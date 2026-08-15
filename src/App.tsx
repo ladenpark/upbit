@@ -999,16 +999,16 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   <button
                     onClick={handleManualBuy}
-                    disabled={positionAmount > 0}
-                    className="py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition"
+                    disabled={balance < 5000}
+                    className="py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition cursor-pointer"
                   >
                     <ArrowUpRight className="w-3.5 h-3.5" />
-                    <span>수동 매수 (BUY)</span>
+                    <span>{positionAmount > 0 ? '수동 추가 매수' : '수동 매수 (BUY)'}</span>
                   </button>
                   <button
                     onClick={handleManualSell}
                     disabled={positionAmount === 0}
-                    className="py-2 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition"
+                    className="py-2 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition cursor-pointer"
                   >
                     <ArrowDownRight className="w-3.5 h-3.5" />
                     <span>전량 청산 (SELL)</span>

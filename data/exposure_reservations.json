@@ -19,5 +19,12 @@
     "amountKrw": 300000,
     "createdAt": 1786805188667,
     "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786805283987_5k6wki",
+    "clientOrderId": "ORD_MANUAL_ENTRY_BUY_1786805283986",
+    "amountKrw": 2516280,
+    "createdAt": 1786805283987,
+    "status": "RESERVED"
   }
 ]
