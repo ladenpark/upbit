@@ -6,6 +6,7 @@ export type ExchangeType = 'UPBIT';
 
 export type SignalType = 
   | 'ENTRY_BUY'
+  | 'BREAKOUT_BUY'
   | 'DCA_BUY'
   | 'PYRAMID_BUY'
   | 'REENTRY_BUY'
@@ -21,7 +22,7 @@ export type SignalPriority = 1 | 2 | 3 | 4 | 5 | 6;
 // 3 = TRAILING_STOP_EXIT
 // 4 = REENTRY_BUY
 // 5 = DCA_BUY
-// 6 = ENTRY_BUY, PYRAMID_BUY (Lowest)
+// 6 = ENTRY_BUY, BREAKOUT_BUY, PYRAMID_BUY (Lowest)
 
 export interface Signal {
   id: string;
@@ -246,6 +247,8 @@ export interface BotParams {
   cooldownSecondsAfterCut: number; // 손절/청산 후 쿨다운 시간(초), 기본 60초
   // AI Auto-Pilot (시장 국면 자동 감지 및 자산 배분)
   autoPilotEnabled: boolean;
+  // Breakout Entry (상승 추세 돌파 매수)
+  breakoutEntryEnabled?: boolean;
 }
 
 export interface ApiKeys {

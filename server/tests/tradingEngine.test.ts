@@ -805,6 +805,69 @@ async function runAllTests() {
   const snapAfterCut2 = nonEntryPosManager.getSnapshot();
   assert(snapAfterCut2.amount === 1.2, '[Partial Cut] Position amount reduced to exact 1.2 ETH');
   const disabledSlots2 = snapAfterCut2.dcaSlots.filter((s) => s.status === 'DISABLED').length;
+  assert(disabledSlots2 === 1, '[Partial Cut] DCA disabled slots remain 1 (No duplicate slot disable!)');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 14: Breakout 1st Entry (BULL Market Momentum Entry)
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 14: Breakout 1st Entry in Bullish Momentum');
+
+  const breakoutStrategyCore = new ATRStrategyCore();
+  const breakoutPosManager = new PositionManager(defaultParams);
+  breakoutPosManager.onPositionClosed(0, 'INIT_FLAT'); // reset to pristine FLAT
+  const flatPosition = breakoutPosManager.getSnapshot();
+  flatPosition.cooldownUntil = 0; // clear test cooldown
+
+  // Simulating Bullish upward trend: 20 ticks rising from 2,600,000 to 2,750,000 (above baseline 2,650,000)
+  const bullPriceHistory = Array.from({ length: 20 }, (_, i) => 2600000 + i * 8000);
+  const currentBullPrice = 2750000;
+  const bullBaseline = 2650000;
+  const bullAtr = 35000;
+
+  const breakoutSignals = breakoutStrategyCore.generateSignals(
+    currentBullPrice,
+    bullBaseline,
+    bullAtr,
+    { ...defaultParams, breakoutEntryEnabled: true },
+    flatPosition,
+    0.05,
+    bullPriceHistory
+  );
+
+  assert(breakoutSignals.length === 1, '[Breakout Entry] Exactly 1 signal generated in Bull trend');
+  assert(breakoutSignals[0].type === 'BREAKOUT_BUY', '[Breakout Entry] Signal is BREAKOUT_BUY (No waiting for lower band!)');
+  assert(breakoutSignals[0].priority === 6, '[Breakout Entry] Priority is 6 (Entry level)');
+
+  // Evaluate by Risk Governor
+  const breakoutGov = new GlobalRiskGovernor(defaultParams);
+  const breakoutRiskEval = breakoutGov.evaluateSignal(
+    breakoutSignals[0],
+    'RUNNING',
+    'LIVE',
+    10000000,
+    flatPosition,
+    currentBullPrice,
+    [],
+    0
+  );
+
+  assert(breakoutRiskEval.approved === true, '[Breakout Entry] Approved by Global Risk Governor');
+  assert(breakoutRiskEval.orderRequest?.side === 'BUY', '[Breakout Entry] Valid BUY order request generated');
+
+  // Fill execution and Position initialization
+  breakoutPosManager.onInitialEntryFilled(
+    currentBullPrice,
+    0.8,
+    bullBaseline,
+    bullAtr,
+    3.0,
+    2.0
+  );
+  const posAfterBreakout = breakoutPosManager.getSnapshot();
+  assert(posAfterBreakout.state === 'ENTRY_FILLED', '[Breakout Entry] Position state transitioned to ENTRY_FILLED');
+  assert(posAfterBreakout.amount === 0.8, '[Breakout Entry] Position amount is 0.8 ETH');
+  assert(posAfterBreakout.initialStopPrice !== null && posAfterBreakout.initialStopPrice < currentBullPrice, '[Breakout Entry] Static Stop Loss securely locked below entry');
+
   // ──────────────────────────────────────────────────────
   // RESULTS
   // ──────────────────────────────────────────────────────

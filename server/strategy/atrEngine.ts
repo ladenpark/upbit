@@ -54,7 +54,8 @@ export class ATREngine {
     trendDropSpeedThreshold: 0.6,
     trendDropWindowSeconds: 5,
     cooldownSecondsAfterCut: 60,
-    autoPilotEnabled: true
+    autoPilotEnabled: true,
+    breakoutEntryEnabled: true
   };
 
   // Live Metrics
@@ -322,7 +323,7 @@ export class ATREngine {
       ? overrideVolume!
       : (record.filledVolume > 0 ? record.filledVolume : (record.requestedBudgetOrVolume / fillPrice));
 
-    if (signalType === 'ENTRY_BUY') {
+    if (signalType === 'ENTRY_BUY' || signalType === 'BREAKOUT_BUY') {
       if (position.amount > 0 && position.state !== 'FLAT') {
         this.positionManager.addAdditionalEntryFilled(fillPrice, effectiveVolume);
       } else {

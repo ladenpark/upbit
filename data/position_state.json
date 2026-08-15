@@ -1,5 +1,5 @@
 {
-  "id": "POS_1786803475211",
+  "id": "POS_1786804300669",
   "symbol": "KRW-ETH",
   "state": "FLAT",
   "amount": 0,
@@ -8,19 +8,16 @@
   "initialStopPrice": 2475000,
   "initialBaseline": 2650000,
   "initialBand": 2545000,
-  "totalCostKrw": 5400000,
-  "realizedPnl": -915009.4088,
+  "totalCostKrw": 2200000,
+  "realizedPnl": -1475009.4087999999,
   "unrealizedPnl": 0,
   "unrealizedPnlPercent": 0,
-  "openedAt": 1786803475211,
-  "lastUpdatedAt": 1786803475233,
+  "openedAt": 1786804300670,
+  "lastUpdatedAt": 1786804300670,
   "dcaSlots": [
     {
       "slotNumber": 1,
-      "status": "DISABLED",
-      "filledPrice": 2600000,
-      "filledVolume": 0.5,
-      "filledAt": 1786803475213
+      "status": "AVAILABLE"
     },
     {
       "slotNumber": 2,
@@ -31,10 +28,10 @@
       "status": "AVAILABLE"
     }
   ],
-  "pyramidingCount": 1,
+  "pyramidingCount": 0,
   "maxPyramidingOrders": 2,
   "trailingActive": false,
   "trailingPeakPrice": null,
-  "cooldownUntil": 1786803535232,
-  "cooldownReason": "PARTIAL_LOSS_CUT"
+  "cooldownUntil": 1786804330667,
+  "cooldownReason": "INIT_FLAT"
 }

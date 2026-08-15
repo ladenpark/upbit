@@ -236,6 +236,7 @@ export class GlobalRiskGovernor {
     // 6. Handle BUY Signals with Global Max Exposure & Reservation
     if (
       signal.type === 'ENTRY_BUY' ||
+      signal.type === 'BREAKOUT_BUY' ||
       signal.type === 'DCA_BUY' ||
       signal.type === 'PYRAMID_BUY' ||
       signal.type === 'REENTRY_BUY'

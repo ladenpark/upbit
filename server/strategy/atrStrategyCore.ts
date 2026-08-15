@@ -274,7 +274,30 @@ export class ATRStrategyCore {
         priority: 6,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[1차 진입] 하단 밴드(₩${Math.round(lowerBand).toLocaleString()}) 터치 과매도 반등 매수`,
+        reason: `[1차 저점 진입] 하단 밴드(₩${Math.round(lowerBand).toLocaleString()}) 터치 과매도 반등 매수`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
+    // --- Rule 9: Breakout 1st Entry Buy (Priority 6) ---
+    if (
+      !hasPosition &&
+      position.state === 'FLAT' &&
+      params.breakoutEntryEnabled !== false &&
+      currentPrice > baselineValue &&
+      (adaptive.marketRegime === 'BULL' || adaptive.slope >= 0.10)
+    ) {
+      signals.push({
+        id: `SIG_BREAKOUT_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'BREAKOUT_ENTRY_ENGINE',
+        type: 'BREAKOUT_BUY',
+        priority: 6,
+        symbol: params.symbol,
+        price: currentPrice,
+        reason: `[1차 돌파 진입] 상승 추세(BULL) 모멘텀(기울기: +${adaptive.slope.toFixed(2)}%) 돌파 매수`,
         indicatorSnapshot: snapshot
       });
       return signals;
