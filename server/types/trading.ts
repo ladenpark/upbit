@@ -188,12 +188,24 @@ export interface ExposureLimits {
   remainingAllowableExposureKrw: number;
 }
 
+export interface NextOrderItem {
+  category: 'DIP' | 'BREAKOUT' | 'DCA' | 'PYRAMID' | 'COMPLETED';
+  categoryLabel: string;
+  type: string;
+  budgetKrw: number;
+  unitPercent: number;
+  scaleMultiplier: number;
+  targetPriceLabel: string;
+  themeColor: 'indigo' | 'emerald' | 'amber' | 'blue';
+}
+
 export interface NextOrderInfo {
   type: string;
   budgetKrw: number;
   unitPercent: number;
   scaleMultiplier: number;
   targetPriceLabel: string;
+  pages: NextOrderItem[];
 }
 
 export interface TradeLog {

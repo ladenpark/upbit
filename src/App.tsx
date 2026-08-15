@@ -137,7 +137,19 @@ export default function App() {
     unitPercent: number;
     scaleMultiplier: number;
     targetPriceLabel: string;
+    pages?: Array<{
+      category: 'DIP' | 'BREAKOUT' | 'DCA' | 'PYRAMID' | 'COMPLETED';
+      categoryLabel: string;
+      type: string;
+      budgetKrw: number;
+      unitPercent: number;
+      scaleMultiplier: number;
+      targetPriceLabel: string;
+      themeColor: 'indigo' | 'emerald' | 'amber' | 'blue';
+    }>;
   } | null>(null);
+  const [nextOrderPageIndex, setNextOrderPageIndex] = useState<number>(0);
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
 
   // Price & Indicators State
   const [currentPrice, setCurrentPrice] = useState<number>(2650000.0);
@@ -957,39 +969,149 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Next Order Unit & Target Budget Card */}
-              <div className="bg-gradient-to-br from-indigo-50/90 via-blue-50/70 to-slate-50 p-3 rounded-2xl border border-indigo-100 shadow-2xs">
-                <div className="flex items-center justify-between mb-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-indigo-600 animate-pulse" />
-                    <span className="text-[11px] font-extrabold text-slate-800">
-                      다음 매수 예상 금액 (Next Unit)
-                    </span>
-                  </div>
-                  <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-md bg-indigo-600 text-white shadow-2xs tracking-tight">
-                    {nextOrderInfo ? nextOrderInfo.type : (positionAmount > 0 ? 'DCA 1차 물타기' : '1차 신규 진입')}
-                  </span>
-                </div>
-                <div className="flex items-baseline justify-between">
-                  <div>
-                    <div className="text-base font-black mono text-indigo-900 tracking-tight">
-                      {nextOrderInfo && nextOrderInfo.budgetKrw > 0
-                        ? formatPrice(nextOrderInfo.budgetKrw)
-                        : formatPrice(currentEquity * ((orderRatio || 25) / 100))}
+              {/* Swipeable Next Order Unit & Target Budget Card */}
+              {(() => {
+                const pages = nextOrderInfo?.pages && nextOrderInfo.pages.length > 0
+                  ? nextOrderInfo.pages
+                  : [
+                      {
+                        category: (positionAmount > 0 ? 'DCA' : 'DIP') as any,
+                        categoryLabel: positionAmount > 0 ? '하락 시 물타기' : '저점 눌림목 매수',
+                        type: positionAmount > 0 ? 'DCA 1차 물타기' : '1차 저점 진입',
+                        budgetKrw: currentEquity * ((orderRatio || 25) / 100),
+                        unitPercent: orderRatio || 25,
+                        scaleMultiplier: 1.0,
+                        targetPriceLabel: '하단 밴드 터치 또는 돌파',
+                        themeColor: 'indigo' as const
+                      },
+                      {
+                        category: (positionAmount > 0 ? 'PYRAMID' : 'BREAKOUT') as any,
+                        categoryLabel: positionAmount > 0 ? '상승 시 불타기' : '상승 추세 돌파 매수',
+                        type: positionAmount > 0 ? '상승 불타기 1차' : '1차 돌파 진입',
+                        budgetKrw: currentEquity * ((orderRatio || 25) / 100),
+                        unitPercent: orderRatio || 25,
+                        scaleMultiplier: 1.0,
+                        targetPriceLabel: positionAmount > 0 ? '+1.5% 상승 돌파 시' : '기준선 상향 돌파 시',
+                        themeColor: 'amber' as const
+                      }
+                    ];
+                const currentPage = pages[nextOrderPageIndex % pages.length];
+                const pageNum = (nextOrderPageIndex % pages.length) + 1;
+                const totalPages = pages.length;
+
+                const isAmber = currentPage.themeColor === 'amber';
+                const isEmerald = currentPage.themeColor === 'emerald';
+                const isBlue = currentPage.themeColor === 'blue';
+
+                const handleCardTouchStart = (e: React.TouchEvent) => {
+                  setTouchStartX(e.touches[0].clientX);
+                };
+
+                const handleCardTouchEnd = (e: React.TouchEvent) => {
+                  if (touchStartX === null) return;
+                  const touchEndX = e.changedTouches[0].clientX;
+                  const diff = touchStartX - touchEndX;
+                  if (diff > 35) {
+                    setNextOrderPageIndex((prev) => (prev + 1) % pages.length);
+                  } else if (diff < -35) {
+                    setNextOrderPageIndex((prev) => (prev - 1 + pages.length) % pages.length);
+                  }
+                  setTouchStartX(null);
+                };
+
+                return (
+                  <div
+                    onTouchStart={handleCardTouchStart}
+                    onTouchEnd={handleCardTouchEnd}
+                    className={`p-3.5 rounded-2xl border transition-all select-none relative overflow-hidden ${
+                      isAmber
+                        ? 'bg-gradient-to-br from-amber-50/90 via-orange-50/60 to-slate-50 border-amber-200/80 shadow-2xs'
+                        : isEmerald
+                        ? 'bg-gradient-to-br from-emerald-50/90 via-teal-50/60 to-slate-50 border-emerald-200/80 shadow-2xs'
+                        : isBlue
+                        ? 'bg-gradient-to-br from-blue-50/90 via-sky-50/60 to-slate-50 border-blue-200/80 shadow-2xs'
+                        : 'bg-gradient-to-br from-indigo-50/90 via-blue-50/70 to-slate-50 border-indigo-200/80 shadow-2xs'
+                    }`}
+                  >
+                    {/* Header: Title with (1/2) Page Indicator and Switch Button */}
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-2 h-2 rounded-full animate-pulse ${
+                          isAmber ? 'bg-amber-600' : isEmerald ? 'bg-emerald-600' : isBlue ? 'bg-blue-600' : 'bg-indigo-600'
+                        }`} />
+                        <span className="text-[11px] font-extrabold text-slate-800 flex items-center gap-1">
+                          다음 매수 예상 금액
+                          <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-bold ${
+                            isAmber ? 'bg-amber-200/80 text-amber-900' : isEmerald ? 'bg-emerald-200/80 text-emerald-900' : isBlue ? 'bg-blue-200/80 text-blue-900' : 'bg-indigo-200/80 text-indigo-900'
+                          }`}>
+                            ({pageNum}/{totalPages})
+                          </span>
+                        </span>
+                      </div>
+
+                      {/* Right: Badge & Page Switcher */}
+                      <div className="flex items-center gap-1.5">
+                        <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-md text-white shadow-2xs tracking-tight ${
+                          isAmber ? 'bg-amber-600' : isEmerald ? 'bg-emerald-600' : isBlue ? 'bg-blue-600' : 'bg-indigo-600'
+                        }`}>
+                          {currentPage.type}
+                        </span>
+                        <button
+                          onClick={() => setNextOrderPageIndex((prev) => (prev + 1) % pages.length)}
+                          className="px-1.5 py-0.5 rounded-lg bg-white/90 border border-slate-200 flex items-center gap-0.5 text-[9px] text-slate-700 font-bold hover:bg-white shadow-2xs cursor-pointer active:scale-95 transition"
+                          title="플랜 전환"
+                        >
+                          <span>{pageNum === 1 ? '불타기' : '물타기'}</span>
+                          <span className="text-[10px]">⇄</span>
+                        </button>
+                      </div>
                     </div>
-                    <div className="text-[10px] text-slate-500 font-medium mt-0.5">
-                      총자산의 {orderRatio || 25}% 
-                      {nextOrderInfo && nextOrderInfo.scaleMultiplier > 1 ? ` (×${nextOrderInfo.scaleMultiplier}배 스케일링)` : ' (기본 1 Unit)'}
+
+                    {/* Content: Budget and Trigger Condition */}
+                    <div className="flex items-baseline justify-between">
+                      <div>
+                        <div className={`text-base font-black mono tracking-tight ${
+                          isAmber ? 'text-amber-900' : isEmerald ? 'text-emerald-900' : isBlue ? 'text-blue-900' : 'text-indigo-900'
+                        }`}>
+                          {currentPage.budgetKrw > 0
+                            ? formatPrice(currentPage.budgetKrw)
+                            : formatPrice(currentEquity * ((orderRatio || 25) / 100))}
+                        </div>
+                        <div className="text-[10px] text-slate-500 font-medium mt-0.5">
+                          {currentPage.categoryLabel} · 총자산의 {orderRatio || 25}% 
+                          {currentPage.scaleMultiplier > 1 ? ` (×${currentPage.scaleMultiplier}배 스케일링)` : ' (기본 1 Unit)'}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-[10px] font-semibold text-slate-400">진입 예상 타이밍</div>
+                        <div className="text-[11px] font-bold text-slate-700 mt-0.5">
+                          {currentPage.targetPriceLabel}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Bottom Swipe Dot Indicators */}
+                    <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-200/50">
+                      <div className="flex items-center gap-1.5">
+                        {pages.map((_, idx) => (
+                          <button
+                            key={idx}
+                            onClick={() => setNextOrderPageIndex(idx)}
+                            className={`h-1.5 rounded-full transition-all cursor-pointer ${
+                              idx === (nextOrderPageIndex % pages.length)
+                                ? `w-5 ${isAmber ? 'bg-amber-600' : isEmerald ? 'bg-emerald-600' : isBlue ? 'bg-blue-600' : 'bg-indigo-600'}`
+                                : 'w-1.5 bg-slate-300 hover:bg-slate-400'
+                            }`}
+                          />
+                        ))}
+                      </div>
+                      <span className="text-[9px] text-slate-400 font-medium flex items-center gap-0.5">
+                        👆 좌우로 스와이프하여 {pageNum === 1 ? '불타기(2/2)' : '물타기(1/2)'} 확인
+                      </span>
                     </div>
                   </div>
-                  <div className="text-right">
-                    <div className="text-[10px] font-semibold text-slate-400">진입 예상 타이밍</div>
-                    <div className="text-[11px] font-bold text-slate-700 mt-0.5">
-                      {nextOrderInfo ? nextOrderInfo.targetPriceLabel : '하단 밴드 터치 또는 돌파'}
-                    </div>
-                  </div>
-                </div>
-              </div>
+                );
+              })()}
 
               {/* Real-time Canvas Chart */}
               <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">

@@ -1,30 +1,23 @@
 [
   {
-    "id": "RES_1786805188661_leptc8",
+    "id": "RES_1786805916702_9ek4ls",
     "clientOrderId": "ORD_TEST_PENDING_001",
     "amountKrw": 1500000,
-    "createdAt": 1786805188661,
+    "createdAt": 1786805916702,
     "status": "RELEASED"
   },
   {
-    "id": "RES_1786805188666_tr18d",
-    "clientOrderId": "ORD_RESERVE_TEST_1786805188666",
+    "id": "RES_1786805916729_nn2p2e",
+    "clientOrderId": "ORD_RESERVE_TEST_1786805916729",
     "amountKrw": 500000,
-    "createdAt": 1786805188666,
+    "createdAt": 1786805916729,
     "status": "COMMITTED"
   },
   {
-    "id": "RES_1786805188667_9caxvg",
-    "clientOrderId": "ORD_RESERVE_TEST_2_1786805188667",
+    "id": "RES_1786805916730_rrzou",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786805916730",
     "amountKrw": 300000,
-    "createdAt": 1786805188667,
+    "createdAt": 1786805916730,
     "status": "RELEASED"
-  },
-  {
-    "id": "RES_1786805283987_5k6wki",
-    "clientOrderId": "ORD_MANUAL_ENTRY_BUY_1786805283986",
-    "amountKrw": 2516280,
-    "createdAt": 1786805283987,
-    "status": "RESERVED"
   }
 ]

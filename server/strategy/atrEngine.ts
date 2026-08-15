@@ -4,7 +4,8 @@ import {
   PricePoint,
   BotLifecycleState,
   MarketDataState,
-  ApiKeys
+  ApiKeys,
+  NextOrderItem
 } from '../types/trading';
 import { SecretManager } from '../security/secretManager';
 import { MarketDataManager } from '../market/marketDataManager';
@@ -671,46 +672,108 @@ export class ATREngine {
       0
     );
 
-    // Calculate Next Order Info for UI
-    let nextOrderType = '1차 신규 진입 (1 Unit)';
-    let nextScaleMultiplier = 1.0;
-    let nextBudgetRaw = exposure.totalCapitalKrw * ((this.params.orderRatio || 25) / 100);
-    const lowerBandCalc = this.baselineValue - this.atrValue * this.params.atrMultiplier;
-    let nextTargetPriceLabel = `하단 ₩${Math.round(lowerBandCalc > 0 ? lowerBandCalc : this.currentPrice * 0.98).toLocaleString()} 또는 돌파 시`;
+    // Calculate Next Order Info Pages for UI Swipeable Card
+    const pages: NextOrderItem[] = [];
+    const baseUnitBudget = exposure.totalCapitalKrw * ((this.params.orderRatio || 25) / 100);
 
     if (pos.amount > 0 && pos.state !== 'FLAT') {
-      const nextSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE');
-      if (this.params.dcaEnabled && nextSlot) {
-        nextOrderType = `DCA #${nextSlot.slotNumber}차 물타기`;
-        nextScaleMultiplier = Number(Math.pow(this.params.safetyOrderVolumeScale, nextSlot.slotNumber).toFixed(2));
-        nextBudgetRaw = nextBudgetRaw * nextScaleMultiplier;
-        const entry = pos.entryPrice || this.currentPrice;
-        const targetDcaPrice = entry * (1 - (this.params.safetyOrderStepPercent * nextSlot.slotNumber) / 100);
-        nextTargetPriceLabel = `₩${Math.round(targetDcaPrice).toLocaleString()} (-${(this.params.safetyOrderStepPercent * nextSlot.slotNumber).toFixed(1)}% 하락 시)`;
-      } else if (this.params.pyramidingEnabled && pos.pyramidingCount < this.params.maxPyramidingOrders) {
-        nextOrderType = `상승 불타기 #${pos.pyramidingCount + 1}차`;
-        nextScaleMultiplier = 1.0;
-        const entry = pos.entryPrice || this.currentPrice;
-        const targetPyrPrice = entry * (1 + (this.params.pyramidingStepPercent * (pos.pyramidingCount + 1)) / 100);
-        nextTargetPriceLabel = `₩${Math.round(targetPyrPrice).toLocaleString()} (+${(this.params.pyramidingStepPercent * (pos.pyramidingCount + 1)).toFixed(1)}% 상승 시)`;
+      const entry = pos.entryPrice || this.currentPrice;
+
+      // Page 1: DCA 물타기 (하락 시 대응)
+      const nextDcaSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE');
+      if (this.params.dcaEnabled && nextDcaSlot) {
+        const dcaScale = Number(Math.pow(this.params.safetyOrderVolumeScale, nextDcaSlot.slotNumber).toFixed(2));
+        const dcaBudgetRaw = baseUnitBudget * dcaScale;
+        const dcaBudget = Math.floor(Math.min(dcaBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
+        const targetDcaPrice = entry * (1 - (this.params.safetyOrderStepPercent * nextDcaSlot.slotNumber) / 100);
+        pages.push({
+          category: 'DCA',
+          categoryLabel: '하락 시 물타기',
+          type: `DCA #${nextDcaSlot.slotNumber}차 물타기`,
+          budgetKrw: dcaBudget,
+          unitPercent: this.params.orderRatio || 25,
+          scaleMultiplier: dcaScale,
+          targetPriceLabel: `₩${Math.round(targetDcaPrice).toLocaleString()} (-${(this.params.safetyOrderStepPercent * nextDcaSlot.slotNumber).toFixed(1)}% 하락 시)`,
+          themeColor: 'indigo'
+        });
       } else {
-        nextOrderType = '추가 매수 완료 (익절/손절 대기)';
-        nextScaleMultiplier = 0;
-        nextBudgetRaw = 0;
-        nextTargetPriceLabel = '익절 또는 손절 대기 중';
+        pages.push({
+          category: 'COMPLETED',
+          categoryLabel: '물타기 완료',
+          type: 'DCA 슬롯 소진',
+          budgetKrw: 0,
+          unitPercent: this.params.orderRatio || 25,
+          scaleMultiplier: 0,
+          targetPriceLabel: '최대 물타기 완료 (손절선 감시)',
+          themeColor: 'indigo'
+        });
       }
+
+      // Page 2: 불타기 (상승 시 대응)
+      if (this.params.pyramidingEnabled && pos.pyramidingCount < this.params.maxPyramidingOrders) {
+        const pyrBudget = Math.floor(Math.min(baseUnitBudget, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
+        const nextPyrStep = (pos.pyramidingCount + 1);
+        const targetPyrPrice = entry * (1 + (this.params.pyramidingStepPercent * nextPyrStep) / 100);
+        pages.push({
+          category: 'PYRAMID',
+          categoryLabel: '상승 시 불타기',
+          type: `상승 불타기 #${nextPyrStep}차`,
+          budgetKrw: pyrBudget,
+          unitPercent: this.params.orderRatio || 25,
+          scaleMultiplier: 1.0,
+          targetPriceLabel: `₩${Math.round(targetPyrPrice).toLocaleString()} (+${(this.params.pyramidingStepPercent * nextPyrStep).toFixed(1)}% 상승 시)`,
+          themeColor: 'amber'
+        });
+      } else {
+        pages.push({
+          category: 'COMPLETED',
+          categoryLabel: '불타기 완료',
+          type: '불타기 한도 소진',
+          budgetKrw: 0,
+          unitPercent: this.params.orderRatio || 25,
+          scaleMultiplier: 0,
+          targetPriceLabel: '최고점 트레일링 익절 대기 중',
+          themeColor: 'amber'
+        });
+      }
+    } else {
+      // 무포지션 FLAT 상태일 때:
+      const entryBudget = Math.floor(Math.min(baseUnitBudget, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
+      const lowerBandCalc = this.baselineValue - (this.atrValue * this.params.atrMultiplier);
+      const lowerTarget = Math.round(lowerBandCalc > 0 ? lowerBandCalc : this.currentPrice * 0.98);
+
+      // Page 1: 저점 눌림목 진입
+      pages.push({
+        category: 'DIP',
+        categoryLabel: '저점 눌림목 매수',
+        type: '1차 저점 진입 (1 Unit)',
+        budgetKrw: entryBudget,
+        unitPercent: this.params.orderRatio || 25,
+        scaleMultiplier: 1.0,
+        targetPriceLabel: `하단 ₩${lowerTarget.toLocaleString()} 이하 터치 시`,
+        themeColor: 'blue'
+      });
+
+      // Page 2: 상승 돌파 진입
+      pages.push({
+        category: 'BREAKOUT',
+        categoryLabel: '상승 추세 돌파 매수',
+        type: '1차 돌파 진입 (1 Unit)',
+        budgetKrw: entryBudget,
+        unitPercent: this.params.orderRatio || 25,
+        scaleMultiplier: 1.0,
+        targetPriceLabel: `기준선(₩${Math.round(this.baselineValue).toLocaleString()}) 상향 돌파 시`,
+        themeColor: 'emerald'
+      });
     }
 
-    const nextBudgetKrw = nextBudgetRaw > 0
-      ? Math.floor(Math.min(nextBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw))
-      : 0;
-
     const nextOrderInfo = {
-      type: nextOrderType,
-      budgetKrw: nextBudgetKrw,
+      type: pages[0]?.type || '1차 신규 진입',
+      budgetKrw: pages[0]?.budgetKrw || 0,
       unitPercent: this.params.orderRatio || 25,
-      scaleMultiplier: nextScaleMultiplier,
-      targetPriceLabel: nextTargetPriceLabel
+      scaleMultiplier: pages[0]?.scaleMultiplier || 1.0,
+      targetPriceLabel: pages[0]?.targetPriceLabel || '',
+      pages
     };
 
     return {
