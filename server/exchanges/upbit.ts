@@ -73,10 +73,14 @@ export class UpbitClient {
     return `KRW-${rawSymbol.replace('USDT', '').toUpperCase()}`;
   }
 
-  // Fetch initial klines for ATR computation
-  public async fetchCandles(market: string = 'KRW-BTC', count: number = 30): Promise<UpbitCandle[]> {
+  // Fetch klines for ATR and Higher-Timeframe regime computation
+  public async fetchCandles(
+    market: string = 'KRW-BTC',
+    count: number = 30,
+    unit: string = 'minutes/1'
+  ): Promise<UpbitCandle[]> {
     const formattedMarket = UpbitClient.formatMarket(market);
-    const url = `https://api.upbit.com/v1/candles/minutes/1?market=${formattedMarket}&count=${count}`;
+    const url = `https://api.upbit.com/v1/candles/${unit}?market=${formattedMarket}&count=${count}`;
 
     try {
       const res = await fetch(url);

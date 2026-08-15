@@ -79,7 +79,7 @@ export default function App() {
   // Bot Parameters
   const [isBotActive, setIsBotActive] = useState<boolean>(false);
   const [atrMultiplier, setAtrMultiplier] = useState<number>(3.0);
-  const [orderRatio, setOrderRatio] = useState<number>(25); // %
+  const [orderRatio, setOrderRatio] = useState<number>(20); // % (20% + 24% + 28.8% fits under 85%)
   const [stopLossMultiplier, setStopLossMultiplier] = useState<number>(2.0);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
 
@@ -100,11 +100,11 @@ export default function App() {
   const [pyramidingCount, setPyramidingCount] = useState<number>(0);
   const [partialLossCutEnabled, setPartialLossCutEnabled] = useState<boolean>(true);
   const [partialLossCutPercent, setPartialLossCutPercent] = useState<number>(40);
-  const [partialLossCutThreshold, setPartialLossCutThreshold] = useState<number>(3.5);
+  const [partialLossCutThreshold, setPartialLossCutThreshold] = useState<number>(4.5);
 
   // Trend-Aware Loss-Cut & Bottom Re-entry State
   const [trendAwareCutEnabled, setTrendAwareCutEnabled] = useState<boolean>(true);
-  const [trendDropSpeedThreshold, setTrendDropSpeedThreshold] = useState<number>(0.6);
+  const [trendDropSpeedThreshold, setTrendDropSpeedThreshold] = useState<number>(1.8);
   const [awaitingReentry, setAwaitingReentry] = useState<boolean>(false);
 
   // Global State Machine States

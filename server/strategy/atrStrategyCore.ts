@@ -17,7 +17,8 @@ export class ATRStrategyCore {
     baselineValue: number,
     atrValue: number,
     params: BotParams,
-    priceHistory: number[]
+    priceHistory: number[],
+    higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number }
   ) {
     if (priceHistory.length < 15) {
       return {
@@ -40,27 +41,44 @@ export class ATRStrategyCore {
     const priceToBaseline = ((currentPrice - baselineValue) / baselineValue) * 100;
     const volatilityRatio = baselineValue > 0 ? (atrValue / baselineValue) * 100 : 1.5;
 
-    // 1. Dynamic ATR Multiplier: 1.6x (aggressive uptrend) ~ 3.8x (deep defensive downtrend)
-    const rawAtr = 2.6 - (slope * 2.2) + ((volatilityRatio - 1.2) * 0.4);
-    const dynamicAtr = Number(Math.max(1.6, Math.min(3.8, rawAtr)).toFixed(1));
-
-    // 2. Dynamic Order Ratio: 15% ~ 60%
-    const rawRatio = 30 + (slope * 30);
-    const dynamicOrderRatio = Math.round(Math.max(15, Math.min(60, rawRatio)));
-
-    // 3. Dynamic DCA Step: 1.5% ~ 3.5%
-    const rawDca = 2.0 + (volatilityRatio * 0.5);
-    const dynamicDcaStep = Number(Math.max(1.5, Math.min(3.5, rawDca)).toFixed(1));
-
-    // 4. Dynamic Trailing Callback: 0.6% ~ 1.5%
-    const rawCallback = 0.8 + (volatilityRatio * 0.2);
-    const dynamicTrailingCallback = Number(Math.max(0.6, Math.min(1.5, rawCallback)).toFixed(1));
-
+    // Multi-Timeframe Confluence Regime Determination (15m + 1m)
     let marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR' = 'SIDEWAYS';
-    if (slope > 0.12 && priceToBaseline > 0.08) {
+    const htf = higherTfTrend?.trend || 'SIDEWAYS';
+
+    if (slope > 0.10 && priceToBaseline > 0.05 && htf !== 'BEAR') {
       marketRegime = 'BULL';
-    } else if (slope < -0.12 && priceToBaseline < -0.08) {
+    } else if (slope < -0.10 && priceToBaseline < -0.05 && htf !== 'BULL') {
       marketRegime = 'BEAR';
+    }
+
+    // 1. Dynamic ATR Multiplier: 1.8x (BULL) ~ 3.5x (BEAR)
+    let dynamicAtr = 2.4;
+    if (marketRegime === 'BULL') {
+      dynamicAtr = 1.8;
+    } else if (marketRegime === 'BEAR') {
+      dynamicAtr = 3.5;
+    }
+
+    // 2. Dynamic Order Ratio (Sizing): 10% (BEAR) ~ 20% (BULL) to prevent 85% exposure overflow
+    let dynamicOrderRatio = 18;
+    if (marketRegime === 'BULL') {
+      dynamicOrderRatio = 20; // 20% + 24% + 28.8% = 72.8% (Fits well under 85%)
+    } else if (marketRegime === 'BEAR') {
+      dynamicOrderRatio = 10; // Defensive small unit
+    }
+
+    // 3. Dynamic DCA Step: 1.5% ~ 3.0%
+    let dynamicDcaStep = 2.0;
+    if (marketRegime === 'BULL') {
+      dynamicDcaStep = 1.5;
+    } else if (marketRegime === 'BEAR') {
+      dynamicDcaStep = 3.0; // Wider gap in downtrend to avoid catching falling knives
+    }
+
+    // 4. Dynamic Trailing Callback: 0.8% ~ 1.2%
+    let dynamicTrailingCallback = 0.8;
+    if (volatilityRatio > 2.0) {
+      dynamicTrailingCallback = 1.2;
     }
 
     return {
@@ -84,12 +102,13 @@ export class ATRStrategyCore {
     params: BotParams,
     position: PositionSnapshot,
     dropSpeed: number,
-    priceHistory: number[]
+    priceHistory: number[],
+    higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number }
   ): Signal[] {
     const signals: Signal[] = [];
     const now = Date.now();
 
-    const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, priceHistory);
+    const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, priceHistory, higherTfTrend);
     const effectiveAtrMultiplier = params.autoPilotEnabled ? adaptive.dynamicAtr : params.atrMultiplier;
 
     const lowerBand = baselineValue - (atrValue * effectiveAtrMultiplier);

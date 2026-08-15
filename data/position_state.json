@@ -1,5 +1,5 @@
 {
-  "id": "POS_1786806299038",
+  "id": "POS_1786807151800",
   "symbol": "KRW-ETH",
   "state": "ENTRY_FILLED",
   "amount": 0.94490424,
@@ -12,8 +12,8 @@
   "realizedPnl": -140000,
   "unrealizedPnl": 0,
   "unrealizedPnlPercent": 0,
-  "openedAt": 1786806299038,
-  "lastUpdatedAt": 1786806299038,
+  "openedAt": 1786807151800,
+  "lastUpdatedAt": 1786807151800,
   "dcaSlots": [
     {
       "slotNumber": 1,
@@ -32,6 +32,6 @@
   "maxPyramidingOrders": 2,
   "trailingActive": false,
   "trailingPeakPrice": null,
-  "cooldownUntil": 1786806329036,
+  "cooldownUntil": 1786807181798,
   "cooldownReason": "INIT_FLAT"
 }

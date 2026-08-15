@@ -33,7 +33,7 @@ export class ATREngine {
   // Strategy Core Parameters
   public params: BotParams = {
     atrMultiplier: 3.0,
-    orderRatio: 25,
+    orderRatio: 20,
     stopLossMultiplier: 2.0,
     isBotActive: false,
     exchange: 'UPBIT',
@@ -50,14 +50,17 @@ export class ATREngine {
     pyramidingStepPercent: 1.5,
     partialLossCutEnabled: true,
     partialLossCutPercent: 40,
-    partialLossCutThreshold: 3.5,
+    partialLossCutThreshold: 4.5,
     trendAwareCutEnabled: true,
-    trendDropSpeedThreshold: 0.6,
-    trendDropWindowSeconds: 5,
+    trendDropSpeedThreshold: 1.8,
+    trendDropWindowSeconds: 3,
     cooldownSecondsAfterCut: 60,
     autoPilotEnabled: true,
     breakoutEntryEnabled: true
   };
+
+  // Higher Timeframe (15m) Trend State for Whipsaw Filtering
+  private higherTfTrend: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number } = { trend: 'SIDEWAYS', htfSlope: 0 };
 
   // Live Metrics
   public currentPrice = 2650000.0;
@@ -218,13 +221,14 @@ export class ATREngine {
     const historyPrices = this.priceHistory.map((p) => p.price);
     historyPrices.push(price);
 
-    // Evaluate dynamic auto-pilot indicators
+    // Evaluate dynamic auto-pilot indicators with Higher-TF Confluence
     const adaptive = this.strategyCore.evaluateAdaptiveParams(
       price,
       this.baselineValue,
       this.atrValue,
       this.params,
-      historyPrices
+      historyPrices,
+      this.higherTfTrend
     );
 
     if (adaptive.marketRegime !== this.marketRegime) {
@@ -240,7 +244,8 @@ export class ATREngine {
       this.params,
       position,
       dropSpeed,
-      historyPrices
+      historyPrices,
+      this.higherTfTrend
     );
 
     // 2. Pass highest-priority signal through Global Risk Governor
@@ -468,10 +473,12 @@ export class ATREngine {
 
   /**
    * Authoritative real-time ATR & Baseline recalculation from Upbit candle history
+   * and Multi-Timeframe (15m) Trend Analysis for Whipsaw Filtering
    */
   public async refreshAtrFromExchange() {
     try {
-      const candles = await this.upbitClient.fetchCandles(this.params.symbol, 20);
+      // 1. Fetch 1-minute candles for immediate ATR & Baseline calculation
+      const candles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/1');
       if (candles && candles.length >= 14) {
         let trSum = 0;
         for (let i = 1; i < candles.length; i++) {
@@ -486,10 +493,25 @@ export class ATREngine {
           this.atrValue = calculatedAtr;
           const sumClose = candles.reduce((acc, c) => acc + c.trade_price, 0);
           this.baselineValue = Math.round(sumClose / candles.length);
-          console.log(`[ATREngine] 📊 Recalculated Dynamic ATR from candles: ₩${this.atrValue.toLocaleString()} (Baseline: ₩${this.baselineValue.toLocaleString()})`);
-          this.notifyClients();
+          console.log(`[ATREngine] 📊 Recalculated Dynamic ATR (1m): ₩${this.atrValue.toLocaleString()} (Baseline: ₩${this.baselineValue.toLocaleString()})`);
         }
       }
+
+      // 2. Fetch 15-minute candles for Higher Timeframe trend confluence
+      const htfCandles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/15');
+      if (htfCandles && htfCandles.length >= 10) {
+        const htfCloses = htfCandles.map((c) => c.trade_price);
+        const fastHtf = htfCloses.slice(-3).reduce((a, b) => a + b, 0) / 3;
+        const slowHtf = htfCloses.slice(-10).reduce((a, b) => a + b, 0) / 10;
+        const htfSlope = ((fastHtf - slowHtf) / slowHtf) * 100;
+        let htfTrend: 'BULL' | 'SIDEWAYS' | 'BEAR' = 'SIDEWAYS';
+        if (htfSlope > 0.15) htfTrend = 'BULL';
+        else if (htfSlope < -0.15) htfTrend = 'BEAR';
+        this.higherTfTrend = { trend: htfTrend, htfSlope };
+        console.log(`[ATREngine] 📈 Higher-TF (15m) Trend Confluence: ${htfTrend} (Slope: ${htfSlope.toFixed(2)}%)`);
+      }
+
+      this.notifyClients();
     } catch (e: any) {
       console.warn('[ATREngine] ⚠️ ATR calculation fallback notice:', e.message);
     }
