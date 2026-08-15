@@ -605,6 +605,48 @@ export class ATREngine {
       0
     );
 
+    // Calculate Next Order Info for UI
+    let nextOrderType = '1차 신규 진입 (1 Unit)';
+    let nextScaleMultiplier = 1.0;
+    let nextBudgetRaw = exposure.totalCapitalKrw * ((this.params.orderRatio || 25) / 100);
+    const lowerBandCalc = this.baselineValue - this.atrValue * this.params.atrMultiplier;
+    let nextTargetPriceLabel = `하단 ₩${Math.round(lowerBandCalc > 0 ? lowerBandCalc : this.currentPrice * 0.98).toLocaleString()} 또는 돌파 시`;
+
+    if (pos.amount > 0 && pos.state !== 'FLAT') {
+      const nextSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE');
+      if (this.params.dcaEnabled && nextSlot) {
+        nextOrderType = `DCA #${nextSlot.slotNumber}차 물타기`;
+        nextScaleMultiplier = Number(Math.pow(this.params.safetyOrderVolumeScale, nextSlot.slotNumber).toFixed(2));
+        nextBudgetRaw = nextBudgetRaw * nextScaleMultiplier;
+        const entry = pos.entryPrice || this.currentPrice;
+        const targetDcaPrice = entry * (1 - (this.params.safetyOrderStepPercent * nextSlot.slotNumber) / 100);
+        nextTargetPriceLabel = `₩${Math.round(targetDcaPrice).toLocaleString()} (-${(this.params.safetyOrderStepPercent * nextSlot.slotNumber).toFixed(1)}% 하락 시)`;
+      } else if (this.params.pyramidingEnabled && pos.pyramidingCount < this.params.maxPyramidingOrders) {
+        nextOrderType = `상승 불타기 #${pos.pyramidingCount + 1}차`;
+        nextScaleMultiplier = 1.0;
+        const entry = pos.entryPrice || this.currentPrice;
+        const targetPyrPrice = entry * (1 + (this.params.pyramidingStepPercent * (pos.pyramidingCount + 1)) / 100);
+        nextTargetPriceLabel = `₩${Math.round(targetPyrPrice).toLocaleString()} (+${(this.params.pyramidingStepPercent * (pos.pyramidingCount + 1)).toFixed(1)}% 상승 시)`;
+      } else {
+        nextOrderType = '추가 매수 완료 (익절/손절 대기)';
+        nextScaleMultiplier = 0;
+        nextBudgetRaw = 0;
+        nextTargetPriceLabel = '익절 또는 손절 대기 중';
+      }
+    }
+
+    const nextBudgetKrw = nextBudgetRaw > 0
+      ? Math.floor(Math.min(nextBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw))
+      : 0;
+
+    const nextOrderInfo = {
+      type: nextOrderType,
+      budgetKrw: nextBudgetKrw,
+      unitPercent: this.params.orderRatio || 25,
+      scaleMultiplier: nextScaleMultiplier,
+      targetPriceLabel: nextTargetPriceLabel
+    };
+
     return {
       params: this.params,
       botState: this.botState,
@@ -628,6 +670,7 @@ export class ATREngine {
         cooldownUntil: pos.cooldownUntil
       },
       exposureLimits: exposure,
+      nextOrderInfo,
       totalRealizedPnl: this.totalRealizedPnl,
       totalTrades: this.totalTrades,
       winTrades: this.winTrades,

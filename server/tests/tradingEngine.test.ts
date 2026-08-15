@@ -6,6 +6,8 @@
  * Run: npx tsx server/tests/tradingEngine.test.ts
  */
 
+import fs from 'fs';
+import path from 'path';
 import { ATRStrategyCore } from '../strategy/atrStrategyCore';
 import { GlobalRiskGovernor } from '../risk/globalRiskGovernor';
 import { PositionManager } from '../position/positionManager';
@@ -30,6 +32,18 @@ async function runAllTests() {
   console.log('\n======================================================');
   console.log('🧪 Starting Automated Quantitative Trading Test Suite');
   console.log('======================================================');
+
+  // Clean test fixtures for isolated idempotent test suite execution
+  const testDataDir = path.resolve(process.cwd(), 'data');
+  const reservationFile = path.join(testDataDir, 'exposure_reservations.json');
+  const orderFile = path.join(testDataDir, 'order_history.json');
+  const signalFile = path.join(testDataDir, 'processed_signals.json');
+  const posFile = path.join(testDataDir, 'position_state.json');
+
+  if (fs.existsSync(reservationFile)) fs.writeFileSync(reservationFile, '[]', 'utf-8');
+  if (fs.existsSync(orderFile)) fs.writeFileSync(orderFile, '[]', 'utf-8');
+  if (fs.existsSync(signalFile)) fs.writeFileSync(signalFile, '[]', 'utf-8');
+  if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
 
   const defaultParams: BotParams = {
     atrMultiplier: 3.0,

@@ -131,6 +131,13 @@ export default function App() {
   const [totalTrades, setTotalTrades] = useState<number>(0);
   const [winTrades, setWinTrades] = useState<number>(0);
   const [realBalances, setRealBalances] = useState<Record<string, number>>({});
+  const [nextOrderInfo, setNextOrderInfo] = useState<{
+    type: string;
+    budgetKrw: number;
+    unitPercent: number;
+    scaleMultiplier: number;
+    targetPriceLabel: string;
+  } | null>(null);
 
   // Price & Indicators State
   const [currentPrice, setCurrentPrice] = useState<number>(2650000.0);
@@ -252,6 +259,7 @@ export default function App() {
           if (s.logs) setLogs(s.logs);
           if (s.realBalances) setRealBalances(s.realBalances);
           if (s.hasApiKeys) setHasApiKeys(s.hasApiKeys);
+          if (s.nextOrderInfo) setNextOrderInfo(s.nextOrderInfo);
         } else if (data.type === 'TEST_API_KEYS_RESULT') {
           const res = data.payload;
           if (res.success) {
@@ -927,6 +935,40 @@ export default function App() {
                   </div>
                   <div className={`text-[10px] font-bold mt-1 ${unrealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                     손익: {unrealizedPnl >= 0 ? '+' : ''}{formatPrice(unrealizedPnl)} ({unrealizedPnlPercent.toFixed(1)}%)
+                  </div>
+                </div>
+              </div>
+
+              {/* Next Order Unit & Target Budget Card */}
+              <div className="bg-gradient-to-br from-indigo-50/90 via-blue-50/70 to-slate-50 p-3 rounded-2xl border border-indigo-100 shadow-2xs">
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-indigo-600 animate-pulse" />
+                    <span className="text-[11px] font-extrabold text-slate-800">
+                      다음 매수 예상 금액 (Next Unit)
+                    </span>
+                  </div>
+                  <span className="text-[9px] font-extrabold px-2 py-0.5 rounded-md bg-indigo-600 text-white shadow-2xs tracking-tight">
+                    {nextOrderInfo ? nextOrderInfo.type : (positionAmount > 0 ? 'DCA 1차 물타기' : '1차 신규 진입')}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <div>
+                    <div className="text-base font-black mono text-indigo-900 tracking-tight">
+                      {nextOrderInfo && nextOrderInfo.budgetKrw > 0
+                        ? formatPrice(nextOrderInfo.budgetKrw)
+                        : formatPrice(currentEquity * ((orderRatio || 25) / 100))}
+                    </div>
+                    <div className="text-[10px] text-slate-500 font-medium mt-0.5">
+                      총자산의 {orderRatio || 25}% 
+                      {nextOrderInfo && nextOrderInfo.scaleMultiplier > 1 ? ` (×${nextOrderInfo.scaleMultiplier}배 스케일링)` : ' (기본 1 Unit)'}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-[10px] font-semibold text-slate-400">진입 예상 타이밍</div>
+                    <div className="text-[11px] font-bold text-slate-700 mt-0.5">
+                      {nextOrderInfo ? nextOrderInfo.targetPriceLabel : '하단 밴드 터치 또는 돌파'}
+                    </div>
                   </div>
                 </div>
               </div>

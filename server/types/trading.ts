@@ -188,6 +188,14 @@ export interface ExposureLimits {
   remainingAllowableExposureKrw: number;
 }
 
+export interface NextOrderInfo {
+  type: string;
+  budgetKrw: number;
+  unitPercent: number;
+  scaleMultiplier: number;
+  targetPriceLabel: string;
+}
+
 export interface TradeLog {
   id: string;
   time: string;
