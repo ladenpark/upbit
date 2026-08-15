@@ -76,6 +76,7 @@ export class ATREngine {
 
   private broadcastCallback?: (payload: any) => void;
   private balanceRefreshTimer: NodeJS.Timeout | null = null;
+  private atrRefreshTimer: NodeJS.Timeout | null = null;
 
   constructor(broadcastCallback?: (payload: any) => void) {
     this.broadcastCallback = broadcastCallback;
@@ -99,6 +100,9 @@ export class ATREngine {
 
     this.initDefaultHistory();
 
+    // Fetch initial dynamic ATR from candles
+    this.refreshAtrFromExchange();
+
     // Initialize Market Data Manager with tick dispatcher
     this.marketManager = new MarketDataManager(
       this.params.exchange,
@@ -117,6 +121,11 @@ export class ATREngine {
     this.balanceRefreshTimer = setInterval(() => {
       this.fetchRealAccountBalance();
     }, 10000);
+
+    // Start periodic background ATR recalculation (every 30s)
+    this.atrRefreshTimer = setInterval(() => {
+      this.refreshAtrFromExchange();
+    }, 30000);
   }
 
   public async reconcileOnStartup() {
@@ -461,32 +470,88 @@ export class ATREngine {
   }
 
   /**
+   * Authoritative real-time ATR & Baseline recalculation from Upbit candle history
+   */
+  public async refreshAtrFromExchange() {
+    try {
+      const candles = await this.upbitClient.fetchCandles(this.params.symbol, 20);
+      if (candles && candles.length >= 14) {
+        let trSum = 0;
+        for (let i = 1; i < candles.length; i++) {
+          const prevClose = candles[i - 1].trade_price;
+          const high = candles[i].high_price;
+          const low = candles[i].low_price;
+          const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+          trSum += tr;
+        }
+        const calculatedAtr = Math.round(trSum / (candles.length - 1));
+        if (calculatedAtr > 0) {
+          this.atrValue = calculatedAtr;
+          const sumClose = candles.reduce((acc, c) => acc + c.trade_price, 0);
+          this.baselineValue = Math.round(sumClose / candles.length);
+          console.log(`[ATREngine] 📊 Recalculated Dynamic ATR from candles: ₩${this.atrValue.toLocaleString()} (Baseline: ₩${this.baselineValue.toLocaleString()})`);
+          this.notifyClients();
+        }
+      }
+    } catch (e: any) {
+      console.warn('[ATREngine] ⚠️ ATR calculation fallback notice:', e.message);
+    }
+  }
+
+  /**
    * Manual Buy / Sell Dispatcher
    */
   public async executeManualTrade(side: 'BUY' | 'SELL') {
     const position = this.positionManager.getSnapshot();
     const keys = this.secretManager.getKeys();
+    const exposure = this.riskGovernor.calculateExposureLimits(
+      this.actualKrwBalance,
+      position.amount,
+      this.currentPrice,
+      0
+    );
 
     if (side === 'BUY') {
-      const budget = Math.min(this.actualKrwBalance * 0.25, 500000);
+      const isAdditional = position.amount > 0 && position.state !== 'FLAT';
+      let targetBudget = exposure.totalCapitalKrw * ((this.params.orderRatio || 25) / 100);
+
+      if (isAdditional) {
+        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');
+        const scale = Math.pow(this.params.safetyOrderVolumeScale, nextSlot ? nextSlot.slotNumber : 1);
+        targetBudget *= scale;
+      }
+
+      const budget = Math.floor(Math.min(
+        targetBudget,
+        this.actualKrwBalance * 0.98,
+        exposure.remainingAllowableExposureKrw
+      ));
+
       if (budget < 5000) {
-        this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '❌ 수동 매수 실패: 주문 가능 KRW 잔고 부족' });
+        this.addLog({
+          type: 'SYSTEM',
+          price: this.currentPrice,
+          reason: `❌ 수동 매수 실패: 주문 가능 예산(₩${budget.toLocaleString()})이 업비트 최소 금액(₩5,000) 미만이거나 잔고가 부족합니다.`
+        });
         return;
       }
+
+      const signalType = isAdditional ? 'DCA_BUY' : 'ENTRY_BUY';
       const req = {
-        clientOrderId: `ORD_MANUAL_BUY_${Date.now()}`,
+        clientOrderId: `ORD_MANUAL_${signalType}_${Date.now()}`,
         signalId: `SIG_MANUAL_${Date.now()}`,
         symbol: this.params.symbol,
         side: 'BUY' as const,
-        requestedAmountKrw: Math.floor(budget),
-        reason: '[수동 매수] 사용자 직접 매수 요청',
+        requestedAmountKrw: budget,
+        reason: `[수동 매수] 사용자 직접 매수 (${isAdditional ? '추가 매수' : '1차 진입'}, ₩${budget.toLocaleString()})`,
         createdAt: Date.now()
       };
+
       await this.orderManager.submitOrder(
         req,
         keys,
         this.params.exchange,
-        (record) => this.handleOrderFilled('ENTRY_BUY', record, this.currentPrice),
+        (record) => this.handleOrderFilled(signalType, record, this.currentPrice),
         (err) => this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `❌ 수동 매수 에러: ${err}` })
       );
     } else {
@@ -562,6 +627,7 @@ export class ATREngine {
 
     if (symbolChanged || exchangeChanged) {
       this.marketManager.setSymbol(this.params.exchange, this.params.symbol);
+      this.refreshAtrFromExchange();
       this.fetchRealAccountBalance();
     }
 
@@ -691,6 +757,7 @@ export class ATREngine {
 
   public close() {
     if (this.balanceRefreshTimer) clearInterval(this.balanceRefreshTimer);
+    if (this.atrRefreshTimer) clearInterval(this.atrRefreshTimer);
     this.marketManager.destroy();
   }
 }
