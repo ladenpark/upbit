@@ -458,7 +458,7 @@ export default function App() {
     let minPrice = Infinity;
     let maxPrice = -Infinity;
     priceHistory.forEach((p) => {
-      minPrice = Math.min(minPrice, p.price, p.lowerBand, p.stopLoss);
+      minPrice = Math.min(minPrice, p.price, p.lowerBand);
       maxPrice = Math.max(maxPrice, p.price, p.upperBand);
     });
 
@@ -504,7 +504,7 @@ export default function App() {
     ctx.fillStyle = 'rgba(59, 130, 246, 0.05)';
     ctx.fill();
 
-    // Indicator Lines (ATR Band)
+    // Indicator Lines (ATR Band - Upper & Lower Bands & Baseline)
     const drawLine = (prop: keyof PricePoint, color: string, dash: number[] = [], w = 1.4) => {
       ctx.beginPath();
       ctx.strokeStyle = color;
@@ -520,7 +520,6 @@ export default function App() {
       ctx.setLineDash([]);
     };
 
-    drawLine('stopLoss', '#f43f5e', [3, 3], 1.2);
     drawLine('lowerBand', '#6366f1', [4, 3], 1.5);
     drawLine('baseline', '#cbd5e1', [], 1);
     drawLine('upperBand', '#10b981', [4, 3], 1.5);
@@ -625,6 +624,19 @@ export default function App() {
     if (positionAmount === 0 || !entryPrice) return 0;
     return ((currentPrice - entryPrice) / entryPrice) * 100;
   }, [positionAmount, entryPrice, currentPrice]);
+
+  const calculatedStopLoss = useMemo(() => {
+    const lastPoint = priceHistory[priceHistory.length - 1];
+    if (lastPoint && lastPoint.stopLoss) return lastPoint.stopLoss;
+    const lower = baselineValue - atrValue * atrMultiplier;
+    return Math.round(lower - atrValue * stopLossMultiplier);
+  }, [priceHistory, baselineValue, atrValue, atrMultiplier, stopLossMultiplier]);
+
+  const stopLossPercent = useMemo(() => {
+    const refPrice = positionAmount > 0 && entryPrice ? entryPrice : currentPrice;
+    if (refPrice <= 0) return 0;
+    return ((calculatedStopLoss - refPrice) / refPrice) * 100;
+  }, [calculatedStopLoss, positionAmount, entryPrice, currentPrice]);
 
   const isKrwCurrency = exchange === 'UPBIT' || selectedCoin.startsWith('KRW-');
 
@@ -1120,10 +1132,13 @@ export default function App() {
                     <BarChart2 className="w-3.5 h-3.5 text-blue-600" />
                     <span className="text-xs font-bold text-slate-800">ATR 밴드 실시간 시세</span>
                   </div>
-                  <div className="flex items-center gap-2 text-[9px] font-semibold">
-                    <span className="text-emerald-600 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>익절선</span>
-                    <span className="text-indigo-600 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>매수선</span>
-                    <span className="text-rose-600 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>손절선</span>
+                  <div className="flex items-center gap-1.5 text-[9px] font-semibold flex-wrap justify-end">
+                    <span className="text-emerald-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>익절선</span>
+                    <span className="text-indigo-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>매수선</span>
+                    <span className="px-1.5 py-0.5 rounded-md bg-rose-50 border border-rose-200/80 text-rose-600 font-extrabold flex items-center gap-1 shadow-2xs">
+                      <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
+                      손절: {formatPrice(calculatedStopLoss)} ({stopLossPercent >= 0 ? '+' : ''}{stopLossPercent.toFixed(1)}%)
+                    </span>
                   </div>
                 </div>
 
@@ -1132,6 +1147,9 @@ export default function App() {
                   <div className="absolute top-1.5 left-2 text-[9px] text-slate-400 mono flex items-center gap-1">
                     <Radio className="w-3 h-3 text-emerald-500 animate-pulse" />
                     WebSocket 수신 중
+                  </div>
+                  <div className="absolute bottom-1.5 right-2 text-[8.5px] text-rose-600 font-bold mono bg-white/90 px-1.5 py-0.5 rounded-md border border-rose-200/60 shadow-2xs backdrop-blur-xs">
+                    🛡️ 마지노선 손절: {formatPrice(calculatedStopLoss)} ({stopLossPercent >= 0 ? '+' : ''}{stopLossPercent.toFixed(1)}%)
                   </div>
                 </div>
 
