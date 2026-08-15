@@ -246,7 +246,7 @@
     "avgFillPrice": 2662000,
     "fee": 249.9999997,
     "createdAt": 1786804810382,
-    "updatedAt": 1786807461608,
+    "updatedAt": 1786807644284,
     "reason": "[수동 매수] 사용자 직접 매수 요청",
     "fills": [],
     "exchangeOrderId": "5976af45-8e4d-4fed-a75e-4cbdb86ab6e7"
@@ -280,7 +280,7 @@
     "avgFillPrice": 2663000,
     "fee": 1258.13999556,
     "createdAt": 1786805283986,
-    "updatedAt": 1786807461645,
+    "updatedAt": 1786807644319,
     "reason": "[수동 매수] 사용자 직접 매수 (1차 진입, ₩2,516,280)",
     "fills": [],
     "exchangeOrderId": "39b02032-a531-4dd8-889d-71b5ac6749b5"

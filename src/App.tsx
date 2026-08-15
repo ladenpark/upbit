@@ -666,6 +666,16 @@ export default function App() {
 
   const winRate = totalTrades > 0 ? ((winTrades / totalTrades) * 100).toFixed(1) : '0.0';
 
+  // Trade Confirmation Modal State
+  const [tradeConfirmModal, setTradeConfirmModal] = useState<{
+    type: 'BUY' | 'SELL';
+    title: string;
+    message: string;
+    actionLabel: string;
+    badgeLabel: string;
+    details: { label: string; value: string; highlight?: boolean }[];
+  } | null>(null);
+
   const handleManualBuy = () => {
     sendWsCommand('MANUAL_TRADE', { side: 'BUY' });
     playBeep('BUY');
@@ -674,6 +684,54 @@ export default function App() {
   const handleManualSell = () => {
     sendWsCommand('MANUAL_TRADE', { side: 'SELL' });
     playBeep('SELL');
+  };
+
+  const requestManualBuyConfirm = () => {
+    const isAdditional = positionAmount > 0;
+    const estBudget = currentEquity * ((orderRatio || 20) / 100);
+    setTradeConfirmModal({
+      type: 'BUY',
+      title: isAdditional ? '수동 추가 매수 (DCA) 확인' : '수동 1차 매수 (BUY) 확인',
+      badgeLabel: isAdditional ? '추가 매수' : '1차 진입',
+      message: isAdditional
+        ? '현재 보유 중인 포지션에 추가 매수하여 평단가를 낮춥니다. 주문을 전송하시겠습니까?'
+        : '업비트 시장가로 1차 매수 주문을 전송합니다. 진행하시겠습니까?',
+      actionLabel: isAdditional ? '추가 매수 실행' : '매수 주문 실행',
+      details: [
+        { label: '주문 코인', value: selectedCoin },
+        { label: '예상 주문 금액', value: `${formatPrice(estBudget)} (총자산의 ${orderRatio || 20}%)`, highlight: true },
+        { label: '현재 실시간 시세', value: formatPrice(currentPrice) },
+        ...(isAdditional && entryPrice ? [{ label: '현재 내 평단가', value: formatPrice(entryPrice) }] : [])
+      ]
+    });
+  };
+
+  const requestManualSellConfirm = () => {
+    const coinKey = selectedCoin.replace('KRW-', '');
+    const estTotalValue = positionAmount * currentPrice;
+    setTradeConfirmModal({
+      type: 'SELL',
+      title: '전량 청산 (시장가 매도) 확인',
+      badgeLabel: '긴급 매도',
+      message: '보유 중인 모든 코인을 시장가로 전량 매도하고 봇을 [긴급 정지] 상태로 전환합니다. 정말로 매도하시겠습니까?',
+      actionLabel: '전량 매도 실행',
+      details: [
+        { label: '매도 대상', value: selectedCoin },
+        { label: '매도 수량', value: `${positionAmount.toFixed(6)} ${coinKey} (100% 전량)`, highlight: true },
+        { label: '예상 평가액', value: formatPrice(estTotalValue) },
+        { label: '평가 손익', value: `${unrealizedPnl >= 0 ? '+' : ''}${formatPrice(unrealizedPnl)} (${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}%)` }
+      ]
+    });
+  };
+
+  const handleConfirmTrade = () => {
+    if (!tradeConfirmModal) return;
+    if (tradeConfirmModal.type === 'BUY') {
+      handleManualBuy();
+    } else {
+      handleManualSell();
+    }
+    setTradeConfirmModal(null);
   };
 
   const getBotStateBadge = () => {
@@ -1156,7 +1214,7 @@ export default function App() {
                 {/* Quick Manual Action Buttons */}
                 <div className="grid grid-cols-2 gap-2 pt-1">
                   <button
-                    onClick={handleManualBuy}
+                    onClick={requestManualBuyConfirm}
                     disabled={balance < 5000}
                     className="py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition cursor-pointer"
                   >
@@ -1164,7 +1222,7 @@ export default function App() {
                     <span>{positionAmount > 0 ? '수동 추가 매수' : '수동 매수 (BUY)'}</span>
                   </button>
                   <button
-                    onClick={handleManualSell}
+                    onClick={requestManualSellConfirm}
                     disabled={positionAmount === 0}
                     className="py-2 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition cursor-pointer"
                   >
@@ -2040,6 +2098,82 @@ export default function App() {
                 >
                   확인 닫기
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Trade Confirmation Popup Modal */}
+        {tradeConfirmModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150"
+            onClick={() => setTradeConfirmModal(null)}
+          >
+            <div
+              className="bg-white w-full max-w-sm rounded-3xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col animate-in zoom-in-95 duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal Header */}
+              <div className={`px-5 py-4 border-b flex items-center justify-between ${
+                tradeConfirmModal.type === 'BUY' ? 'bg-emerald-50/80 border-emerald-100' : 'bg-rose-50/80 border-rose-100'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full text-white shadow-2xs ${
+                      tradeConfirmModal.type === 'BUY' ? 'bg-emerald-600' : 'bg-rose-600'
+                    }`}
+                  >
+                    {tradeConfirmModal.badgeLabel}
+                  </span>
+                  <span className={`text-xs font-black ${
+                    tradeConfirmModal.type === 'BUY' ? 'text-emerald-950' : 'text-rose-950'
+                  }`}>
+                    {tradeConfirmModal.title}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setTradeConfirmModal(null)}
+                  className="w-7 h-7 rounded-full bg-slate-200/80 hover:bg-slate-300 text-slate-600 flex items-center justify-center font-bold text-xs transition cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Modal Content */}
+              <div className="p-5 space-y-4 text-xs">
+                <p className="text-slate-600 font-medium leading-relaxed">
+                  {tradeConfirmModal.message}
+                </p>
+
+                {/* Details Card */}
+                <div className="bg-slate-50 rounded-2xl p-3.5 border border-slate-100 space-y-2.5">
+                  {tradeConfirmModal.details.map((item, idx) => (
+                    <div key={idx} className="flex items-center justify-between">
+                      <span className="text-[11px] text-slate-500 font-medium">{item.label}</span>
+                      <span className={`font-bold mono text-xs ${item.highlight ? (tradeConfirmModal.type === 'BUY' ? 'text-emerald-700 font-extrabold' : 'text-rose-700 font-extrabold') : 'text-slate-800'}`}>
+                        {item.value}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Action Buttons */}
+                <div className="grid grid-cols-2 gap-2 pt-1">
+                  <button
+                    onClick={() => setTradeConfirmModal(null)}
+                    className="py-3 px-4 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition cursor-pointer active:scale-98"
+                  >
+                    취소
+                  </button>
+                  <button
+                    onClick={handleConfirmTrade}
+                    className={`py-3 px-4 rounded-2xl text-white font-black text-xs shadow-md active:scale-98 transition cursor-pointer ${
+                      tradeConfirmModal.type === 'BUY' ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/20' : 'bg-rose-600 hover:bg-rose-700 shadow-rose-600/20'
+                    }`}
+                  >
+                    {tradeConfirmModal.actionLabel}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
