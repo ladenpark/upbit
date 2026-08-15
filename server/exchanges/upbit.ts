@@ -165,6 +165,12 @@ export class UpbitClient {
     });
   }
 
+  public reconnect() {
+    console.log('[Upbit WS] 🔄 Reconnecting WebSocket feed...');
+    this.unsubscribe();
+    this.connectWs();
+  }
+
   public unsubscribe() {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -174,6 +180,31 @@ export class UpbitClient {
       this.ws.removeAllListeners();
       this.ws.close();
       this.ws = null;
+    }
+  }
+
+  // REST Ticker Fallback for Watchdog Heartbeat
+  public async fetchTicker(market: string): Promise<UpbitTickerData | null> {
+    const formattedMarket = UpbitClient.formatMarket(market);
+    try {
+      const res = await fetch(`https://api.upbit.com/v1/ticker?markets=${formattedMarket}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        const item = data[0];
+        return {
+          symbol: item.market,
+          price: item.trade_price,
+          change24h: Number((item.signed_change_rate * 100).toFixed(2)),
+          high24h: item.high_price,
+          low24h: item.low_price,
+          volume24h: item.acc_trade_volume_24h,
+          timestamp: item.timestamp || Date.now()
+        };
+      }
+      return null;
+    } catch {
+      return null;
     }
   }
 
