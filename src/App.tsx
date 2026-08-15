@@ -462,6 +462,13 @@ export default function App() {
       maxPrice = Math.max(maxPrice, p.price, p.upperBand);
     });
 
+    if (positionAmount > 0 && entryPrice) {
+      const targetDca = entryPrice * (1 - (safetyOrderStepPercent || 2.0) / 100);
+      const targetPyr = entryPrice * (1 + (pyramidingStepPercent || 1.5) / 100);
+      minPrice = Math.min(minPrice, entryPrice, targetDca);
+      maxPrice = Math.max(maxPrice, entryPrice, targetPyr);
+    }
+
     const priceRange = maxPrice - minPrice || 1;
     const paddedMin = minPrice - priceRange * 0.08;
     const paddedMax = maxPrice + priceRange * 0.08;
@@ -504,7 +511,7 @@ export default function App() {
     ctx.fillStyle = 'rgba(59, 130, 246, 0.05)';
     ctx.fill();
 
-    // Indicator Lines
+    // Indicator Lines (ATR Band)
     const drawLine = (prop: keyof PricePoint, color: string, dash: number[] = [], w = 1.4) => {
       ctx.beginPath();
       ctx.strokeStyle = color;
@@ -524,6 +531,65 @@ export default function App() {
     drawLine('lowerBand', '#6366f1', [4, 3], 1.5);
     drawLine('baseline', '#cbd5e1', [], 1);
     drawLine('upperBand', '#10b981', [4, 3], 1.5);
+
+    // Active Position Target Lines (평단가, DCA 물타기선, 불타기선)
+    if (positionAmount > 0 && entryPrice) {
+      const targetDca = entryPrice * (1 - (safetyOrderStepPercent || 2.0) / 100);
+      const targetPyr = entryPrice * (1 + (pyramidingStepPercent || 1.5) / 100);
+
+      // 1. 내 평단가 (보라색 선)
+      const entryY = getY(entryPrice);
+      if (entryY >= padding.top - 5 && entryY <= height - padding.bottom + 5) {
+        ctx.beginPath();
+        ctx.strokeStyle = '#a855f7';
+        ctx.lineWidth = 1.3;
+        ctx.setLineDash([3, 2]);
+        ctx.moveTo(padding.left, entryY);
+        ctx.lineTo(width - padding.right, entryY);
+        ctx.stroke();
+
+        ctx.fillStyle = '#9333ea';
+        ctx.font = 'bold 8.5px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`내평단 ₩${Math.round(entryPrice).toLocaleString()}`, padding.left + 4, entryY - 3);
+      }
+
+      // 2. DCA 1차 물타기선 (-2.0%)
+      const dcaY = getY(targetDca);
+      if (dcaY >= padding.top - 5 && dcaY <= height - padding.bottom + 5) {
+        ctx.beginPath();
+        ctx.strokeStyle = '#4f46e5';
+        ctx.lineWidth = 1.3;
+        ctx.setLineDash([5, 3]);
+        ctx.moveTo(padding.left, dcaY);
+        ctx.lineTo(width - padding.right, dcaY);
+        ctx.stroke();
+
+        ctx.fillStyle = '#4338ca';
+        ctx.font = 'bold 8.5px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`💧 DCA 물타기 ₩${Math.round(targetDca).toLocaleString()} (-${safetyOrderStepPercent || 2}%)`, padding.left + 4, dcaY + 9);
+      }
+
+      // 3. 상승 불타기 1차선 (+1.5%)
+      const pyrY = getY(targetPyr);
+      if (pyrY >= padding.top - 5 && pyrY <= height - padding.bottom + 5) {
+        ctx.beginPath();
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 1.3;
+        ctx.setLineDash([5, 3]);
+        ctx.moveTo(padding.left, pyrY);
+        ctx.lineTo(width - padding.right, pyrY);
+        ctx.stroke();
+
+        ctx.fillStyle = '#b45309';
+        ctx.font = 'bold 8.5px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`🚀 불타기 ₩${Math.round(targetPyr).toLocaleString()} (+${pyramidingStepPercent || 1.5}%)`, padding.left + 4, pyrY - 3);
+      }
+
+      ctx.setLineDash([]);
+    }
 
     // Price Line
     ctx.beginPath();
@@ -613,7 +679,7 @@ export default function App() {
     ctx.font = 'bold 10px monospace';
     ctx.textAlign = 'left';
     ctx.fillText(formatPrice(lastPoint.price, selectedCoin), width - padding.right + 7, curY + 3.5);
-  }, [priceHistory, selectedCoin, exchange]);
+  }, [priceHistory, selectedCoin, exchange, positionAmount, entryPrice, safetyOrderStepPercent, pyramidingStepPercent]);
 
   // Position calculations
   const unrealizedPnl = useMemo(() => {
@@ -1120,10 +1186,17 @@ export default function App() {
                     <BarChart2 className="w-3.5 h-3.5 text-blue-600" />
                     <span className="text-xs font-bold text-slate-800">ATR 밴드 실시간 시세</span>
                   </div>
-                  <div className="flex items-center gap-2 text-[9px] font-semibold">
-                    <span className="text-emerald-600 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>익절선</span>
-                    <span className="text-indigo-600 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>매수선</span>
-                    <span className="text-rose-600 flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>손절선</span>
+                  <div className="flex items-center gap-1.5 text-[8.5px] font-bold flex-wrap justify-end">
+                    {positionAmount > 0 && (
+                      <>
+                        <span className="text-purple-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-purple-500"></span>내평단</span>
+                        <span className="text-indigo-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-indigo-600"></span>DCA(-2%)</span>
+                        <span className="text-amber-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>불타기(+1.5%)</span>
+                      </>
+                    )}
+                    <span className="text-emerald-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>익절선</span>
+                    <span className="text-indigo-400 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>매수선</span>
+                    <span className="text-rose-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>손절선</span>
                   </div>
                 </div>
 
