@@ -194,94 +194,112 @@ export default function App() {
     }
   };
 
-  // Connect to Backend WebSocket
+  // Connect to Backend WebSocket with Auto-Reconnect
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
-    console.log(`Connecting to backend WebSocket at ${wsUrl}`);
+    let reconnectTimeout: NodeJS.Timeout | null = null;
+    let isUnmounted = false;
 
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    const connectWs = () => {
+      if (isUnmounted) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      console.log(`Connecting to backend WebSocket at ${wsUrl}`);
 
-    ws.onopen = () => {
-      console.log('Connected to Full-Stack ATR Backend!');
-      setWsConnected(true);
-    };
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'STATE_UPDATE') {
-          const s = data.payload;
-          if (s.params) {
-            setIsBotActive(s.params.isBotActive);
-            setSelectedCoin(s.params.symbol);
-            setAtrMultiplier(s.params.atrMultiplier);
-            setOrderRatio(s.params.orderRatio);
-            setStopLossMultiplier(s.params.stopLossMultiplier);
-            if (s.params.dcaEnabled !== undefined) setDcaEnabled(s.params.dcaEnabled);
-            if (s.params.maxSafetyOrders !== undefined) setMaxSafetyOrders(s.params.maxSafetyOrders);
-            if (s.params.safetyOrderStepPercent !== undefined) setSafetyOrderStepPercent(s.params.safetyOrderStepPercent);
-            if (s.params.trailingStopEnabled !== undefined) setTrailingStopEnabled(s.params.trailingStopEnabled);
-            if (s.params.trailingCallbackPercent !== undefined) setTrailingCallbackPercent(s.params.trailingCallbackPercent);
-            if (s.params.pyramidingEnabled !== undefined) setPyramidingEnabled(s.params.pyramidingEnabled);
-            if (s.params.maxPyramidingOrders !== undefined) setMaxPyramidingOrders(s.params.maxPyramidingOrders);
-            if (s.params.pyramidingStepPercent !== undefined) setPyramidingStepPercent(s.params.pyramidingStepPercent);
-            if (s.params.partialLossCutEnabled !== undefined) setPartialLossCutEnabled(s.params.partialLossCutEnabled);
-            if (s.params.partialLossCutPercent !== undefined) setPartialLossCutPercent(s.params.partialLossCutPercent);
-            if (s.params.partialLossCutThreshold !== undefined) setPartialLossCutThreshold(s.params.partialLossCutThreshold);
-            if (s.params.trendAwareCutEnabled !== undefined) setTrendAwareCutEnabled(s.params.trendAwareCutEnabled);
-            if (s.params.trendDropSpeedThreshold !== undefined) setTrendDropSpeedThreshold(s.params.trendDropSpeedThreshold);
-            if (s.params.autoPilotEnabled !== undefined) setAutoPilotEnabled(s.params.autoPilotEnabled);
+      ws.onopen = () => {
+        console.log('Connected to Full-Stack ATR Backend!');
+        setWsConnected(true);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'STATE_UPDATE') {
+            const s = data.payload;
+            if (s.params) {
+              setIsBotActive(s.params.isBotActive);
+              setSelectedCoin(s.params.symbol);
+              setAtrMultiplier(s.params.atrMultiplier);
+              setOrderRatio(s.params.orderRatio);
+              setStopLossMultiplier(s.params.stopLossMultiplier);
+              if (s.params.dcaEnabled !== undefined) setDcaEnabled(s.params.dcaEnabled);
+              if (s.params.maxSafetyOrders !== undefined) setMaxSafetyOrders(s.params.maxSafetyOrders);
+              if (s.params.safetyOrderStepPercent !== undefined) setSafetyOrderStepPercent(s.params.safetyOrderStepPercent);
+              if (s.params.trailingStopEnabled !== undefined) setTrailingStopEnabled(s.params.trailingStopEnabled);
+              if (s.params.trailingCallbackPercent !== undefined) setTrailingCallbackPercent(s.params.trailingCallbackPercent);
+              if (s.params.pyramidingEnabled !== undefined) setPyramidingEnabled(s.params.pyramidingEnabled);
+              if (s.params.maxPyramidingOrders !== undefined) setMaxPyramidingOrders(s.params.maxPyramidingOrders);
+              if (s.params.pyramidingStepPercent !== undefined) setPyramidingStepPercent(s.params.pyramidingStepPercent);
+              if (s.params.partialLossCutEnabled !== undefined) setPartialLossCutEnabled(s.params.partialLossCutEnabled);
+              if (s.params.partialLossCutPercent !== undefined) setPartialLossCutPercent(s.params.partialLossCutPercent);
+              if (s.params.partialLossCutThreshold !== undefined) setPartialLossCutThreshold(s.params.partialLossCutThreshold);
+              if (s.params.trendAwareCutEnabled !== undefined) setTrendAwareCutEnabled(s.params.trendAwareCutEnabled);
+              if (s.params.trendDropSpeedThreshold !== undefined) setTrendDropSpeedThreshold(s.params.trendDropSpeedThreshold);
+              if (s.params.autoPilotEnabled !== undefined) setAutoPilotEnabled(s.params.autoPilotEnabled);
+            }
+            if (s.botState !== undefined) setBotLifecycleState(s.botState);
+            if (s.marketState !== undefined) setMarketFeedState(s.marketState);
+            if (s.marketRegime !== undefined) setMarketRegime(s.marketRegime);
+            if (s.initialBalance !== undefined) setInitialBalance(s.initialBalance);
+            if (s.balance !== undefined) setBalance(s.balance);
+            if (s.position) {
+              setPositionAmount(s.position.amount);
+              setEntryPrice(s.position.entryPrice);
+              if (s.position.state) setPositionLifecycleState(s.position.state);
+            }
+            if (s.safetyOrderCount !== undefined) setSafetyOrderCount(s.safetyOrderCount);
+            if (s.pyramidingCount !== undefined) setPyramidingCount(s.pyramidingCount);
+            if (s.awaitingReentry !== undefined) setAwaitingReentry(s.awaitingReentry);
+            if (s.isTrailingActive !== undefined) setIsTrailingActive(s.isTrailingActive);
+            if (s.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.trailingPeakPrice);
+            if (s.totalRealizedPnl !== undefined) setTotalRealizedPnl(s.totalRealizedPnl);
+            if (s.totalTrades !== undefined) setTotalTrades(s.totalTrades);
+            if (s.winTrades !== undefined) setWinTrades(s.winTrades);
+            if (s.currentPrice !== undefined) setCurrentPrice(s.currentPrice);
+            if (s.atrValue !== undefined) setAtrValue(s.atrValue);
+            if (s.baselineValue !== undefined) setBaselineValue(s.baselineValue);
+            if (s.priceHistory) setPriceHistory(s.priceHistory);
+            if (s.logs) setLogs(s.logs);
+            if (s.realBalances) setRealBalances(s.realBalances);
+            if (s.hasApiKeys) setHasApiKeys(s.hasApiKeys);
+            if (s.nextOrderInfo) setNextOrderInfo(s.nextOrderInfo);
+          } else if (data.type === 'TEST_API_KEYS_RESULT') {
+            const res = data.payload;
+            if (res.success) {
+              if (res.balances) setRealBalances(res.balances);
+              const assets = res.balances ? Object.keys(res.balances).join(', ') : 'OK';
+              setApiKeyTestStatus(`✅ Upbit API 연결 성공! 실시간 보유 자산 (${assets}) 수신 완료`);
+            } else {
+              setApiKeyTestStatus(`❌ Upbit API 연결 실패: ${res.error}`);
+            }
           }
-          if (s.botState !== undefined) setBotLifecycleState(s.botState);
-          if (s.marketState !== undefined) setMarketFeedState(s.marketState);
-          if (s.marketRegime !== undefined) setMarketRegime(s.marketRegime);
-          if (s.initialBalance !== undefined) setInitialBalance(s.initialBalance);
-          if (s.balance !== undefined) setBalance(s.balance);
-          if (s.position) {
-            setPositionAmount(s.position.amount);
-            setEntryPrice(s.position.entryPrice);
-            if (s.position.state) setPositionLifecycleState(s.position.state);
-          }
-          if (s.safetyOrderCount !== undefined) setSafetyOrderCount(s.safetyOrderCount);
-          if (s.pyramidingCount !== undefined) setPyramidingCount(s.pyramidingCount);
-          if (s.awaitingReentry !== undefined) setAwaitingReentry(s.awaitingReentry);
-          if (s.isTrailingActive !== undefined) setIsTrailingActive(s.isTrailingActive);
-          if (s.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.trailingPeakPrice);
-          if (s.totalRealizedPnl !== undefined) setTotalRealizedPnl(s.totalRealizedPnl);
-          if (s.totalTrades !== undefined) setTotalTrades(s.totalTrades);
-          if (s.winTrades !== undefined) setWinTrades(s.winTrades);
-          if (s.currentPrice !== undefined) setCurrentPrice(s.currentPrice);
-          if (s.atrValue !== undefined) setAtrValue(s.atrValue);
-          if (s.baselineValue !== undefined) setBaselineValue(s.baselineValue);
-          if (s.priceHistory) setPriceHistory(s.priceHistory);
-          if (s.logs) setLogs(s.logs);
-          if (s.realBalances) setRealBalances(s.realBalances);
-          if (s.hasApiKeys) setHasApiKeys(s.hasApiKeys);
-          if (s.nextOrderInfo) setNextOrderInfo(s.nextOrderInfo);
-        } else if (data.type === 'TEST_API_KEYS_RESULT') {
-          const res = data.payload;
-          if (res.success) {
-            if (res.balances) setRealBalances(res.balances);
-            const assets = res.balances ? Object.keys(res.balances).join(', ') : 'OK';
-            setApiKeyTestStatus(`✅ Upbit API 연결 성공! 실시간 보유 자산 (${assets}) 수신 완료`);
-          } else {
-            setApiKeyTestStatus(`❌ Upbit API 연결 실패: ${res.error}`);
-          }
+        } catch (err) {
+          console.error('Error parsing backend WS message:', err);
         }
-      } catch (err) {
-        console.error('Error parsing backend WS message:', err);
-      }
+      };
+
+      ws.onclose = () => {
+        console.log('Backend WS Disconnected. Retrying in 2s...');
+        setWsConnected(false);
+        if (!isUnmounted) {
+          reconnectTimeout = setTimeout(connectWs, 2000);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.warn('Backend WS Error:', err);
+        ws.close();
+      };
     };
 
-    ws.onclose = () => {
-      console.log('Backend WS Disconnected');
-      setWsConnected(false);
-    };
+    connectWs();
 
     return () => {
-      ws.close();
+      isUnmounted = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (wsRef.current) wsRef.current.close();
     };
   }, []);
 
