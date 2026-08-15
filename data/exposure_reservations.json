@@ -1,0 +1,107 @@
+[
+  {
+    "id": "RES_1786803475178_43zlfb",
+    "clientOrderId": "ORD_TEST_PENDING_001",
+    "amountKrw": 1500000,
+    "createdAt": 1786803475178,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786801554695_n7rrza",
+    "clientOrderId": "ORD_RESERVE_TEST_1786801554695",
+    "amountKrw": 500000,
+    "createdAt": 1786801554695,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786801554696_elw9l",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786801554696",
+    "amountKrw": 300000,
+    "createdAt": 1786801554696,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786801590127_i2fo0d",
+    "clientOrderId": "ORD_RESERVE_TEST_1786801590127",
+    "amountKrw": 500000,
+    "createdAt": 1786801590127,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786801590128_vsdndj",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786801590128",
+    "amountKrw": 300000,
+    "createdAt": 1786801590128,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786801609302_y84dt",
+    "clientOrderId": "ORD_RESERVE_TEST_1786801609302",
+    "amountKrw": 500000,
+    "createdAt": 1786801609302,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786801609303_bb207m",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786801609303",
+    "amountKrw": 300000,
+    "createdAt": 1786801609303,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786801905840_6hocvg",
+    "clientOrderId": "ORD_RESERVE_TEST_1786801905840",
+    "amountKrw": 500000,
+    "createdAt": 1786801905840,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786801905842_mljawl",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786801905842",
+    "amountKrw": 300000,
+    "createdAt": 1786801905842,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786802579519_zcutff",
+    "clientOrderId": "ORD_RESERVE_TEST_1786802579519",
+    "amountKrw": 500000,
+    "createdAt": 1786802579519,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786802579524_oallpb",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786802579524",
+    "amountKrw": 300000,
+    "createdAt": 1786802579524,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786803099749_axk5uw",
+    "clientOrderId": "ORD_RESERVE_TEST_1786803099748",
+    "amountKrw": 500000,
+    "createdAt": 1786803099749,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786803099749_iq8kzg",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786803099749",
+    "amountKrw": 300000,
+    "createdAt": 1786803099749,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1786803475187_17t9l8",
+    "clientOrderId": "ORD_RESERVE_TEST_1786803475187",
+    "amountKrw": 500000,
+    "createdAt": 1786803475187,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1786803475192_gj37h",
+    "clientOrderId": "ORD_RESERVE_TEST_2_1786803475192",
+    "amountKrw": 300000,
+    "createdAt": 1786803475192,
+    "status": "RELEASED"
+  }
+]

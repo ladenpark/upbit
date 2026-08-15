@@ -2,8 +2,9 @@ import express from 'express';
 import http from 'http';
 import { WebSocketServer, WebSocket, RawData } from 'ws';
 import path from 'path';
-import { ATREngine, ApiKeys, BotParams } from './strategy/atrEngine';
-import { BinanceClient } from './exchanges/binance';
+import { ATREngine } from './strategy/atrEngine';
+import { ApiKeys, BotParams } from './types/trading';
+import { SecretManager } from './security/secretManager';
 import { UpbitClient } from './exchanges/upbit';
 
 const app = express();
@@ -22,6 +23,7 @@ app.use((req, res, next) => {
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+const secretManager = SecretManager.getInstance();
 
 // Instantiate ATR Strategy Engine
 const engine = new ATREngine((state) => {
@@ -61,53 +63,32 @@ wss.on('connection', (ws: WebSocket) => {
 
         case 'SAVE_API_KEYS': {
           const keys = data.payload as ApiKeys;
-          const trimmedKeys: ApiKeys = {
-            binanceApiKey: keys.binanceApiKey?.trim(),
-            binanceApiSecret: keys.binanceApiSecret?.trim(),
-            upbitAccessKey: keys.upbitAccessKey?.trim(),
-            upbitSecretKey: keys.upbitSecretKey?.trim()
-          };
-          engine.setApiKeys(trimmedKeys);
+          engine.setApiKeys(keys);
           ws.send(JSON.stringify({
             type: 'API_KEYS_STATUS',
-            payload: { success: true, message: 'API keys saved successfully.' }
+            payload: { success: true, message: 'API keys securely saved.' }
           }));
           break;
         }
 
         case 'TEST_API_KEYS': {
-          const { exchange, binanceApiKey, binanceApiSecret, upbitAccessKey, upbitSecretKey } = data.payload;
-          if (exchange === 'BINANCE') {
-            const bKey = (binanceApiKey || engine.apiKeys.binanceApiKey || '').trim();
-            const bSec = (binanceApiSecret || engine.apiKeys.binanceApiSecret || '').trim();
-            const client = new BinanceClient();
-            const res = await client.getAccountBalance(bKey, bSec);
-            if (res.success && res.balances) {
-              engine.realBalances = res.balances;
-              engine.notifyClients();
-            }
-            ws.send(JSON.stringify({ type: 'TEST_API_KEYS_RESULT', payload: res }));
-          } else if (exchange === 'UPBIT') {
-            const uAcc = (upbitAccessKey || engine.apiKeys.upbitAccessKey || '').trim();
-            const uSec = (upbitSecretKey || engine.apiKeys.upbitSecretKey || '').trim();
-            const client = new UpbitClient();
-            const res = await client.getAccountBalance(uAcc, uSec);
-            if (res.success && res.balances) {
-              engine.realBalances = res.balances;
-              engine.notifyClients();
-            }
-            ws.send(JSON.stringify({ type: 'TEST_API_KEYS_RESULT', payload: res }));
+          const { upbitAccessKey, upbitSecretKey } = data.payload;
+          const currentKeys = secretManager.getKeys();
+          const uAcc = (upbitAccessKey || currentKeys.upbitAccessKey || '').trim();
+          const uSec = (upbitSecretKey || currentKeys.upbitSecretKey || '').trim();
+          const client = new UpbitClient();
+          const res = await client.getAccountBalance(uAcc, uSec);
+          if (res.success && res.balances) {
+            engine.realBalances = res.balances;
+            engine.notifyClients();
           }
+          ws.send(JSON.stringify({ type: 'TEST_API_KEYS_RESULT', payload: res }));
           break;
         }
 
         case 'MANUAL_TRADE': {
           const side = data.payload.side as 'BUY' | 'SELL';
-          if (side === 'BUY') {
-            engine.processTick(engine.baselineValue - (engine.atrValue * engine.params.atrMultiplier * 1.1), engine.params.symbol);
-          } else {
-            engine.processTick(engine.baselineValue + (engine.atrValue * engine.params.atrMultiplier * 1.1), engine.params.symbol);
-          }
+          await engine.executeManualTrade(side);
           break;
         }
 
@@ -140,38 +121,41 @@ app.post('/api/config', (req, res) => {
 
 app.post('/api/keys', (req, res) => {
   engine.setApiKeys(req.body);
-  res.json({ success: true, message: 'API keys updated successfully.' });
+  res.json({ success: true, message: 'API keys updated securely.' });
 });
 
 app.post('/api/keys/test', async (req, res) => {
-  const { exchange } = req.body;
-  if (exchange === 'BINANCE') {
-    const client = new BinanceClient();
-    const result = await client.getAccountBalance(
-      engine.apiKeys.binanceApiKey || '',
-      engine.apiKeys.binanceApiSecret || ''
-    );
-    return res.json(result);
-  } else if (exchange === 'UPBIT') {
-    const client = new UpbitClient();
-    const result = await client.getAccountBalance(
-      engine.apiKeys.upbitAccessKey || '',
-      engine.apiKeys.upbitSecretKey || ''
-    );
-    return res.json(result);
-  }
-  res.status(400).json({ success: false, error: 'Invalid exchange' });
+  const currentKeys = secretManager.getKeys();
+  const client = new UpbitClient();
+  const result = await client.getAccountBalance(
+    currentKeys.upbitAccessKey || '',
+    currentKeys.upbitSecretKey || ''
+  );
+  return res.json(result);
 });
 
-// Start Server & Exchange Streams
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`====================================================`);
-  console.log(`🚀 ATR Trading Bot Full-Stack Server Running!`);
-  console.log(`🌐 HTTP Server: http://localhost:${PORT}`);
-  console.log(`⚡ WebSocket Server: ws://localhost:${PORT}`);
-  console.log(`====================================================`);
+// Serve static files from Vite build (dist)
+const distPath = path.resolve(process.cwd(), 'dist');
+app.use(express.static(distPath));
 
-  // Start real-time exchange streams
-  engine.startExchangeStream();
+// SPA fallback for non-API routes
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/ws')) {
+    return next();
+  }
+  res.sendFile(path.join(distPath, 'index.html'), (err) => {
+    if (err) {
+      next();
+    }
+  });
+});
+
+// Start Server
+const PORT = Number(process.env.PORT) || 3005;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`====================================================`);
+  console.log(`🚀 Upbit ATR Quantitative Bot Server Running!`);
+  console.log(`🌐 HTTP Server: http://0.0.0.0:${PORT}`);
+  console.log(`⚡ WebSocket Server: ws://0.0.0.0:${PORT}/ws`);
+  console.log(`====================================================`);
 });

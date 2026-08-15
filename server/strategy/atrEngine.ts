@@ -1,88 +1,154 @@
-import { BinanceClient, BinanceTickerData } from '../exchanges/binance';
-import { UpbitClient, UpbitTickerData } from '../exchanges/upbit';
-
-export interface TradeLog {
-  id: string;
-  time: string;
-  type: 'BUY' | 'SELL' | 'STOP_LOSS' | 'SYSTEM';
-  price: number;
-  reason: string;
-  amount?: number;
-  pnl?: number;
-  pnlPercent?: number;
-  exchange?: string;
-  executionMode?: 'PAPER' | 'REAL';
-}
-
-export interface PricePoint {
-  time: number;
-  timeLabel: string;
-  price: number;
-  upperBand: number;
-  baseline: number;
-  lowerBand: number;
-  stopLoss: number;
-  event?: 'BUY' | 'SELL' | 'STOP_LOSS';
-}
-
-export interface BotParams {
-  atrMultiplier: number;
-  orderRatio: number;
-  stopLossMultiplier: number;
-  isBotActive: boolean;
-  exchange: 'BINANCE' | 'UPBIT' | 'SIMULATION';
-  symbol: string;
-  executionMode: 'PAPER' | 'REAL';
-}
-
-export interface ApiKeys {
-  binanceApiKey?: string;
-  binanceApiSecret?: string;
-  upbitAccessKey?: string;
-  upbitSecretKey?: string;
-}
+import {
+  BotParams,
+  TradeLog,
+  PricePoint,
+  BotLifecycleState,
+  MarketDataState,
+  ApiKeys
+} from '../types/trading';
+import { SecretManager } from '../security/secretManager';
+import { MarketDataManager } from '../market/marketDataManager';
+import { ATRStrategyCore } from './atrStrategyCore';
+import { GlobalRiskGovernor } from '../risk/globalRiskGovernor';
+import { PositionManager } from '../position/positionManager';
+import { OrderManager } from '../orders/orderManager';
+import { UpbitClient } from '../exchanges/upbit';
+import { ApiGateway } from '../gateway/apiGateway';
 
 export class ATREngine {
-  private binanceClient: BinanceClient;
+  // Sub-modules
+  private secretManager: SecretManager;
+  private marketManager: MarketDataManager;
+  private strategyCore: ATRStrategyCore;
+  private riskGovernor: GlobalRiskGovernor;
+  public positionManager: PositionManager;
+  public orderManager: OrderManager;
   private upbitClient: UpbitClient;
+  private apiGateway: ApiGateway;
 
-  // Bot State
+  // Bot Lifecycle State
+  public botState: BotLifecycleState = 'PAUSED';
+
+  // Strategy Core Parameters
   public params: BotParams = {
-    atrMultiplier: 2.0,
+    atrMultiplier: 3.0,
     orderRatio: 25,
-    stopLossMultiplier: 1.5,
+    stopLossMultiplier: 2.0,
     isBotActive: false,
-    exchange: 'BINANCE',
-    symbol: 'BTC/USDT',
-    executionMode: 'PAPER'
+    exchange: 'UPBIT',
+    symbol: 'KRW-ETH',
+    maxExposurePercent: 85,
+    dcaEnabled: true,
+    maxSafetyOrders: 3,
+    safetyOrderStepPercent: 2.0,
+    safetyOrderVolumeScale: 1.2,
+    trailingStopEnabled: true,
+    trailingCallbackPercent: 0.8,
+    pyramidingEnabled: true,
+    maxPyramidingOrders: 2,
+    pyramidingStepPercent: 1.5,
+    partialLossCutEnabled: true,
+    partialLossCutPercent: 40,
+    partialLossCutThreshold: 3.5,
+    trendAwareCutEnabled: true,
+    trendDropSpeedThreshold: 0.6,
+    trendDropWindowSeconds: 5,
+    cooldownSecondsAfterCut: 60,
+    autoPilotEnabled: true
   };
 
-  public apiKeys: ApiKeys = {};
+  // Live Metrics
+  public currentPrice = 2650000.0;
+  public atrValue = 35000.0;
+  public baselineValue = 2650000.0;
+  public marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR' = 'SIDEWAYS';
+  public totalRealizedPnl = 0;
+  public totalTrades = 0;
+  public winTrades = 0;
 
-  public balance: number = 10000.0;
-  public initialBalance: number = 10000.0;
-  public position: { amount: number; entryPrice: number | null } = { amount: 0, entryPrice: null };
-
-  public totalRealizedPnl: number = 0;
-  public totalTrades: number = 0;
-  public winTrades: number = 0;
-
-  public currentPrice: number = 96450.0;
-  public atrValue: number = 1250.0;
-  public baselineValue: number = 96450.0;
+  public actualKrwBalance = 0;
+  public realBalances: Record<string, number> = {};
+  public initialBalance = 0;
 
   public priceHistory: PricePoint[] = [];
   public logs: TradeLog[] = [];
-  private recentPrices: number[] = [];
 
   private broadcastCallback?: (payload: any) => void;
-  private simulationTimer: NodeJS.Timeout | null = null;
+  private balanceRefreshTimer: NodeJS.Timeout | null = null;
 
   constructor(broadcastCallback?: (payload: any) => void) {
-    this.binanceClient = new BinanceClient();
-    this.upbitClient = new UpbitClient();
     this.broadcastCallback = broadcastCallback;
+    this.secretManager = SecretManager.getInstance();
+    this.upbitClient = new UpbitClient();
+    this.apiGateway = ApiGateway.getInstance();
+
+    this.strategyCore = new ATRStrategyCore();
+    this.riskGovernor = new GlobalRiskGovernor(this.params);
+    this.positionManager = new PositionManager(this.params);
+    this.orderManager = new OrderManager(
+      this.riskGovernor,
+      (record, prevFilledVolume) => {
+        const added = record.filledVolume - prevFilledVolume;
+        console.log(`[ATREngine] 🔔 Async Order Fill update received for ${record.clientOrderId} (${record.status}): Total Filled = ${record.filledVolume} (added +${added})`);
+        if (record.signalType && added > 0) {
+          this.handleOrderFilled(record.signalType, record, this.currentPrice, added);
+        }
+      }
+    );
+
     this.initDefaultHistory();
+
+    // Initialize Market Data Manager with tick dispatcher
+    this.marketManager = new MarketDataManager(
+      this.params.exchange,
+      this.params.symbol,
+      (price, ts) => this.handleMarketTick(price, ts),
+      (marketState) => {
+        console.log(`[ATREngine] Market Feed state changed ➡️ ${marketState}`);
+        this.notifyClients();
+      }
+    );
+
+    // Initial account balance load & reconciliation
+    this.reconcileOnStartup();
+
+    // Start periodic background balance sync (every 10s)
+    this.balanceRefreshTimer = setInterval(() => {
+      this.fetchRealAccountBalance();
+    }, 10000);
+  }
+
+  public async reconcileOnStartup() {
+    console.log('[ATREngine] 🔄 Starting complete startup state reconciliation...');
+    try {
+      const keys = this.secretManager.getKeys();
+      if (keys.upbitAccessKey && keys.upbitSecretKey) {
+        // 1. Reconcile Pending Orders from disk against Upbit Exchange
+        await this.orderManager.reconcilePendingOrdersOnStartup(keys, 'UPBIT', this.params.symbol);
+
+        // 2. Sync Real Account Balances
+        await this.fetchRealAccountBalance();
+
+        // 3. Query Open Orders on Exchange
+        const openRes = await this.upbitClient.getOpenOrders(keys.upbitAccessKey, keys.upbitSecretKey, this.params.symbol);
+        if (openRes.success && Array.isArray(openRes.orders)) {
+          console.log(`[ATREngine] 📋 Exchange active open orders: ${openRes.orders.length}`);
+        }
+
+        // 4. Sync Position with authoritative coin holding
+        const coinKey = this.params.symbol.replace('KRW-', '');
+        const realQty = this.realBalances[coinKey] || 0;
+        this.positionManager.reconcileWithExchange(realQty, this.currentPrice);
+
+        this.addLog({
+          type: 'SYSTEM',
+          price: this.currentPrice,
+          reason: `[시스템 복구 완료] 거래소 계좌 및 포지션 상태 동기화 완료 (보유: ${realQty} ${coinKey})`
+        });
+      }
+    } catch (e: any) {
+      console.error('[ATREngine] Startup reconciliation error:', e.message);
+    }
   }
 
   public setBroadcastCallback(cb: (payload: any) => void) {
@@ -94,15 +160,12 @@ export class ATREngine {
     const atr = this.atrValue;
     const now = Date.now();
     const history: PricePoint[] = [];
-
     let tempPrice = base;
-    this.recentPrices = [];
 
     for (let i = 35; i >= 0; i--) {
       const time = now - i * 1000;
       const noise = (Math.random() - 0.5) * (atr * 0.35);
       tempPrice = Math.max(tempPrice + noise, base * 0.8);
-      this.recentPrices.push(tempPrice);
 
       const baseline = base + Math.sin(i * 0.2) * (atr * 0.4);
       const upper = baseline + atr * this.params.atrMultiplier;
@@ -124,336 +187,359 @@ export class ATREngine {
     }
 
     this.priceHistory = history;
-    this.addLog({
-      type: 'SYSTEM',
-      price: tempPrice,
-      reason: `백엔드 엔진 초기화 완료 (${this.params.exchange} - ${this.params.symbol})`
-    });
   }
 
-  public async startExchangeStream() {
-    this.stopExchangeStream();
-
-    const { exchange, symbol } = this.params;
-
-    if (exchange === 'BINANCE') {
-      const formatted = BinanceClient.formatSymbol(symbol);
-      console.log(`[ATREngine] Seeding klines from Binance for ${formatted}...`);
-      const klines = await this.binanceClient.fetchKlines(formatted, '1m', 30);
-      if (klines.length > 0) {
-        this.updateHistoryFromKlines(
-          klines.map((k) => ({ price: k.close, high: k.high, low: k.low, timestamp: k.closeTime }))
-        );
-      }
-
-      this.binanceClient.subscribeTicker(symbol, (ticker: BinanceTickerData) => {
-        this.processTick(ticker.price, ticker.symbol);
-      });
-    } else if (exchange === 'UPBIT') {
-      const formatted = UpbitClient.formatMarket(symbol);
-      console.log(`[ATREngine] Seeding candles from Upbit for ${formatted}...`);
-      const candles = await this.upbitClient.fetchCandles(formatted, 30);
-      if (candles.length > 0) {
-        this.updateHistoryFromKlines(
-          candles.map((c) => ({ price: c.trade_price, high: c.high_price, low: c.low_price, timestamp: c.timestamp }))
-        );
-      }
-
-      this.upbitClient.subscribeTicker(symbol, (ticker: UpbitTickerData) => {
-        this.processTick(ticker.price, ticker.symbol);
-      });
-    } else {
-      // SIMULATION
-      console.log('[ATREngine] Starting Simulation loop...');
-      this.simulationTimer = setInterval(() => {
-        const base = this.currentPrice;
-        const atr = this.atrValue;
-        const meanReversion = (base - this.currentPrice) * 0.05;
-        const noise = (Math.random() - 0.49) * atr * 0.45;
-        const nextPrice = Number((this.currentPrice + meanReversion + noise).toFixed(2));
-        this.processTick(nextPrice, this.params.symbol);
-      }, 1000);
-    }
-  }
-
-  public stopExchangeStream() {
-    this.binanceClient.unsubscribe();
-    this.upbitClient.unsubscribe();
-    if (this.simulationTimer) {
-      clearInterval(this.simulationTimer);
-      this.simulationTimer = null;
-    }
-  }
-
-  private updateHistoryFromKlines(candles: { price: number; high: number; low: number; timestamp: number }[]) {
-    if (candles.length === 0) return;
-    this.recentPrices = candles.map((c) => c.price);
-    const lastPrice = candles[candles.length - 1].price;
-    this.currentPrice = lastPrice;
-
-    // Estimate ATR from high-low ranges
-    let trSum = 0;
-    for (let i = 0; i < candles.length; i++) {
-      trSum += Math.abs(candles[i].high - candles[i].low);
-    }
-    this.atrValue = Number((trSum / candles.length).toFixed(2)) || (lastPrice * 0.015);
-    this.baselineValue = Number((this.recentPrices.reduce((a, b) => a + b, 0) / this.recentPrices.length).toFixed(2));
-  }
-
-  public processTick(price: number, rawSymbol: string) {
+  /**
+   * Main Market Tick Dispatcher & Deterministic Decision Loop
+   */
+  public async handleMarketTick(price: number, timestamp: number) {
     this.currentPrice = price;
-    this.recentPrices.push(price);
-    if (this.recentPrices.length > 50) this.recentPrices.shift();
 
-    // Recompute indicators
-    const sum = this.recentPrices.reduce((a, b) => a + b, 0);
-    this.baselineValue = Number((sum / this.recentPrices.length).toFixed(2));
+    // Update ATR baseline & bands
+    const effectiveAtr = this.atrValue;
+    const lowerBand = this.baselineValue - (effectiveAtr * this.params.atrMultiplier);
+    const upperBand = this.baselineValue + (effectiveAtr * this.params.atrMultiplier);
+    const staticStopPrice = this.positionManager.getSnapshot().initialStopPrice || (lowerBand - (effectiveAtr * this.params.stopLossMultiplier));
 
-    // Dynamic ATR estimation
-    if (this.recentPrices.length > 5) {
-      let trSum = 0;
-      for (let i = 1; i < this.recentPrices.length; i++) {
-        trSum += Math.abs(this.recentPrices[i] - this.recentPrices[i - 1]);
+    // Update trailing state if price touches upper band
+    this.positionManager.updateTrailingState(price, upperBand);
+
+    // Calculate drop speed over explicit 5-second window
+    const dropSpeed = this.marketManager.calculateDropSpeed(this.params.trendDropWindowSeconds || 5);
+
+    // Build price history array for adaptive indicators
+    const historyPrices = this.priceHistory.map((p) => p.price);
+    historyPrices.push(price);
+
+    // Evaluate dynamic auto-pilot indicators
+    const adaptive = this.strategyCore.evaluateAdaptiveParams(
+      price,
+      this.baselineValue,
+      this.atrValue,
+      this.params,
+      historyPrices
+    );
+
+    if (adaptive.marketRegime !== this.marketRegime) {
+      this.marketRegime = adaptive.marketRegime;
+    }
+
+    // 1. Generate Strategy Signals
+    const position = this.positionManager.getSnapshot();
+    const candidateSignals = this.strategyCore.generateSignals(
+      price,
+      this.baselineValue,
+      this.atrValue,
+      this.params,
+      position,
+      dropSpeed,
+      historyPrices
+    );
+
+    // 2. Pass highest-priority signal through Global Risk Governor
+    if (candidateSignals.length > 0) {
+      // Sort by priority ascending (1 = Absolute Stop Loss, 2 = Emergency Cut, etc.)
+      candidateSignals.sort((a, b) => a.priority - b.priority);
+      const topSignal = candidateSignals[0];
+
+      const riskResult = this.riskGovernor.evaluateSignal(
+        topSignal,
+        this.botState,
+        this.marketManager.marketState,
+        this.actualKrwBalance,
+        position,
+        price,
+        this.orderManager.getPendingOrders(),
+        0
+      );
+
+      if (riskResult.approved && riskResult.orderRequest) {
+        const clientOrderId = riskResult.orderRequest.clientOrderId;
+        console.log(`[ATREngine] 🎯 Signal APPROVED by Global Risk Governor: ${topSignal.type} (${topSignal.reason})`);
+
+        this.addLog({
+          type: 'SYSTEM',
+          price,
+          reason: `[위험관리 승인] ${topSignal.reason} ➡️ 주문 발송 중...`
+        });
+
+        // 3. Execute Order via OrderManager (OrderManager autonomously manages reserve/commit/release lifecycle)
+        await this.orderManager.submitOrder(
+          riskResult.orderRequest,
+          this.secretManager.getKeys(),
+          this.params.exchange,
+          (record) => {
+            this.handleOrderFilled(topSignal.type, record, price);
+          },
+          (error) => {
+            this.addLog({
+              type: 'SYSTEM',
+              price,
+              reason: `❌ [주문 실패] ${error}`
+            });
+          }
+        );
       }
-      this.atrValue = Number((trSum / (this.recentPrices.length - 1)).toFixed(2)) || (price * 0.015);
     }
 
-    const upperBand = Number((this.baselineValue + this.atrValue * this.params.atrMultiplier).toFixed(2));
-    const lowerBand = Number((this.baselineValue - this.atrValue * this.params.atrMultiplier).toFixed(2));
-
-    let stopLoss = lowerBand - this.atrValue * this.params.stopLossMultiplier;
-    if (this.position.amount > 0 && this.position.entryPrice) {
-      stopLoss = this.position.entryPrice - this.atrValue * this.params.stopLossMultiplier;
-    }
-    stopLoss = Number(stopLoss.toFixed(2));
-
-    const now = Date.now();
-    const d = new Date(now);
+    // Update Price History Chart Points
+    const d = new Date(timestamp);
     const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 
-    let eventType: 'BUY' | 'SELL' | 'STOP_LOSS' | undefined = undefined;
-
-    // Strategy Execution Logic
-    if (this.params.isBotActive) {
-      // 1. BUY Signal: Position is empty & Price touches or drops below lower band
-      if (this.position.amount === 0 && price <= lowerBand) {
-        this.handleBuySignal(price, lowerBand);
-        eventType = 'BUY';
-      }
-      // 2. STOP LOSS Signal: Position active & Price drops below stop-loss threshold
-      else if (this.position.amount > 0 && price <= stopLoss) {
-        this.handleSellSignal(price, 'STOP_LOSS', `손절선(${stopLoss}) 이탈 긴급 매도`);
-        eventType = 'STOP_LOSS';
-      }
-      // 3. SELL / TAKE PROFIT Signal: Position active & Price touches or exceeds upper band
-      else if (this.position.amount > 0 && price >= upperBand) {
-        this.handleSellSignal(price, 'SELL', `상단 밴드(${upperBand}) 익절 체결`);
-        eventType = 'SELL';
-      }
-    }
-
-    const point: PricePoint = {
-      time: now,
+    this.priceHistory.push({
+      time: timestamp,
       timeLabel,
       price,
       baseline: this.baselineValue,
       upperBand,
       lowerBand,
-      stopLoss,
-      event: eventType
-    };
+      stopLoss: staticStopPrice
+    });
 
-    this.priceHistory.push(point);
-    if (this.priceHistory.length > 50) this.priceHistory.shift();
+    if (this.priceHistory.length > 40) {
+      this.priceHistory.shift();
+    }
 
     this.notifyClients();
   }
 
-  private async handleBuySignal(price: number, lowerBand: number) {
-    const allocateBudget = this.balance * (this.params.orderRatio / 100);
-    const buyQty = Number((allocateBudget / price).toFixed(4));
+  /**
+   * Handles a confirmed fill using ONLY exchange-verified data from the OrderRecord.
+   * record.filledVolume = actual executed_volume from Upbit
+   * record.avgFillPrice = actual weighted avg fill price from Upbit trades
+   * overrideVolume = incremental volume when notified asynchronously by background watcher
+   * Falls back to (requestedBudgetOrVolume / tickPrice) ONLY if exchange data is missing.
+   */
+  private handleOrderFilled(signalType: string, record: any, tickPrice: number, overrideVolume?: number) {
+    const position = this.positionManager.getSnapshot();
+    // Use exchange-confirmed price if available, otherwise fall back to tick price
+    const fillPrice = record.avgFillPrice > 0 ? record.avgFillPrice : tickPrice;
 
-    if (allocateBudget < 10 || buyQty <= 0) return;
+    const isIncremental = overrideVolume !== undefined && overrideVolume > 0;
 
-    if (this.params.executionMode === 'REAL') {
-      // Execute on Real Exchange
-      this.addLog({
-        type: 'SYSTEM',
-        price,
-        reason: `[실제 매매 요청] ${this.params.exchange} 하단 밴드(${lowerBand}) 터치 매수 주문 발송...`
-      });
+    // Use overrideVolume (incremental added volume) if passed by watcher, otherwise full filledVolume
+    const effectiveVolume = isIncremental
+      ? overrideVolume!
+      : (record.filledVolume > 0 ? record.filledVolume : (record.requestedBudgetOrVolume / fillPrice));
 
-      if (this.params.exchange === 'BINANCE') {
-        const res = await this.binanceClient.executeOrder(
-          this.apiKeys.binanceApiKey || '',
-          this.apiKeys.binanceApiSecret || '',
-          this.params.symbol,
-          'BUY',
-          { quoteOrderQty: allocateBudget }
+    if (signalType === 'ENTRY_BUY') {
+      if (position.amount > 0 && position.state !== 'FLAT') {
+        this.positionManager.addAdditionalEntryFilled(fillPrice, effectiveVolume);
+      } else {
+        this.positionManager.onInitialEntryFilled(
+          fillPrice,
+          effectiveVolume,
+          this.baselineValue,
+          this.atrValue,
+          this.params.atrMultiplier,
+          this.params.stopLossMultiplier
         );
-
-        if (res.success) {
-          this.balance = Number((this.balance - allocateBudget).toFixed(2));
-          this.position = { amount: buyQty, entryPrice: price };
-          this.addLog({
-            type: 'BUY',
-            price,
-            amount: buyQty,
-            exchange: 'BINANCE',
-            executionMode: 'REAL',
-            reason: `Binance 실제 매수 성공 (OrderID: ${res.orderId})`
-          });
-        } else {
-          this.addLog({
-            type: 'SYSTEM',
-            price,
-            reason: `Binance 실제 매수 실패: ${res.error}`
-          });
-        }
-      } else if (this.params.exchange === 'UPBIT') {
-        const res = await this.upbitClient.executeOrder(
-          this.apiKeys.upbitAccessKey || '',
-          this.apiKeys.upbitSecretKey || '',
-          this.params.symbol,
-          'BUY',
-          { price: allocateBudget }
-        );
-
-        if (res.success) {
-          this.balance = Number((this.balance - allocateBudget).toFixed(2));
-          this.position = { amount: buyQty, entryPrice: price };
-          this.addLog({
-            type: 'BUY',
-            price,
-            amount: buyQty,
-            exchange: 'UPBIT',
-            executionMode: 'REAL',
-            reason: `Upbit 실제 매수 성공 (UUID: ${res.orderId})`
-          });
-        } else {
-          this.addLog({
-            type: 'SYSTEM',
-            price,
-            reason: `Upbit 실제 매수 실패: ${res.error}`
-          });
-        }
       }
-    } else {
-      // Paper Trading Execution
-      this.balance = Number((this.balance - allocateBudget).toFixed(2));
-      this.position = { amount: buyQty, entryPrice: price };
       this.addLog({
         type: 'BUY',
-        price,
-        amount: buyQty,
+        price: fillPrice,
+        amount: effectiveVolume,
         exchange: this.params.exchange,
-        executionMode: 'PAPER',
-        reason: `[모의매매] 하단 밴드(${lowerBand}) 터치 매수 체결 (${this.params.orderRatio}%)`
+        reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
-    }
-  }
-
-  private async handleSellSignal(price: number, type: 'SELL' | 'STOP_LOSS', reasonText: string) {
-    const qty = this.position.amount;
-    const entry = this.position.entryPrice || price;
-    const sellValue = qty * price;
-    const cost = qty * entry;
-    const pnl = Number((sellValue - cost).toFixed(2));
-    const pnlPercent = Number(((pnl / cost) * 100).toFixed(2));
-
-    if (this.params.executionMode === 'REAL') {
-      this.addLog({
-        type: 'SYSTEM',
-        price,
-        reason: `[실제 매매 요청] ${this.params.exchange} 매도 주문 발송...`
-      });
-
-      if (this.params.exchange === 'BINANCE') {
-        const res = await this.binanceClient.executeOrder(
-          this.apiKeys.binanceApiKey || '',
-          this.apiKeys.binanceApiSecret || '',
-          this.params.symbol,
-          'SELL',
-          { quantity: qty }
-        );
-
-        if (res.success) {
-          this.balance = Number((this.balance + sellValue).toFixed(2));
-          this.position = { amount: 0, entryPrice: null };
-          this.totalRealizedPnl = Number((this.totalRealizedPnl + pnl).toFixed(2));
-          this.totalTrades += 1;
-          if (pnl > 0) this.winTrades += 1;
-
-          this.addLog({
-            type,
-            price,
-            amount: qty,
-            pnl,
-            pnlPercent,
-            exchange: 'BINANCE',
-            executionMode: 'REAL',
-            reason: `Binance 실제 매도 성공 (${reasonText})`
-          });
-        } else {
-          this.addLog({
-            type: 'SYSTEM',
-            price,
-            reason: `Binance 실제 매도 실패: ${res.error}`
-          });
-        }
-      } else if (this.params.exchange === 'UPBIT') {
-        const res = await this.upbitClient.executeOrder(
-          this.apiKeys.upbitAccessKey || '',
-          this.apiKeys.upbitSecretKey || '',
-          this.params.symbol,
-          'SELL',
-          { volume: qty }
-        );
-
-        if (res.success) {
-          this.balance = Number((this.balance + sellValue).toFixed(2));
-          this.position = { amount: 0, entryPrice: null };
-          this.totalRealizedPnl = Number((this.totalRealizedPnl + pnl).toFixed(2));
-          this.totalTrades += 1;
-          if (pnl > 0) this.winTrades += 1;
-
-          this.addLog({
-            type,
-            price,
-            amount: qty,
-            pnl,
-            pnlPercent,
-            exchange: 'UPBIT',
-            executionMode: 'REAL',
-            reason: `Upbit 실제 매도 성공 (${reasonText})`
-          });
-        } else {
-          this.addLog({
-            type: 'SYSTEM',
-            price,
-            reason: `Upbit 실제 매도 실패: ${res.error}`
-          });
-        }
+    } else if (signalType === 'DCA_BUY') {
+      if (isIncremental) {
+        // Incremental DCA fill: add to current DCA slot volume without consuming a new slot
+        this.positionManager.addAdditionalDcaFilled(fillPrice, effectiveVolume);
+      } else {
+        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE') || { slotNumber: 1 };
+        this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume);
       }
-    } else {
-      // Paper Trading Execution
-      this.balance = Number((this.balance + sellValue).toFixed(2));
-      this.position = { amount: 0, entryPrice: null };
-      this.totalRealizedPnl = Number((this.totalRealizedPnl + pnl).toFixed(2));
-      this.totalTrades += 1;
-      if (pnl > 0) this.winTrades += 1;
+      this.addLog({
+        type: 'BUY',
+        price: fillPrice,
+        amount: effectiveVolume,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
+    } else if (signalType === 'PYRAMID_BUY') {
+      if (isIncremental) {
+        // Incremental Pyramid fill: add volume without incrementing pyramidingCount again
+        this.positionManager.addAdditionalPyramidFilled(fillPrice, effectiveVolume);
+      } else {
+        this.positionManager.onPyramidFilled(fillPrice, effectiveVolume);
+      }
+      this.addLog({
+        type: 'BUY',
+        price: fillPrice,
+        amount: effectiveVolume,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
+    } else if (signalType === 'PARTIAL_LOSS_CUT') {
+      const cutVolume = effectiveVolume;
+      const entry = position.entryPrice || fillPrice;
+      const pnl = (fillPrice - entry) * cutVolume;
+      const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
+
+      if (isIncremental) {
+        this.positionManager.addAdditionalPartialCutFilled(cutVolume, fillPrice, pnl);
+        this.totalRealizedPnl += pnl;
+      } else {
+        this.positionManager.onPartialLossCutFilled(cutVolume, fillPrice, pnl);
+        this.totalRealizedPnl += pnl;
+        this.totalTrades += 1;
+      }
 
       this.addLog({
-        type,
-        price,
-        amount: qty,
+        type: 'STOP_LOSS',
+        price: fillPrice,
+        amount: cutVolume,
         pnl,
         pnlPercent,
         exchange: this.params.exchange,
-        executionMode: 'PAPER',
-        reason: `[모의매매] ${reasonText}`
+        reason: `${record.reason} [실제체결: ${cutVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
+    } else if (signalType === 'EMERGENCY_TREND_CUT') {
+      const cutVolume = effectiveVolume;
+      const entry = position.entryPrice || fillPrice;
+      const pnl = (fillPrice - entry) * cutVolume;
+      const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
+
+      if (isIncremental) {
+        this.positionManager.addAdditionalPartialCutFilled(cutVolume, fillPrice, pnl);
+        this.totalRealizedPnl += pnl;
+      } else {
+        this.positionManager.onEmergencyTrendCutFilled(cutVolume, fillPrice, pnl);
+        this.totalRealizedPnl += pnl;
+        this.totalTrades += 1;
+      }
+
+      this.addLog({
+        type: 'STOP_LOSS',
+        price: fillPrice,
+        amount: cutVolume,
+        pnl,
+        pnlPercent,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [실제체결: ${cutVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
+    } else if (
+      signalType === 'TRAILING_STOP_EXIT' ||
+      signalType === 'ABSOLUTE_STOP_EXIT' ||
+      signalType === 'EMERGENCY_FULL_EXIT'
+    ) {
+      const sellVolume = effectiveVolume;
+      const entry = position.entryPrice || fillPrice;
+      const pnl = (fillPrice - entry) * sellVolume;
+      const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
+
+      if (record.status === 'FILLED') {
+        this.positionManager.onPositionClosed(pnl, signalType);
+        this.totalRealizedPnl += pnl;
+        this.totalTrades += 1;
+        if (pnl > 0) this.winTrades += 1;
+
+        if (signalType === 'EMERGENCY_FULL_EXIT') {
+          this.botState = 'HALTED';
+          this.params.isBotActive = false;
+        }
+      } else {
+        this.positionManager.reducePositionOnPartialExit(sellVolume, pnl);
+        this.totalRealizedPnl += pnl;
+      }
+
+      this.addLog({
+        type: pnl >= 0 ? 'SELL' : 'STOP_LOSS',
+        price: fillPrice,
+        amount: sellVolume,
+        pnl,
+        pnlPercent,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [실제체결: ${sellVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
     }
+
+    // Refresh real account balances immediately after any fill
+    this.fetchRealAccountBalance();
+  }
+
+  /**
+   * Manual Buy / Sell Dispatcher
+   */
+  public async executeManualTrade(side: 'BUY' | 'SELL') {
+    const position = this.positionManager.getSnapshot();
+    const keys = this.secretManager.getKeys();
+
+    if (side === 'BUY') {
+      const budget = Math.min(this.actualKrwBalance * 0.25, 500000);
+      if (budget < 5000) {
+        this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '❌ 수동 매수 실패: 주문 가능 KRW 잔고 부족' });
+        return;
+      }
+      const req = {
+        clientOrderId: `ORD_MANUAL_BUY_${Date.now()}`,
+        signalId: `SIG_MANUAL_${Date.now()}`,
+        symbol: this.params.symbol,
+        side: 'BUY' as const,
+        requestedAmountKrw: Math.floor(budget),
+        reason: '[수동 매수] 사용자 직접 매수 요청',
+        createdAt: Date.now()
+      };
+      await this.orderManager.submitOrder(
+        req,
+        keys,
+        this.params.exchange,
+        (record) => this.handleOrderFilled('ENTRY_BUY', record, this.currentPrice),
+        (err) => this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `❌ 수동 매수 에러: ${err}` })
+      );
+    } else {
+      if (position.amount <= 0) {
+        this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '❌ 수동 매도 실패: 보유 코인 수량 없음' });
+        return;
+      }
+      const req = {
+        clientOrderId: `ORD_MANUAL_SELL_${Date.now()}`,
+        signalId: `SIG_MANUAL_${Date.now()}`,
+        symbol: this.params.symbol,
+        side: 'SELL' as const,
+        requestedVolume: position.amount,
+        reason: '[전량 청산] 사용자 긴급 전량 매도 요청',
+        createdAt: Date.now()
+      };
+      await this.orderManager.submitOrder(
+        req,
+        keys,
+        this.params.exchange,
+        (record) => this.handleOrderFilled('EMERGENCY_FULL_EXIT', record, this.currentPrice),
+        (err) => this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `❌ 긴급 청산 에러: ${err}` })
+      );
+    }
+  }
+
+  /**
+   * Authoritative balance fetch & reconciliation with exchange
+   */
+  public async fetchRealAccountBalance() {
+    try {
+      const keys = this.secretManager.getKeys();
+      if (this.params.exchange === 'UPBIT' && keys.upbitAccessKey && keys.upbitSecretKey) {
+        const res = await this.apiGateway.enqueue(3, async () => {
+          return await this.upbitClient.getAccountBalance(keys.upbitAccessKey!, keys.upbitSecretKey!);
+        });
+
+        if (res.success && res.balances) {
+          this.realBalances = res.balances;
+          const krw = this.realBalances['KRW'] || 0;
+          this.actualKrwBalance = krw;
+          const coinKey = this.params.symbol.replace('KRW-', '');
+          const realCoinQty = this.realBalances[coinKey] || 0;
+
+          // Reconcile position state with actual coin quantity
+          this.positionManager.reconcileWithExchange(realCoinQty, this.currentPrice);
+
+          if (this.initialBalance === 0 && (krw > 0 || realCoinQty > 0)) {
+            this.initialBalance = krw + (realCoinQty * this.currentPrice);
+          }
+        }
+      }
+      this.notifyClients();
+    } catch (e) {}
   }
 
   public updateParams(newParams: Partial<BotParams>) {
@@ -461,86 +547,94 @@ export class ATREngine {
     const exchangeChanged = newParams.exchange && newParams.exchange !== this.params.exchange;
 
     this.params = { ...this.params, ...newParams };
+    this.riskGovernor.setParams(this.params);
+    this.positionManager.setParams(this.params);
 
-    if (symbolChanged || exchangeChanged) {
-      if (this.params.exchange === 'UPBIT' && !this.params.symbol.startsWith('KRW-')) {
-        const coin = this.params.symbol.split('/')[0] || 'BTC';
-        this.params.symbol = `KRW-${coin}`;
-      } else if (this.params.exchange === 'BINANCE' && !this.params.symbol.includes('/')) {
-        const coin = this.params.symbol.replace('KRW-', '');
-        this.params.symbol = `${coin}/USDT`;
-      }
-      this.startExchangeStream();
+    if (newParams.isBotActive !== undefined) {
+      this.botState = newParams.isBotActive ? 'RUNNING' : 'PAUSED';
+      this.addLog({
+        type: 'SYSTEM',
+        price: this.currentPrice,
+        reason: `[봇 상태 전환] ➡️ ${this.botState}`
+      });
     }
 
-    this.addLog({
-      type: 'SYSTEM',
-      price: this.currentPrice,
-      reason: `봇 설정 변경: [거래소: ${this.params.exchange}, 심볼: ${this.params.symbol}, ATR: ${this.params.atrMultiplier}x, 모드: ${this.params.executionMode}]`
-    });
+    if (symbolChanged || exchangeChanged) {
+      this.marketManager.setSymbol(this.params.exchange, this.params.symbol);
+      this.fetchRealAccountBalance();
+    }
 
     this.notifyClients();
   }
 
-  public realBalances: Record<string, number> = {};
-
-  public async fetchRealAccountBalance() {
-    try {
-      if (this.params.exchange === 'UPBIT' && this.apiKeys.upbitAccessKey && this.apiKeys.upbitSecretKey) {
-        const res = await this.upbitClient.getAccountBalance(this.apiKeys.upbitAccessKey, this.apiKeys.upbitSecretKey);
-        if (res.success && res.balances) {
-          this.realBalances = res.balances;
-        }
-      } else if (this.params.exchange === 'BINANCE' && this.apiKeys.binanceApiKey && this.apiKeys.binanceApiSecret) {
-        const res = await this.binanceClient.getAccountBalance(this.apiKeys.binanceApiKey, this.apiKeys.binanceApiSecret);
-        if (res.success && res.balances) {
-          this.realBalances = res.balances;
-        }
-      }
-      this.notifyClients();
-    } catch (e) {}
-  }
-
   public setApiKeys(keys: ApiKeys) {
-    this.apiKeys = { ...this.apiKeys, ...keys };
+    this.secretManager.saveKeys(keys);
+    this.orderManager.setApiKeysForWatcher(keys);
     this.fetchRealAccountBalance();
     this.addLog({
       type: 'SYSTEM',
       price: this.currentPrice,
-      reason: '거래소 API 키 설정이 업데이트되었습니다.'
+      reason: '🔑 거래소 API 키가 암호화되어 안전하게 영구 저장되었습니다.'
     });
   }
 
-  public addLog(log: Omit<TradeLog, 'id' | 'time'>) {
+  public addLog(log: Omit<TradeLog, 'id' | 'time' | 'timestamp'>) {
     const d = new Date();
     const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
     const newLog: TradeLog = {
       ...log,
       id: Math.random().toString(36).substring(7),
-      time: timeLabel
+      time: timeLabel,
+      timestamp: Date.now()
     };
     this.logs.unshift(newLog);
-    if (this.logs.length > 50) this.logs.pop();
+    if (this.logs.length > 60) this.logs.pop();
   }
 
+  /**
+   * Full Snapshot for WebSocket Client UI Synchronization
+   */
   public getFullState() {
+    const pos = this.positionManager.getSnapshot();
+    const masked = this.secretManager.getMaskedStatus();
+    const exposure = this.riskGovernor.calculateExposureLimits(
+      this.actualKrwBalance,
+      pos.amount,
+      this.currentPrice,
+      0
+    );
+
     return {
       params: this.params,
-      balance: this.balance,
-      initialBalance: this.initialBalance,
-      position: this.position,
-      totalRealizedPnl: this.totalRealizedPnl,
-      totalTrades: this.totalTrades,
-      winTrades: this.winTrades,
+      botState: this.botState,
+      marketState: this.marketManager ? this.marketManager.marketState : 'DISCONNECTED',
+      marketRegime: this.marketRegime,
       currentPrice: this.currentPrice,
       atrValue: this.atrValue,
       baselineValue: this.baselineValue,
+      balance: this.actualKrwBalance,
+      initialBalance: this.initialBalance,
+      realBalances: this.realBalances,
+      position: {
+        amount: pos.amount,
+        entryPrice: pos.entryPrice,
+        initialStopPrice: pos.initialStopPrice,
+        state: pos.state,
+        unrealizedPnl: (pos.amount > 0 && pos.entryPrice) ? (this.currentPrice - pos.entryPrice) * pos.amount : 0,
+        unrealizedPnlPercent: (pos.amount > 0 && pos.entryPrice) ? ((this.currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : 0,
+        trailingActive: pos.trailingActive,
+        trailingPeakPrice: pos.trailingPeakPrice,
+        cooldownUntil: pos.cooldownUntil
+      },
+      exposureLimits: exposure,
+      totalRealizedPnl: this.totalRealizedPnl,
+      totalTrades: this.totalTrades,
+      winTrades: this.winTrades,
       priceHistory: this.priceHistory,
       logs: this.logs,
-      realBalances: this.realBalances,
+      maskedKeys: masked,
       hasApiKeys: {
-        binance: Boolean(this.apiKeys.binanceApiKey && this.apiKeys.binanceApiSecret),
-        upbit: Boolean(this.apiKeys.upbitAccessKey && this.apiKeys.upbitSecretKey)
+        upbit: masked.hasUpbitKeys
       }
     };
   }
@@ -549,5 +643,10 @@ export class ATREngine {
     if (this.broadcastCallback) {
       this.broadcastCallback(this.getFullState());
     }
+  }
+
+  public close() {
+    if (this.balanceRefreshTimer) clearInterval(this.balanceRefreshTimer);
+    this.marketManager.destroy();
   }
 }

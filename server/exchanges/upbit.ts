@@ -23,6 +23,37 @@ export interface UpbitTickerData {
   timestamp: number;
 }
 
+/**
+ * Upbit exchange raw order response shape (subset of fields we use).
+ */
+export interface UpbitOrderResponse {
+  uuid: string;
+  identifier?: string;
+  side: 'bid' | 'ask';
+  ord_type: string;
+  price: string | null;
+  state: 'wait' | 'watch' | 'done' | 'cancel';
+  market: string;
+  created_at: string;
+  volume: string | null;
+  remaining_volume: string;
+  reserved: string;
+  remaining_fee: string;
+  paid_fee: string;
+  locked: string;
+  executed_volume: string;
+  trades_count: number;
+  trades?: Array<{
+    market: string;
+    uuid: string;
+    price: string;
+    volume: string;
+    funds: string;
+    created_at: string;
+    side: string;
+  }>;
+}
+
 export class UpbitClient {
   private ws: WebSocket | null = null;
   private currentMarket: string = 'KRW-BTC';
@@ -159,13 +190,18 @@ export class UpbitClient {
     return jwt.sign(payload, secretKey);
   }
 
-  // Real REST Order Execution for Upbit
+  /**
+   * Real REST Order Execution for Upbit.
+   * Now passes `identifier` (= clientOrderId) to Upbit so orders can be
+   * reconciled by our own idempotency key instead of relying solely on uuid.
+   */
   public async executeOrder(
     accessKey: string,
     secretKey: string,
     market: string,
     side: 'BUY' | 'SELL',
-    amountOrPrice: { volume?: number; price?: number }
+    amountOrPrice: { volume?: number; price?: number },
+    identifier?: string
   ): Promise<{ success: boolean; orderId?: string; raw?: any; error?: string }> {
     if (!accessKey || !secretKey) {
       return { success: false, error: 'Missing Upbit Access Key or Secret Key' };
@@ -178,6 +214,11 @@ export class UpbitClient {
       market: formattedMarket,
       side: orderSide
     };
+
+    // Pass identifier (clientOrderId) to Upbit for idempotent order tracking
+    if (identifier) {
+      params.identifier = identifier;
+    }
 
     if (side === 'BUY') {
       // Upbit market buy uses ord_type: 'price' with total KRW amount ('price')
@@ -219,7 +260,9 @@ export class UpbitClient {
         raw: data
       };
     } catch (err: any) {
-      return { success: false, error: err.message || 'Network error executing Upbit order' };
+      // Do NOT return { success: false } here. Rethrow so caller knows
+      // this is a network error, not a definitive rejection.
+      throw new Error(`NETWORK_ERROR: ${err.message || 'Network error executing Upbit order'}`);
     }
   }
 
@@ -264,6 +307,80 @@ export class UpbitClient {
         return { success: false, error: 'Upbit API 응답 시간 초과 (6초). 네트워크 연결을 확인하세요.' };
       }
       return { success: false, error: err.message || 'Upbit API 통신 실패' };
+    }
+  }
+
+  /**
+   * Query specific order status by UUID.
+   * Returns full order with executed_volume, remaining_volume, state, trades.
+   */
+  public async getOrder(accessKey: string, secretKey: string, uuid: string): Promise<{ success: boolean; order?: UpbitOrderResponse; error?: string }> {
+    if (!accessKey || !secretKey || !uuid) {
+      return { success: false, error: 'Missing parameters for getOrder' };
+    }
+    const params = { uuid };
+    try {
+      const token = this.generateAuthToken(accessKey, secretKey, params);
+      const url = `https://api.upbit.com/v1/order?uuid=${uuid}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { success: false, error: data.error?.message || 'Failed to query order' };
+      }
+      return { success: true, order: data as UpbitOrderResponse };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Network error querying order' };
+    }
+  }
+
+  /**
+   * Query order by our clientOrderId (Upbit's `identifier` field).
+   * This is the primary reconciliation method after timeout.
+   */
+  public async getOrderByIdentifier(accessKey: string, secretKey: string, identifier: string): Promise<{ success: boolean; order?: UpbitOrderResponse; error?: string }> {
+    if (!accessKey || !secretKey || !identifier) {
+      return { success: false, error: 'Missing parameters for getOrderByIdentifier' };
+    }
+    const params = { identifier };
+    try {
+      const token = this.generateAuthToken(accessKey, secretKey, params);
+      const url = `https://api.upbit.com/v1/order?identifier=${encodeURIComponent(identifier)}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        // 404 or error means order with this identifier was never created
+        return { success: false, error: data.error?.message || 'Order not found by identifier' };
+      }
+      return { success: true, order: data as UpbitOrderResponse };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Network error querying order by identifier' };
+    }
+  }
+
+  // Get list of open (unfilled) orders
+  public async getOpenOrders(accessKey: string, secretKey: string, market: string = 'KRW-ETH'): Promise<{ success: boolean; orders?: any[]; error?: string }> {
+    if (!accessKey || !secretKey) {
+      return { success: false, error: 'Missing credentials for getOpenOrders' };
+    }
+    const formatted = UpbitClient.formatMarket(market);
+    const params = { market: formatted, state: 'wait' };
+    try {
+      const token = this.generateAuthToken(accessKey, secretKey, params);
+      const url = `https://api.upbit.com/v1/orders?market=${formatted}&state=wait`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { success: false, error: data.error?.message || 'Failed to query open orders' };
+      }
+      return { success: true, orders: Array.isArray(data) ? data : [] };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Network error querying open orders' };
     }
   }
 }

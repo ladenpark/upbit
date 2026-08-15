@@ -1,0 +1,259 @@
+/**
+ * Comprehensive Domain Types & State Models for Quantitative Trading Engine
+ */
+
+export type ExchangeType = 'UPBIT';
+
+export type SignalType = 
+  | 'ENTRY_BUY'
+  | 'DCA_BUY'
+  | 'PYRAMID_BUY'
+  | 'REENTRY_BUY'
+  | 'PARTIAL_LOSS_CUT'
+  | 'EMERGENCY_TREND_CUT'
+  | 'TRAILING_STOP_EXIT'
+  | 'ABSOLUTE_STOP_EXIT'
+  | 'EMERGENCY_FULL_EXIT';
+
+export type SignalPriority = 1 | 2 | 3 | 4 | 5 | 6; 
+// 1 = EMERGENCY_FULL_EXIT, ABSOLUTE_STOP_EXIT (Highest)
+// 2 = EMERGENCY_TREND_CUT, PARTIAL_LOSS_CUT
+// 3 = TRAILING_STOP_EXIT
+// 4 = REENTRY_BUY
+// 5 = DCA_BUY
+// 6 = ENTRY_BUY, PYRAMID_BUY (Lowest)
+
+export interface Signal {
+  id: string;
+  timestamp: number;
+  timeframe: string; // e.g. '1m', 'tick'
+  source: string; // e.g. 'ATR_STRATEGY_CORE'
+  type: SignalType;
+  priority: SignalPriority;
+  symbol: string;
+  price: number;
+  reason: string;
+  indicatorSnapshot: {
+    baseline: number;
+    atr: number;
+    upperBand: number;
+    lowerBand: number;
+    currentStopLoss: number;
+    marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
+    slope: number;
+    volatilityRatio: number;
+  };
+}
+
+export type OrderSide = 'BUY' | 'SELL';
+
+export type OrderStatus = 
+  | 'SIGNAL_CREATED'
+  | 'ORDER_SUBMITTING'
+  | 'ORDER_SUBMITTED'
+  | 'OPEN'
+  | 'PARTIALLY_FILLED'
+  | 'FILLED'
+  | 'CANCEL_REQUESTED'
+  | 'CANCELLED'
+  | 'REJECTED'
+  | 'UNKNOWN_PENDING_RECONCILIATION'
+  | 'UNKNOWN';
+
+export const PROTECTIVE_SELL_SIGNALS: SignalType[] = [
+  'ABSOLUTE_STOP_EXIT',
+  'TRAILING_STOP_EXIT',
+  'PARTIAL_LOSS_CUT',
+  'EMERGENCY_TREND_CUT',
+  'EMERGENCY_FULL_EXIT'
+];
+
+export interface ExposureReservation {
+  id: string;
+  clientOrderId: string;
+  amountKrw: number;
+  createdAt: number;
+  status: 'RESERVED' | 'COMMITTED' | 'RELEASED';
+}
+
+export interface OrderFill {
+  id: string;
+  timestamp: number;
+  price: number;
+  volume: number;
+  fee: number;
+}
+
+export interface OrderRequest {
+  clientOrderId: string; // Idempotency key
+  signalId: string;
+  signalType?: SignalType;
+  symbol: string;
+  side: OrderSide;
+  requestedAmountKrw?: number; // for Market BUY on Upbit
+  requestedVolume?: number; // for Market SELL on Upbit
+  reason: string;
+  createdAt: number;
+}
+
+export interface OrderRecord {
+  id: string;
+  clientOrderId: string;
+  signalId: string;
+  signalType?: SignalType;
+  exchangeOrderId?: string;
+  symbol: string;
+  side: OrderSide;
+  status: OrderStatus;
+  requestedBudgetOrVolume: number;
+  filledVolume: number;
+  avgFillPrice: number;
+  fee: number;
+  createdAt: number;
+  updatedAt: number;
+  reason: string;
+  error?: string;
+  fills: OrderFill[];
+}
+
+export type PositionState = 
+  | 'FLAT'
+  | 'ENTRY_PENDING'
+  | 'ENTRY_FILLED'
+  | 'DCA_MODE'
+  | 'DEFENSIVE'
+  | 'EMERGENCY_EXIT'
+  | 'COOLDOWN'
+  | 'REENTRY_WAIT'
+  | 'REENTRY_ALLOWED'
+  | 'TAKE_PROFIT'
+  | 'CLOSED'
+  | 'ERROR'
+  | 'HALTED';
+
+export interface PositionSnapshot {
+  id: string;
+  symbol: string;
+  state: PositionState;
+  amount: number;
+  entryPrice: number | null;
+  positionEntryAtr: number | null;
+  initialStopPrice: number | null;
+  initialBaseline: number | null;
+  initialBand: number | null;
+  totalCostKrw: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  unrealizedPnlPercent: number;
+  openedAt: number | null;
+  lastUpdatedAt: number;
+  // DCA Slots Lifecycle
+  dcaSlots: {
+    slotNumber: number;
+    status: 'AVAILABLE' | 'RESERVED' | 'ORDER_PENDING' | 'FILLED' | 'DISABLED';
+    filledPrice?: number;
+    filledVolume?: number;
+    filledAt?: number;
+  }[];
+  pyramidingCount: number;
+  maxPyramidingOrders: number;
+  // Trailing Take Profit State
+  trailingActive: boolean;
+  trailingPeakPrice: number | null;
+  // Cooldown
+  cooldownUntil: number;
+  cooldownReason?: string;
+}
+
+export type BotLifecycleState = 
+  | 'RUNNING'
+  | 'PAUSED'
+  | 'HALTED'
+  | 'ERROR'
+  | 'RECONNECTING';
+
+export type MarketDataState = 
+  | 'LIVE'
+  | 'STALE'
+  | 'DISCONNECTED'
+  | 'RECONNECTING';
+
+export interface ExposureLimits {
+  totalCapitalKrw: number;
+  maxExposureRatio: number; // 0.0 ~ 1.0 (e.g. 0.85 = Max 85% in coin)
+  maxPositionAmountKrw: number;
+  currentExposureKrw: number;
+  pendingExposureKrw: number;
+  remainingAllowableExposureKrw: number;
+}
+
+export interface TradeLog {
+  id: string;
+  time: string;
+  timestamp: number;
+  type: 'BUY' | 'SELL' | 'STOP_LOSS' | 'SYSTEM';
+  price: number;
+  reason: string;
+  amount?: number;
+  pnl?: number;
+  pnlPercent?: number;
+  exchange?: string;
+  orderId?: string;
+  clientOrderId?: string;
+  positionState?: PositionState;
+}
+
+export interface PricePoint {
+  time: number;
+  timeLabel: string;
+  price: number;
+  upperBand: number;
+  baseline: number;
+  lowerBand: number;
+  stopLoss: number;
+  event?: 'BUY' | 'SELL' | 'STOP_LOSS';
+}
+
+export interface BotParams {
+  atrMultiplier: number;
+  orderRatio: number;
+  stopLossMultiplier: number;
+  isBotActive: boolean;
+  exchange: ExchangeType;
+  symbol: string;
+  // Global Exposure Limit (%)
+  maxExposurePercent: number; // e.g. 85%
+  // DCA (물타기) 파라미터
+  dcaEnabled: boolean;
+  maxSafetyOrders: number;
+  safetyOrderStepPercent: number;
+  safetyOrderVolumeScale: number;
+  // Trailing Take-Profit (트레일링 익절) 파라미터
+  trailingStopEnabled: boolean;
+  trailingCallbackPercent: number;
+  // Pyramiding (상승 불타기) 파라미터
+  pyramidingEnabled: boolean;
+  maxPyramidingOrders: number;
+  pyramidingStepPercent: number;
+  // Partial Loss-Cut & Cash Recycling (자금순환 부분손절) 파라미터
+  partialLossCutEnabled: boolean;
+  partialLossCutPercent: number;
+  partialLossCutThreshold: number;
+  // Trend-Aware Predictive Loss-Cut & Bottom Re-entry
+  trendAwareCutEnabled: boolean;
+  trendDropSpeedThreshold: number; // 하락 속도 임계값 (%)
+  trendDropWindowSeconds: number; // 급락 계산 기준 시간창(초), 기본 5초
+  cooldownSecondsAfterCut: number; // 손절/청산 후 쿨다운 시간(초), 기본 60초
+  // AI Auto-Pilot (시장 국면 자동 감지 및 자산 배분)
+  autoPilotEnabled: boolean;
+}
+
+export interface ApiKeys {
+  upbitAccessKey?: string;
+  upbitSecretKey?: string;
+}
+
+export interface MaskedApiKeys {
+  hasUpbitKeys: boolean;
+  upbitAccessMasked?: string;
+}
