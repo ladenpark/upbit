@@ -324,19 +324,39 @@ export class PositionManager {
   }
 
   /**
-   * Reconciles internal state with authoritative real exchange balance.
+   * Reconciles internal state with authoritative real exchange balance and average buy price.
    */
-  public reconcileWithExchange(realCoinQuantity: number, currentPrice: number) {
+  public reconcileWithExchange(realCoinQuantity: number, authoritativeAvgBuyPrice?: number | null, fallbackPrice?: number) {
+    let stateChanged = false;
     if (Math.abs(this.position.amount - realCoinQuantity) > 0.0001) {
       console.warn(`[PositionManager] State Reconciliation: Local Amount (${this.position.amount}) != Exchange Real (${realCoinQuantity})`);
       this.position.amount = realCoinQuantity;
-      if (realCoinQuantity === 0) {
+      stateChanged = true;
+    }
+
+    if (realCoinQuantity === 0) {
+      if (this.position.state !== 'FLAT' || this.position.entryPrice !== null) {
         this.position.state = 'FLAT';
         this.position.entryPrice = null;
-      } else if (this.position.entryPrice === null) {
-        this.position.entryPrice = currentPrice;
-        this.position.state = 'ENTRY_FILLED';
+        stateChanged = true;
       }
+    } else {
+      // If exchange provides authoritative average buy price, synchronize it precisely!
+      if (authoritativeAvgBuyPrice && authoritativeAvgBuyPrice > 0 && Math.abs((this.position.entryPrice || 0) - authoritativeAvgBuyPrice) > 1) {
+        console.log(`[PositionManager] 🎯 Authoritative Entry Price Synchronized from Exchange: ₩${authoritativeAvgBuyPrice.toLocaleString()} (was: ₩${this.position.entryPrice?.toLocaleString() || 'null'})`);
+        this.position.entryPrice = authoritativeAvgBuyPrice;
+        stateChanged = true;
+      } else if (this.position.entryPrice === null && fallbackPrice && fallbackPrice > 0) {
+        this.position.entryPrice = fallbackPrice;
+        stateChanged = true;
+      }
+      if (this.position.state === 'FLAT') {
+        this.position.state = 'ENTRY_FILLED';
+        stateChanged = true;
+      }
+    }
+
+    if (stateChanged) {
       this.saveStateToFile();
     }
   }

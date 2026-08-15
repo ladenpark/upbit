@@ -267,7 +267,12 @@ export class UpbitClient {
   }
 
   // Get Upbit Account Balances
-  public async getAccountBalance(accessKey: string, secretKey: string): Promise<{ success: boolean; balances?: Record<string, number>; error?: string }> {
+  public async getAccountBalance(accessKey: string, secretKey: string): Promise<{
+    success: boolean;
+    balances?: Record<string, number>;
+    avgBuyPrices?: Record<string, number>;
+    error?: string;
+  }> {
     if (!accessKey || !secretKey) {
       return { success: false, error: 'Upbit Access Key와 Secret Key를 모두 입력해 주세요.' };
     }
@@ -292,16 +297,21 @@ export class UpbitClient {
       }
 
       const balanceMap: Record<string, number> = {};
+      const avgPriceMap: Record<string, number> = {};
       if (Array.isArray(data)) {
         data.forEach((acc: any) => {
           const balance = parseFloat(acc.balance);
+          const avgPrice = parseFloat(acc.avg_buy_price || '0');
           if (balance > 0) {
             balanceMap[acc.currency] = balance;
+            if (avgPrice > 0) {
+              avgPriceMap[acc.currency] = avgPrice;
+            }
           }
         });
       }
 
-      return { success: true, balances: balanceMap };
+      return { success: true, balances: balanceMap, avgBuyPrices: avgPriceMap };
     } catch (err: any) {
       if (err.name === 'AbortError') {
         return { success: false, error: 'Upbit API 응답 시간 초과 (6초). 네트워크 연결을 확인하세요.' };

@@ -146,15 +146,11 @@ export class ATREngine {
           console.log(`[ATREngine] 📋 Exchange active open orders: ${openRes.orders.length}`);
         }
 
-        // 4. Sync Position with authoritative coin holding
-        const coinKey = this.params.symbol.replace('KRW-', '');
-        const realQty = this.realBalances[coinKey] || 0;
-        this.positionManager.reconcileWithExchange(realQty, this.currentPrice);
-
+        // 4. Position reconciled automatically via fetchRealAccountBalance
         this.addLog({
           type: 'SYSTEM',
           price: this.currentPrice,
-          reason: `[시스템 복구 완료] 거래소 계좌 및 포지션 상태 동기화 완료 (보유: ${realQty} ${coinKey})`
+          reason: `[시스템 복구 완료] 거래소 계좌 및 공식 평단가 동기화 완료`
         });
       }
     } catch (e: any) {
@@ -596,9 +592,10 @@ export class ATREngine {
           this.actualKrwBalance = krw;
           const coinKey = this.params.symbol.replace('KRW-', '');
           const realCoinQty = this.realBalances[coinKey] || 0;
+          const authoritativeAvgPrice = res.avgBuyPrices ? res.avgBuyPrices[coinKey] : null;
 
-          // Reconcile position state with actual coin quantity
-          this.positionManager.reconcileWithExchange(realCoinQty, this.currentPrice);
+          // Reconcile position state with actual coin quantity and exchange authoritative avg buy price
+          this.positionManager.reconcileWithExchange(realCoinQty, authoritativeAvgPrice, this.currentPrice);
 
           if (this.initialBalance === 0 && (krw > 0 || realCoinQty > 0)) {
             this.initialBalance = krw + (realCoinQty * this.currentPrice);
