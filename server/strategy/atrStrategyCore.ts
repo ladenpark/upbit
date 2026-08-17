@@ -122,7 +122,8 @@ export class ATRStrategyCore {
       currentStopLoss: position.initialStopPrice || (lowerBand - (atrValue * params.stopLossMultiplier)),
       marketRegime: adaptive.marketRegime,
       slope: adaptive.slope,
-      volatilityRatio: adaptive.volatilityRatio
+      volatilityRatio: adaptive.volatilityRatio,
+      dynamicOrderRatio: adaptive.dynamicOrderRatio
     };
 
     const hasPosition = position.amount > 0 && position.entryPrice !== null;

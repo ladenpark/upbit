@@ -43,6 +43,7 @@ export interface Signal {
     marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
     slope: number;
     volatilityRatio: number;
+    dynamicOrderRatio: number;
   };
 }
 

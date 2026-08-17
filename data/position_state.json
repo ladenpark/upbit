@@ -1,5 +1,5 @@
 {
-  "id": "POS_1786963031753",
+  "id": "POS_1786963766348",
   "symbol": "KRW-ETH",
   "state": "ENTRY_FILLED",
   "amount": 0,
@@ -12,8 +12,8 @@
   "realizedPnl": 275000,
   "unrealizedPnl": 0,
   "unrealizedPnlPercent": 0,
-  "openedAt": 1786963031753,
-  "lastUpdatedAt": 1786963031755,
+  "openedAt": 1786963766348,
+  "lastUpdatedAt": 1786963766350,
   "dcaSlots": [
     {
       "slotNumber": 1,

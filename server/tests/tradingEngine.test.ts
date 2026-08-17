@@ -156,7 +156,8 @@ async function runAllTests() {
     symbol: 'KRW-ETH', price: 2800000, reason: 'Test Buy Signal',
     indicatorSnapshot: {
       baseline: 3000000, atr: 50000, upperBand: 3150000, lowerBand: 2850000,
-      currentStopLoss: 2750000, marketRegime: 'BEAR', slope: -0.02, volatilityRatio: 1.5
+      currentStopLoss: 2750000, marketRegime: 'BEAR', slope: -0.02, volatilityRatio: 1.5,
+      dynamicOrderRatio: 10
     }
   };
 
@@ -914,7 +915,8 @@ async function runAllTests() {
       currentStopLoss: 2600000,
       marketRegime: 'BULL',
       slope: 0.2,
-      volatilityRatio: 1.0
+      volatilityRatio: 1.0,
+      dynamicOrderRatio: 20
     }
   };
 
@@ -1115,6 +1117,216 @@ async function runAllTests() {
   assert(concurrentSignals.length === 1, '[Scenario 9] Exactly 1 signal generated on concurrent condition tick');
   assert(concurrentSignals[0].type === 'TRAILING_STOP_EXIT', '[Scenario 9] TRAILING_STOP_EXIT (Priority 3) takes precedence over Pyramiding (Priority 6)');
   assert(concurrentSignals.find((s) => s.type === 'PYRAMID_BUY') === undefined, '[Scenario 9] PYRAMID_BUY is NOT co-emitted in the same tick');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 17: Dynamic Order Ratio (Regime-Aware Sizing) & AutoPilot Gate - Scenarios 1 to 6
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 17: Dynamic Order Ratio (Regime-Aware Sizing) & AutoPilot Gate');
+
+  const sizingRiskGov = new GlobalRiskGovernor({
+    ...defaultParams,
+    autoPilotEnabled: true,
+    orderRatio: 25 // static fallback is 25%
+  });
+
+  const cleanFlatPos: PositionSnapshot = {
+    ...testPosition,
+    amount: 0,
+    state: 'FLAT',
+    cooldownUntil: 0
+  };
+
+  const totalCap = 10000000; // 10,000,000 KRW
+
+  // [Scenario 1] AutoPilot ON + BULL market (dynamicOrderRatio = 20%) -> effectiveOrderRatio = 0.20, targetBudget = 2,000,000 KRW
+  const bullBuySignal: Signal = {
+    id: 'SIG_BULL_BUY_TEST',
+    timestamp: Date.now(),
+    timeframe: 'tick',
+    source: 'ATR_STRATEGY_CORE',
+    type: 'ENTRY_BUY',
+    priority: 6,
+    symbol: 'KRW-ETH',
+    price: 2700000,
+    reason: 'Bull Breakout Entry',
+    indicatorSnapshot: {
+      baseline: 2650000,
+      atr: 30000,
+      upperBand: 2722000,
+      lowerBand: 2578000,
+      currentStopLoss: 2518000,
+      marketRegime: 'BULL',
+      slope: 0.25,
+      volatilityRatio: 1.13,
+      dynamicOrderRatio: 20 // 20%
+    }
+  };
+
+  const bullRiskEval = sizingRiskGov.evaluateSignal(
+    bullBuySignal,
+    'RUNNING',
+    'LIVE',
+    totalCap,
+    cleanFlatPos,
+    2700000,
+    [],
+    0
+  );
+
+  assert(bullRiskEval.approved === true, '[Scenario 1] BULL ENTRY_BUY is approved by RiskGovernor');
+  assert(bullRiskEval.calculatedBudgetKrw === 2000000, `[Scenario 1] BULL dynamicOrderRatio (20%) applied: calculated budget is exact ₩2,000,000 (was: ₩${bullRiskEval.calculatedBudgetKrw?.toLocaleString()})`);
+
+  // [Scenario 2] AutoPilot ON + BEAR market (dynamicOrderRatio = 10%) -> effectiveOrderRatio = 0.10, targetBudget = 1,000,000 KRW
+  const bearBuySignal: Signal = {
+    ...bullBuySignal,
+    id: 'SIG_BEAR_BUY_TEST',
+    indicatorSnapshot: {
+      ...bullBuySignal.indicatorSnapshot,
+      marketRegime: 'BEAR',
+      dynamicOrderRatio: 10 // 10%
+    }
+  };
+
+  const bearRiskEval = sizingRiskGov.evaluateSignal(
+    bearBuySignal,
+    'RUNNING',
+    'LIVE',
+    totalCap,
+    cleanFlatPos,
+    2700000,
+    [],
+    0
+  );
+
+  assert(bearRiskEval.approved === true, '[Scenario 2] BEAR ENTRY_BUY is approved by RiskGovernor');
+  assert(bearRiskEval.calculatedBudgetKrw === 1000000, `[Scenario 2] BEAR dynamicOrderRatio (10%) applied: calculated budget is exact ₩1,000,000 (was: ₩${bearRiskEval.calculatedBudgetKrw?.toLocaleString()})`);
+
+  // [Scenario 3] AutoPilot OFF -> Ignores dynamicOrderRatio (20%), strictly uses static params.orderRatio (25%) -> 2,500,000 KRW
+  const manualRiskGov = new GlobalRiskGovernor({
+    ...defaultParams,
+    autoPilotEnabled: false, // AutoPilot turned OFF!
+    orderRatio: 25 // Static user configured ratio = 25%
+  });
+
+  const autoPilotOffEval = manualRiskGov.evaluateSignal(
+    bullBuySignal, // carries dynamicOrderRatio = 20
+    'RUNNING',
+    'LIVE',
+    totalCap,
+    cleanFlatPos,
+    2700000,
+    [],
+    0
+  );
+
+  assert(autoPilotOffEval.approved === true, '[Scenario 3] AutoPilot OFF ENTRY_BUY is approved');
+  assert(autoPilotOffEval.calculatedBudgetKrw === 2500000, `[Scenario 3] AutoPilot OFF strictly preserves user static orderRatio (25% = ₩2,500,000) ignoring dynamicRatio (was: ₩${autoPilotOffEval.calculatedBudgetKrw?.toLocaleString()})`);
+
+  // [Scenario 4] DCA_BUY: dynamicOrderRatio (SIDEWAYS 18%) multiplied by safetyOrderVolumeScale (1.2^slot)
+  const sidewaysDcaPos: PositionSnapshot = {
+    ...testPosition,
+    amount: 1.0, // 1.0 ETH @ 2,700,000 = 2,700,000 KRW
+    entryPrice: 2800000,
+    dcaSlots: [
+      { slotNumber: 1, status: 'FILLED' },
+      { slotNumber: 2, status: 'AVAILABLE' }, // Slot 2 -> scale = 1.2^2 = 1.44
+      { slotNumber: 3, status: 'AVAILABLE' }
+    ]
+  };
+
+  const dcaSignalTest17: Signal = {
+    ...bullBuySignal,
+    id: 'SIG_DCA_SIDEWAYS_TEST',
+    type: 'DCA_BUY',
+    priority: 5,
+    indicatorSnapshot: {
+      ...bullBuySignal.indicatorSnapshot,
+      marketRegime: 'SIDEWAYS',
+      dynamicOrderRatio: 18 // 18% base
+    }
+  };
+
+  // actualKrwBalance = 7,300,000 + (1.0 * 2,700,000) = 10,000,000 Total Capital
+  const dcaRiskEvalTest17 = sizingRiskGov.evaluateSignal(
+    dcaSignalTest17,
+    'RUNNING',
+    'LIVE',
+    7300000,
+    sidewaysDcaPos,
+    2700000,
+    [],
+    0
+  );
+
+  // Expected DCA budget: TotalCapital (10,000,000) * 0.18 * (1.2^2 = 1.44) = 2,592,000 KRW
+  assert(dcaRiskEvalTest17.approved === true, '[Scenario 4] DCA_BUY approved with dynamic ratio & slot scaling');
+  assert(dcaRiskEvalTest17.calculatedBudgetKrw === 2592000, `[Scenario 4] DCA_BUY budget correctly scaled: ₩10M * 18% * 1.44 = ₩2,592,000 (was: ₩${dcaRiskEvalTest17.calculatedBudgetKrw?.toLocaleString()})`);
+
+  // [Scenario 5] Strict Clamp: targetBudget clamped to 98% KRW balance and remainingAllowableExposure
+  // Test 98% cash balance clamp on 99% dynamic ratio (Flat position, 1M capital):
+  const highRatioSignal: Signal = {
+    ...bullBuySignal,
+    id: 'SIG_HIGH_RATIO_CLAMP_TEST',
+    indicatorSnapshot: {
+      ...bullBuySignal.indicatorSnapshot,
+      dynamicOrderRatio: 99 // 99% -> targetBudget = ₩990,000
+    }
+  };
+
+  // Using a governor with maxExposure = 99% to isolate 98% cash clamp
+  const cashClampGov = new GlobalRiskGovernor({
+    ...defaultParams,
+    maxExposurePercent: 99,
+    autoPilotEnabled: true
+  });
+
+  const lowCashRiskEval = cashClampGov.evaluateSignal(
+    highRatioSignal,
+    'RUNNING',
+    'LIVE',
+    1000000, // 1,000,000 KRW cash
+    cleanFlatPos,
+    2700000,
+    [],
+    0
+  );
+
+  assert(lowCashRiskEval.approved === true, '[Scenario 5] Low cash order approved within 98% clamp');
+  assert(lowCashRiskEval.calculatedBudgetKrw === 980000, `[Scenario 5] Clamped to 98% cash: ₩980,000 (was: ₩${lowCashRiskEval.calculatedBudgetKrw?.toLocaleString()})`);
+
+  // Max exposure limit clamp: Total capital = 10M (1.9M cash + 8.1M coin [3.0 ETH @ 2.7M]).
+  // Max exposure (85%) = 8,500,000 KRW. Current exposure = 8,100,000 KRW. Remaining allowable = 400,000 KRW.
+  const nearMaxExpPos: PositionSnapshot = {
+    ...cleanFlatPos,
+    amount: 3.0 // 3.0 * 2,700,000 = 8,100,000 KRW exposure
+  };
+  const maxExpClampedEval = sizingRiskGov.evaluateSignal(
+    bullBuySignal,
+    'RUNNING',
+    'LIVE',
+    1900000, // 1,900,000 KRW cash (Total capital = 10,000,000 KRW)
+    nearMaxExpPos,
+    2700000,
+    [],
+    0
+  );
+  assert(maxExpClampedEval.approved === true, '[Scenario 5] Near max exposure order approved within allowable remaining');
+  assert(maxExpClampedEval.calculatedBudgetKrw === 400000, `[Scenario 5] Clamped to remaining allowable exposure: ₩400,000 (was: ₩${maxExpClampedEval.calculatedBudgetKrw?.toLocaleString()})`);
+
+  // [Scenario 6] Full compilation and end-to-end signal generator output contains dynamicOrderRatio
+  const fullSignals = pyramidStrategyCore.generateSignals(
+    2750000,
+    2650000,
+    30000,
+    defaultParams,
+    cleanFlatPos,
+    0.01,
+    baseBullHistory,
+    { trend: 'BULL', htfSlope: 0.5 }
+  );
+  assert(fullSignals.length > 0, '[Scenario 6] Strategy Core generates signals successfully');
+  assert(typeof fullSignals[0].indicatorSnapshot.dynamicOrderRatio === 'number', '[Scenario 6] Signal contains numeric dynamicOrderRatio');
+  assert(fullSignals[0].indicatorSnapshot.dynamicOrderRatio === 20, '[Scenario 6] BULL signal carries dynamicOrderRatio = 20%');
 
   // ──────────────────────────────────────────────────────
   // RESULTS

@@ -286,8 +286,11 @@ export class GlobalRiskGovernor {
         };
       }
 
-      // Base order budget calculation
-      const effectiveOrderRatio = (this.params.orderRatio || 25) / 100;
+      // Base order budget calculation — use dynamic (regime-aware) ratio when AutoPilot is on
+      const dynamicRatio = signal.indicatorSnapshot?.dynamicOrderRatio;
+      const effectiveOrderRatio = (this.params.autoPilotEnabled && typeof dynamicRatio === 'number' && dynamicRatio > 0)
+        ? dynamicRatio / 100
+        : (this.params.orderRatio || 25) / 100;
       let targetBudget = limits.totalCapitalKrw * effectiveOrderRatio;
 
       if (signal.type === 'DCA_BUY') {
