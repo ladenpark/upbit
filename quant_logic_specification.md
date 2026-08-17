@@ -2,7 +2,7 @@
 
 **Target Asset**: Upbit KRW-ETH (Spot Trading)  
 **Core Framework**: TypeScript, Node.js (PM2 Cluster), React/Vite, Upbit Open API (REST & WebSocket)  
-**Validation**: 17 Test Groups, 123 Automated Tests (100% Pass)
+**Validation**: 124 Automated Assertions (Custom Test Suite, `tradingEngine.test.ts`)
 
 ---
 
@@ -13,6 +13,9 @@
   - **워치독(Watchdog)**: 8초 이상 체결이 없으면 Upbit REST API(`/v1/ticker`)로 백업 폴링, 20초 이상 무응답 시 웹소켓 자동 재연결.
 - **포지션 동기화 (Exchange Reconciliation)**:
   - Upbit 계좌 API(`/v1/accounts`)의 `avg_buy_price`(실제 매수 평단가)를 파싱하여 엔진의 `entryPrice`와 1원 단위까지 100% 일치 동기화.
+  - 체결 직후 발생하는 업비트의 잔고 갱신 지연(Eventual Consistency)을 방어하기 위해, 잔고 동기화를 디바운싱 기반 1.5초(1500ms) 지연 비동기 실행.
+- **상태 영속성 및 동시성 제어 (State Persistence)**:
+  - PM2 다중 프로세스 환경 및 비동기 겹침 시 파일 무결성을 보장하기 위해 `.tmp` 파일 및 `fs.renameSync`를 활용한 원자적 쓰기(Atomic Write) 적용.
 
 ---
 
@@ -22,25 +25,33 @@
 1분봉 20개 선형 회귀 기울기(`slope`), 캔들 변동성 비율(`volatilityRatio`), 15분봉 상위 타임프레임 EMA 추세(`higherTfTrend`)를 결합하여 3대 국면을 판정합니다.
 
 1. **상승장 (BULL)**: 
-   - `slope > 0.12` AND `(현재가 - Baseline) / Baseline > +0.08%` AND `15분봉 추세가 BEAR가 아님`
+   - `slope > 0.10` AND `(현재가 - Baseline) / Baseline > +0.05%` AND `15분봉 추세가 BEAR가 아님`
 2. **하락장 (BEAR)**: 
-   - `slope < -0.10` AND `(현재가 - Baseline) / Baseline < -0.06%`
+   - `slope < -0.10` AND `(현재가 - Baseline) / Baseline < -0.05%` AND `15분봉 추세가 BULL이 아님`
 3. **횡보장 (SIDEWAYS)**: 
    - 위 조건 외 모든 구간
 
 ### 2.2 오토파일럿(AutoPilot) 동적 파라미터 매트릭스
 
-| 시장 국면 (Market Regime) | 밴드 승수 (`dynamicAtr`) | DCA 간격 (`dynamicDcaStep`) | 트레일링 콜백 (`dynamicTrailingCallback`) | 1차 진입 비중 (`dynamicOrderRatio`) |
-|---|---|---|---|---|
-| **상승장 (BULL)** | **2.4** (기회 포착 확대) | **1.5%** (빠른 회전) | **0.8%** (추세 끝까지 추종) | **20.0%** (적극 진입) |
-| **횡보장 (SIDEWAYS)** | **3.0** (노이즈 필터링) | **2.0%** (표준 분할) | **0.6%** (중간 박스권 익절) | **18.0%** (안정적 진입) |
-| **하락장 (BEAR)** | **3.6** (돌파 엄격화) | **3.0%** (낙폭 확대 방어) | **0.5%** (단기 반등 즉시 탈출) | **10.0%** (현금 보존 축소) |
+| 시장 국면 (Market Regime) | 밴드 승수 (`dynamicAtr`) | DCA 간격 (`dynamicDcaStep`) | 1차 진입 비중 (`dynamicOrderRatio`) |
+|---|---|---|---|
+| **상승장 (BULL)** | **1.8** (기회 포착 확대) | **1.5%** (빠른 회전) | **20.0%** (적극 진입) |
+| **횡보장 (SIDEWAYS)** | **2.4** (노이즈 필터링) | **2.0%** (표준 분할) | **18.0%** (안정적 진입) |
+| **하락장 (BEAR)** | **3.5** (돌파 엄격화) | **3.0%** (낙폭 확대 방어) | **10.0%** (현금 보존 축소) |
+
+**트레일링 콜백 (`dynamicTrailingCallback`)**: 국면과 무관하게 **변동성(volatilityRatio)**에 의해 결정됩니다.
+- 기본: **0.8%** (volatilityRatio ≤ 2.0)
+- 고변동성: **1.2%** (volatilityRatio > 2.0)
 
 ---
 
 ## 3. 신호 생성 엔진 및 7대 규칙 우선순위 (ATRStrategyCore)
 
 동일 틱(Tick)에서 복수의 조건이 충족될 경우, **엄격한 우선순위(Priority 1 -> 6)에 따른 단일 신호 방출(Early Return)**로 상충을 원천 차단합니다.
+
+**[안전 지정가 래핑 (Slippage Defense)]**
+- 모든 보호성 매도 신호(손절, 부분 익절, 긴급 청산 등)는 시장가 매도로 인한 막대한 슬리피지를 방지하기 위해, 현재가 대비 **-1.5% 수준의 하한가**를 계산하여 **지정가(limit)** 주문으로 제출합니다.
+- 이때 계산된 하한가는 업비트의 원화 마켓 호가 단위 규격(Tick Size)에 맞게 정밀하게 내림 처리(`roundDownToTick`)되어 API 에러(`invalid_price_tick`)를 방지합니다.
 
 - **Priority 1: ABSOLUTE_STOP_EXIT (정적 손절선 이탈 -> 100% 전량 청산)**
   - 발동 조건: `현재가 <= position.initialStopPrice` (진입 시 확정 스냅샷된 손절선)
@@ -103,8 +114,9 @@
 2. **자산 노출 예약 라이프사이클 (Exposure Reservation)**:
    - 주문 생성 즉시 `reserveExposure()`로 자본 예약 -> 체결 시 `commitExposure()` -> 취소/거절 시 `releaseExposure()`로 반환.
 3. **비동기 부분 체결 감시 큐 (Partial Fill Watcher Queue)**:
-   - 주문이 분할 체결(`state: 'wait'`)될 경우 큐에 등록하여 3초 주기로 업비트 REST API를 재조회, 체결된 증분(`overrideVolume`)만 포지션 매니저에 정밀 누적 반영.
-   - 15초 이상 미체결 주문은 자동 취소(`CANCEL_REQUESTED`).
+    - 주문 제출 직후 최대 5회 폴링으로 체결 상태를 확인합니다. API Rate Limit 에러를 방지하기 위해 **지수 백오프(Exponential Backoff)** 대기(초기 600ms에서 1.5배씩 점진적 증가)를 적용하며, 미확인 시 3단계 Reconciliation(identifier → uuid → open orders 스캔)을 거칩니다.
+    - 분할 체결(`state: 'wait'`)된 주문은 Background Partial Fill Watcher(4초 주기)가 지속 추적하여 증분(`overrideVolume`)만 포지션 매니저에 정밀 누적 반영합니다.
+    - 최종 미확인 주문은 `UNKNOWN_PENDING_RECONCILIATION` 상태로 전환되어 다음 폴링에서 재검증됩니다 (자동 취소 타이머는 없음).
 
 ---
 

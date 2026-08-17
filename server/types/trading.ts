@@ -94,6 +94,7 @@ export interface OrderRequest {
   side: OrderSide;
   requestedAmountKrw?: number; // for Market BUY on Upbit
   requestedVolume?: number; // for Market SELL on Upbit
+  limitPrice?: number; // Safety limit price for SELL to prevent slippage
   reason: string;
   createdAt: number;
 }
@@ -270,6 +271,10 @@ export interface BotParams {
   autoPilotEnabled: boolean;
   // Breakout Entry (상승 추세 돌파 매수)
   breakoutEntryEnabled?: boolean;
+  // Dry-Run Mode (실제 API 미호출, 시뮬레이션 전용)
+  dryRunMode?: boolean;
+  // Daily Maximum Loss Limit (일일 최대 손실 한도, 기본 5%)
+  dailyMaxLossPercent?: number;
 }
 
 export interface ApiKeys {

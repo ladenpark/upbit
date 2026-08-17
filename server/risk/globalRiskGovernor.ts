@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { roundDownToTick } from '../utils/priceUtils';
 import {
   Signal,
   OrderRequest,
@@ -28,9 +29,54 @@ export class GlobalRiskGovernor {
   private reservations: Map<string, ExposureReservation> = new Map();
   public reservedBuyExposureKrw = 0;
 
+  // Daily Loss Limit / Circuit Breaker
+  private dailyRealizedLossKrw = 0;
+  private dailyLossResetDate: string = '';
+  public circuitBreakerTriggered = false;
+
   constructor(params: BotParams) {
     this.params = params;
     this.loadReservations();
+    this.dailyLossResetDate = this.getTodayKST();
+  }
+
+  private getTodayKST(): string {
+    const kst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+    return kst.toISOString().slice(0, 10);
+  }
+
+  /**
+   * Records a realized loss for daily tracking. Call this from ATREngine on every losing trade.
+   * Positive value = loss amount (absolute), negative values are ignored (profits).
+   */
+  public recordDailyLoss(lossAmountKrw: number, totalCapitalKrw: number): { circuitBroken: boolean } {
+    // Auto-reset at day boundary (KST)
+    const today = this.getTodayKST();
+    if (today !== this.dailyLossResetDate) {
+      this.dailyRealizedLossKrw = 0;
+      this.dailyLossResetDate = today;
+      this.circuitBreakerTriggered = false;
+      console.log(`[GlobalRiskGovernor] 📅 Daily loss counter reset for ${today}`);
+    }
+
+    if (lossAmountKrw <= 0) return { circuitBroken: false };
+
+    this.dailyRealizedLossKrw += lossAmountKrw;
+    const maxLossPercent = this.params.dailyMaxLossPercent || 5;
+    const maxLossKrw = totalCapitalKrw * (maxLossPercent / 100);
+
+    console.log(`[GlobalRiskGovernor] 📉 Daily realized loss: ₩${Math.round(this.dailyRealizedLossKrw).toLocaleString()} / ₩${Math.round(maxLossKrw).toLocaleString()} (${maxLossPercent}% limit)`);
+
+    if (this.dailyRealizedLossKrw >= maxLossKrw) {
+      this.circuitBreakerTriggered = true;
+      console.error(`[GlobalRiskGovernor] 🚨 CIRCUIT BREAKER TRIGGERED! Daily loss ₩${Math.round(this.dailyRealizedLossKrw).toLocaleString()} exceeds ${maxLossPercent}% limit (₩${Math.round(maxLossKrw).toLocaleString()})`);
+      return { circuitBroken: true };
+    }
+    return { circuitBroken: false };
+  }
+
+  public getDailyLossStatus(): { dailyLossKrw: number; circuitBroken: boolean } {
+    return { dailyLossKrw: this.dailyRealizedLossKrw, circuitBroken: this.circuitBreakerTriggered };
   }
 
   public setParams(newParams: BotParams) {
@@ -141,6 +187,11 @@ export class GlobalRiskGovernor {
     const pendingOrdersCount = Array.isArray(pendingOrdersInput) ? pendingOrdersInput.length : pendingOrdersInput;
     const isProtectiveSell = PROTECTIVE_SELL_SIGNALS.includes(signal.type);
 
+    // 0. Circuit Breaker Check — Only allow protective sells
+    if (this.circuitBreakerTriggered && !isProtectiveSell) {
+      return { approved: false, rejectionReason: `[Risk Block] 🚨 Circuit Breaker active — Daily loss limit exceeded. Only protective sells allowed.` };
+    }
+
     // 1. Bot State Check
     if (botState !== 'RUNNING' && signal.type !== 'EMERGENCY_FULL_EXIT') {
       return { approved: false, rejectionReason: `[Risk Block] Bot is currently in ${botState} state.` };
@@ -215,6 +266,7 @@ export class GlobalRiskGovernor {
           symbol: signal.symbol,
           side: 'SELL',
           requestedVolume: volume,
+          limitPrice: roundDownToTick(currentPrice * 0.985),
           reason: signal.reason,
           createdAt: Date.now()
         }
@@ -240,6 +292,7 @@ export class GlobalRiskGovernor {
           symbol: signal.symbol,
           side: 'SELL',
           requestedVolume: volume,
+          limitPrice: roundDownToTick(currentPrice * 0.985),
           reason: signal.reason,
           createdAt: Date.now()
         }
@@ -263,6 +316,7 @@ export class GlobalRiskGovernor {
           symbol: signal.symbol,
           side: 'SELL',
           requestedVolume: volume,
+          limitPrice: roundDownToTick(currentPrice * 0.985),
           reason: signal.reason,
           createdAt: Date.now()
         }
@@ -352,7 +406,9 @@ export class GlobalRiskGovernor {
       const dir = path.dirname(RESERVATION_FILE);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       const list = Array.from(this.reservations.values()).slice(-100);
-      fs.writeFileSync(RESERVATION_FILE, JSON.stringify(list, null, 2), 'utf-8');
+      const tmpFile = RESERVATION_FILE + '.tmp';
+      fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, RESERVATION_FILE);
     } catch (e) {
       console.error('[GlobalRiskGovernor] Failed to save exposure reservations:', e);
     }

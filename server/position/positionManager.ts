@@ -2,6 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { PositionSnapshot, PositionState, BotParams, OrderFill } from '../types/trading';
 
+const TRADE_LOGS_FILE = path.join(process.cwd(), 'data', 'trade_logs.json');
+
 const POSITION_FILE = path.join(process.cwd(), 'data', 'position_state.json');
 
 export class PositionManager {
@@ -12,6 +14,30 @@ export class PositionManager {
     this.params = params;
     this.position = this.createDefaultPosition();
     this.loadStateFromFile();
+  }
+
+  // ──── Static Utility: Trade Logs Persistence ────
+  public static loadTradeLogs(): any[] {
+    try {
+      if (fs.existsSync(TRADE_LOGS_FILE)) {
+        return JSON.parse(fs.readFileSync(TRADE_LOGS_FILE, 'utf-8'));
+      }
+    } catch {}
+    return [];
+  }
+
+  public static saveTradeLogs(logs: any[]) {
+    try {
+      const dir = path.dirname(TRADE_LOGS_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Keep max 1000 entries
+      const trimmed = logs.slice(0, 1000);
+      const tmpFile = TRADE_LOGS_FILE + '.tmp';
+      fs.writeFileSync(tmpFile, JSON.stringify(trimmed, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, TRADE_LOGS_FILE);
+    } catch (e) {
+      console.error('[PositionManager] Failed to save trade logs:', e);
+    }
   }
 
   private createDefaultPosition(): PositionSnapshot {
@@ -404,7 +430,9 @@ export class PositionManager {
     try {
       const dir = path.dirname(POSITION_FILE);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(POSITION_FILE, JSON.stringify(this.position, null, 2), 'utf-8');
+      const tmpFile = POSITION_FILE + '.tmp';
+      fs.writeFileSync(tmpFile, JSON.stringify(this.position, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, POSITION_FILE);
     } catch (e) {
       console.error('[PositionManager] Failed to save position state to file:', e);
     }

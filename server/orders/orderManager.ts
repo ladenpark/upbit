@@ -103,7 +103,9 @@ export class OrderManager {
       const dir = path.dirname(PROCESSED_SIGNALS_FILE);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       const list = Array.from(this.processedSignalIds).slice(-1000); // keep last 1000
-      fs.writeFileSync(PROCESSED_SIGNALS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+      const tmpFile = PROCESSED_SIGNALS_FILE + '.tmp';
+      fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, PROCESSED_SIGNALS_FILE);
     } catch (e) {
       console.error('[OrderManager] Failed to save processed signal IDs:', e);
     }
@@ -158,8 +160,9 @@ export class OrderManager {
     secretKey: string,
     uuid: string
   ): Promise<UpbitOrderResponse | null> {
+    let currentInterval = 600;
     for (let attempt = 1; attempt <= FILL_CONFIRM_MAX_RETRIES; attempt++) {
-      await this.sleep(FILL_CONFIRM_INTERVAL_MS);
+      await this.sleep(currentInterval);
       try {
         const queryRes = await this.upbitClient.getOrder(accessKey, secretKey, uuid);
         if (queryRes.success && queryRes.order) {
@@ -174,6 +177,7 @@ export class OrderManager {
       } catch (e) {
         console.warn(`[OrderManager] Upbit poll attempt ${attempt}/${FILL_CONFIRM_MAX_RETRIES} failed:`, e);
       }
+      currentInterval = Math.floor(currentInterval * 1.5);
     }
     return null;
   }
@@ -299,7 +303,7 @@ export class OrderManager {
           } else {
             return await this.upbitClient.executeOrder(
               accessKey, secretKey, req.symbol, 'SELL',
-              { volume: req.requestedVolume },
+              { volume: req.requestedVolume, limitPrice: req.limitPrice },
               req.clientOrderId
             );
           }
@@ -474,9 +478,13 @@ export class OrderManager {
   private startPartialFillWatcher() {
     if (this.partialFillWatchTimer) return;
     this.partialFillWatchTimer = setInterval(async () => {
-      if (this.watchingOrderIds.size === 0) return;
       if (!this.lastApiKeys?.upbitAccessKey || !this.lastApiKeys?.upbitSecretKey) return;
 
+      const STALE_ORDER_TIMEOUT_MS = 60000;   // 60 seconds for OPEN/PARTIALLY_FILLED
+      const UNKNOWN_ORDER_TIMEOUT_MS = 120000; // 120 seconds for UNKNOWN_PENDING_RECONCILIATION
+      const now = Date.now();
+
+      // 1. Check watched orders (PARTIALLY_FILLED / OPEN)
       for (const orderId of Array.from(this.watchingOrderIds)) {
         const ord = this.orders.get(orderId);
         if (!ord || (ord.status !== 'PARTIALLY_FILLED' && ord.status !== 'OPEN')) {
@@ -484,6 +492,30 @@ export class OrderManager {
           continue;
         }
 
+        const elapsed = now - ord.createdAt;
+
+        // Auto-cancel stale orders after 60 seconds
+        if (elapsed > STALE_ORDER_TIMEOUT_MS && ord.exchangeOrderId) {
+          console.warn(`[OrderManager] ⏰ Stale order detected (${Math.round(elapsed / 1000)}s): ${ord.clientOrderId}. Auto-cancelling...`);
+          try {
+            const cancelRes = await this.upbitClient.cancelOrder(
+              this.lastApiKeys.upbitAccessKey,
+              this.lastApiKeys.upbitSecretKey,
+              ord.exchangeOrderId
+            );
+            if (cancelRes.success && cancelRes.order) {
+              this.applyUpbitOrderState(ord, cancelRes.order, () => {}, () => {}, 'WATCHER');
+              console.log(`[OrderManager] ✅ Stale order auto-cancelled: ${ord.clientOrderId} (filled=${ord.filledVolume})`);
+            } else {
+              console.warn(`[OrderManager] ⚠️ Cancel failed for ${ord.clientOrderId}: ${cancelRes.error}`);
+            }
+          } catch (e) {
+            console.warn(`[OrderManager] Cancel error for ${ord.clientOrderId}:`, e);
+          }
+          continue;
+        }
+
+        // Normal reconciliation for non-stale watched orders
         try {
           const res = await this.reconcileUpbitOrder(
             ord.clientOrderId,
@@ -499,6 +531,41 @@ export class OrderManager {
         } catch (e) {
           console.warn(`[OrderManager] Partial fill watcher: reconcile failed for ${ord.clientOrderId}`, e);
         }
+      }
+
+      // 2. Check UNKNOWN_PENDING_RECONCILIATION orders (not in watchingOrderIds)
+      for (const ord of this.orders.values()) {
+        if (ord.status !== 'UNKNOWN_PENDING_RECONCILIATION') continue;
+        const elapsed = now - ord.updatedAt;
+        if (elapsed <= UNKNOWN_ORDER_TIMEOUT_MS) continue;
+
+        console.warn(`[OrderManager] ⏰ UNKNOWN order timeout (${Math.round(elapsed / 1000)}s): ${ord.clientOrderId}. Force-releasing...`);
+
+        // Try one last reconciliation
+        try {
+          const res = await this.reconcileUpbitOrder(
+            ord.clientOrderId,
+            ord.exchangeOrderId,
+            ord.symbol,
+            ord.side,
+            this.lastApiKeys.upbitAccessKey,
+            this.lastApiKeys.upbitSecretKey
+          );
+          if (res.found && res.order) {
+            this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
+            continue;
+          }
+        } catch {}
+
+        // If still unresolved, force-release
+        ord.status = 'CANCELLED';
+        ord.error = 'Force-released after UNKNOWN timeout (120s)';
+        ord.updatedAt = Date.now();
+        if (ord.side === 'BUY' && this.riskGovernor) {
+          this.riskGovernor.releaseExposure(ord.clientOrderId);
+        }
+        this.saveOrdersToFile();
+        console.log(`[OrderManager] 🔓 Force-released UNKNOWN order: ${ord.clientOrderId}`);
       }
     }, 4000);
 
@@ -534,7 +601,9 @@ export class OrderManager {
       const dir = path.dirname(ORDERS_FILE);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       const list = Array.from(this.orders.values()).slice(-200);
-      fs.writeFileSync(ORDERS_FILE, JSON.stringify(list, null, 2), 'utf-8');
+      const tmpFile = ORDERS_FILE + '.tmp';
+      fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), 'utf-8');
+      fs.renameSync(tmpFile, ORDERS_FILE);
     } catch (e) {
       console.error('[OrderManager] Failed to save order history:', e);
     }

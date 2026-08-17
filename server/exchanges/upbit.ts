@@ -235,7 +235,7 @@ export class UpbitClient {
     secretKey: string,
     market: string,
     side: 'BUY' | 'SELL',
-    amountOrPrice: { volume?: number; price?: number },
+    amountOrPrice: { volume?: number; price?: number; limitPrice?: number },
     identifier?: string
   ): Promise<{ success: boolean; orderId?: string; raw?: any; error?: string }> {
     if (!accessKey || !secretKey) {
@@ -266,7 +266,12 @@ export class UpbitClient {
     } else {
       // Upbit market sell uses ord_type: 'market' with volume
       if (amountOrPrice.volume) {
-        params.ord_type = 'market';
+        if (amountOrPrice.limitPrice) {
+          params.ord_type = 'limit';
+          params.price = amountOrPrice.limitPrice.toString();
+        } else {
+          params.ord_type = 'market';
+        }
         params.volume = amountOrPrice.volume.toString();
       } else {
         return { success: false, error: 'Upbit market sell requires volume' };
@@ -426,6 +431,34 @@ export class UpbitClient {
       return { success: true, orders: Array.isArray(data) ? data : [] };
     } catch (err: any) {
       return { success: false, error: err.message || 'Network error querying open orders' };
+    }
+  }
+
+  // Cancel an open order by UUID
+  public async cancelOrder(
+    accessKey: string,
+    secretKey: string,
+    uuid: string
+  ): Promise<{ success: boolean; order?: UpbitOrderResponse; error?: string }> {
+    if (!accessKey || !secretKey || !uuid) {
+      return { success: false, error: 'Missing parameters for cancelOrder' };
+    }
+    const params = { uuid };
+    try {
+      const token = this.generateAuthToken(accessKey, secretKey, params);
+      const url = `https://api.upbit.com/v1/order?uuid=${uuid}`;
+      const res = await fetch(url, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { success: false, error: data.error?.message || 'Failed to cancel order' };
+      }
+      console.log(`[UpbitClient] ✅ Order cancelled successfully: uuid=${uuid}`);
+      return { success: true, order: data as UpbitOrderResponse };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Network error cancelling order' };
     }
   }
 }

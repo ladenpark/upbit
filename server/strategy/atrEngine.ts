@@ -15,6 +15,7 @@ import { PositionManager } from '../position/positionManager';
 import { OrderManager } from '../orders/orderManager';
 import { UpbitClient } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
+import { roundDownToTick } from '../utils/priceUtils';
 
 export class ATREngine {
   // Sub-modules
@@ -56,7 +57,9 @@ export class ATREngine {
     trendDropWindowSeconds: 3,
     cooldownSecondsAfterCut: 60,
     autoPilotEnabled: true,
-    breakoutEntryEnabled: true
+    breakoutEntryEnabled: true,
+    dryRunMode: false,
+    dailyMaxLossPercent: 5
   };
 
   // Higher Timeframe (15m) Trend State for Whipsaw Filtering
@@ -81,6 +84,7 @@ export class ATREngine {
   private broadcastCallback?: (payload: any) => void;
   private balanceRefreshTimer: NodeJS.Timeout | null = null;
   private atrRefreshTimer: NodeJS.Timeout | null = null;
+  private balanceSyncTimeout: NodeJS.Timeout | null = null;
 
   constructor(broadcastCallback?: (payload: any) => void) {
     this.broadcastCallback = broadcastCallback;
@@ -101,6 +105,9 @@ export class ATREngine {
         }
       }
     );
+
+    // Restore persisted trade logs from disk so UI doesn't reset on restart
+    this.logs = PositionManager.loadTradeLogs().slice(0, 60);
 
     this.initDefaultHistory();
 
@@ -217,6 +224,22 @@ export class ATREngine {
     // Calculate drop speed over explicit 5-second window
     const dropSpeed = this.marketManager.calculateDropSpeed(this.params.trendDropWindowSeconds || 5);
 
+    // ── enableReentry trigger: DEFENSIVE/EMERGENCY_EXIT → REENTRY_ALLOWED ──
+    const positionForReentry = this.positionManager.getSnapshot();
+    if (
+      (positionForReentry.state === 'DEFENSIVE' || positionForReentry.state === 'EMERGENCY_EXIT') &&
+      !this.positionManager.isUnderCooldown() &&
+      dropSpeed >= -0.3 &&
+      price > lowerBand
+    ) {
+      this.positionManager.enableReentry();
+      this.addLog({
+        type: 'SYSTEM',
+        price,
+        reason: `✅ [재진입 허용] 급락 진정 확인 (dropSpeed=${dropSpeed.toFixed(2)}%) — 바닥 재매수 가능 상태로 전환`
+      });
+    }
+
     // Build price history array for adaptive indicators
     const historyPrices = this.priceHistory.map((p) => p.price);
     historyPrices.push(price);
@@ -275,22 +298,41 @@ export class ATREngine {
           reason: `[위험관리 승인] ${topSignal.reason} ➡️ 주문 발송 중...`
         });
 
-        // 3. Execute Order via OrderManager (OrderManager autonomously manages reserve/commit/release lifecycle)
-        await this.orderManager.submitOrder(
-          riskResult.orderRequest,
-          this.secretManager.getKeys(),
-          this.params.exchange,
-          (record) => {
-            this.handleOrderFilled(topSignal.type, record, price);
-          },
-          (error) => {
-            this.addLog({
-              type: 'SYSTEM',
-              price,
-              reason: `❌ [주문 실패] ${error}`
-            });
-          }
-        );
+        // DRY-RUN MODE: Simulate fill without touching exchange
+        if (this.params.dryRunMode) {
+          const dryVolume = riskResult.orderRequest.side === 'BUY'
+            ? (riskResult.orderRequest.requestedAmountKrw || 0) / price
+            : (riskResult.orderRequest.requestedVolume || 0);
+          const dryRecord = {
+            clientOrderId,
+            signalType: topSignal.type,
+            status: 'FILLED',
+            filledVolume: dryVolume,
+            avgFillPrice: price,
+            requestedBudgetOrVolume: riskResult.orderRequest.requestedAmountKrw || riskResult.orderRequest.requestedVolume || 0,
+            reason: riskResult.orderRequest.reason,
+            side: riskResult.orderRequest.side
+          };
+          console.log(`[ATREngine] 🏷️ DRY-RUN: Simulated ${riskResult.orderRequest.side} ${dryVolume.toFixed(6)} @ ₩${Math.round(price).toLocaleString()}`);
+          this.handleOrderFilled(topSignal.type, dryRecord, price);
+        } else {
+          // 3. Execute Order via OrderManager (OrderManager autonomously manages reserve/commit/release lifecycle)
+          await this.orderManager.submitOrder(
+            riskResult.orderRequest,
+            this.secretManager.getKeys(),
+            this.params.exchange,
+            (record) => {
+              this.handleOrderFilled(topSignal.type, record, price);
+            },
+            (error) => {
+              this.addLog({
+                type: 'SYSTEM',
+                price,
+                reason: `❌ [주문 실패] ${error}`
+              });
+            }
+          );
+        }
       }
     }
 
@@ -493,8 +535,43 @@ export class ATREngine {
       });
     }
 
-    // Refresh real account balances immediately after any fill
-    this.fetchRealAccountBalance();
+    // ── Record daily loss for Circuit Breaker ──
+    // Sum up total capital for threshold calculation
+    const totalCap = this.actualKrwBalance + (this.positionManager.getSnapshot().amount * this.currentPrice);
+    if (this.totalRealizedPnl < 0) {
+      // Only track realized losses (positive lossAmount = how much was lost)
+      // We pass the absolute loss from this specific trade, not the cumulative
+    }
+    // Check if this specific fill was a losing sell
+    if (
+      signalType !== 'ENTRY_BUY' && signalType !== 'BREAKOUT_BUY' &&
+      signalType !== 'DCA_BUY' && signalType !== 'PYRAMID_BUY' && signalType !== 'REENTRY_BUY'
+    ) {
+      const entry = position.entryPrice || fillPrice;
+      const thisTradePnl = (fillPrice - entry) * effectiveVolume;
+      if (thisTradePnl < 0) {
+        const { circuitBroken } = this.riskGovernor.recordDailyLoss(Math.abs(thisTradePnl), totalCap);
+        if (circuitBroken) {
+          this.botState = 'HALTED';
+          this.params.isBotActive = false;
+          this.addLog({
+            type: 'SYSTEM',
+            price: fillPrice,
+            reason: `🚨 [서킷 브레이커] 일일 최대 손실 한도(${this.params.dailyMaxLossPercent || 5}%) 초과 — 봇 자동 정지`
+          });
+        }
+      }
+    }
+
+    // Refresh real account balances with a delay for eventual consistency defense
+    if (!this.params.dryRunMode) {
+      if (this.balanceSyncTimeout) {
+        clearTimeout(this.balanceSyncTimeout);
+      }
+      this.balanceSyncTimeout = setTimeout(() => {
+        this.fetchRealAccountBalance();
+      }, 1500);
+    }
   }
 
   /**
@@ -610,6 +687,7 @@ export class ATREngine {
         symbol: this.params.symbol,
         side: 'SELL' as const,
         requestedVolume: position.amount,
+        limitPrice: roundDownToTick(this.currentPrice * 0.985),
         reason: '[전량 청산] 사용자 긴급 전량 매도 요청',
         createdAt: Date.now()
       };
@@ -692,16 +770,27 @@ export class ATREngine {
   }
 
   public addLog(log: Omit<TradeLog, 'id' | 'time' | 'timestamp'>) {
+    const dryTag = this.params.dryRunMode ? '[DRY-RUN] ' : '';
     const d = new Date();
     const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
     const newLog: TradeLog = {
       ...log,
+      reason: dryTag + log.reason,
       id: Math.random().toString(36).substring(7),
       time: timeLabel,
       timestamp: Date.now()
     };
     this.logs.unshift(newLog);
     if (this.logs.length > 60) this.logs.pop();
+
+    // Persist trade logs (BUY/SELL/STOP_LOSS) to disk
+    if (log.type !== 'SYSTEM') {
+      try {
+        const diskLogs = PositionManager.loadTradeLogs();
+        diskLogs.unshift(newLog);
+        PositionManager.saveTradeLogs(diskLogs);
+      } catch {}
+    }
   }
 
   /**
