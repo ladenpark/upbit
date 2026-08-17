@@ -265,7 +265,7 @@ export class ATRStrategyCore {
       params.pyramidingEnabled &&
       position.pyramidingCount < params.maxPyramidingOrders &&
       pnlPercent >= params.pyramidingStepPercent * (position.pyramidingCount + 1) &&
-      !position.trailingActive
+      adaptive.marketRegime === 'BULL'
     ) {
       signals.push({
         id: `SIG_PYRAMID_${position.pyramidingCount + 1}_${now}`,

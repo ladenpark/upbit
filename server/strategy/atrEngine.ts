@@ -431,8 +431,34 @@ export class ATREngine {
         exchange: this.params.exchange,
         reason: `${record.reason} [실제체결: ${cutVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
+    } else if (signalType === 'TRAILING_STOP_EXIT') {
+      const sellVolume = effectiveVolume;
+      const entry = position.entryPrice || fillPrice;
+      const pnl = (fillPrice - entry) * sellVolume;
+      const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
+
+      const isFullExit = sellVolume >= position.amount - 1e-6;
+
+      if (isFullExit) {
+        this.positionManager.onPositionClosed(pnl, signalType);
+      } else {
+        this.positionManager.onTrailingPartialFilled(sellVolume, fillPrice, pnl);
+      }
+
+      this.totalRealizedPnl += pnl;
+      this.totalTrades += 1;
+      if (pnl > 0) this.winTrades += 1;
+
+      this.addLog({
+        type: pnl >= 0 ? 'SELL' : 'STOP_LOSS',
+        price: fillPrice,
+        amount: sellVolume,
+        pnl,
+        pnlPercent,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [${isFullExit ? '전량' : '부분'}체결: ${sellVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
     } else if (
-      signalType === 'TRAILING_STOP_EXIT' ||
       signalType === 'ABSOLUTE_STOP_EXIT' ||
       signalType === 'EMERGENCY_FULL_EXIT'
     ) {

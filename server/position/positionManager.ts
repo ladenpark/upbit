@@ -260,6 +260,32 @@ export class PositionManager {
   }
 
   /**
+   * Called when a partial Trailing Take-Profit order fills.
+   * Reduces position by cutVolume but keeps the position open.
+   * Disarms trailing (trailingActive=false, trailingPeakPrice=null) so that
+   * the NEXT trailing take-profit requires a genuinely new high (price must
+   * cross upperBand again) before it can fire again.
+   */
+  public onTrailingPartialFilled(cutVolume: number, cutPrice: number, pnl: number) {
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(6));
+    this.position.realizedPnl += pnl;
+    this.position.lastUpdatedAt = Date.now();
+
+    // Disarm trailing: require a fresh higher high before the next partial take-profit can fire.
+    this.position.trailingActive = false;
+    this.position.trailingPeakPrice = null;
+
+    if (this.position.amount <= 0) {
+      this.position.entryPrice = null;
+      this.position.state = 'FLAT';
+      this.position.pyramidingCount = 0;
+    }
+
+    this.saveStateToFile();
+    console.log(`[PositionManager] Trailing Partial Take-Profit: Sold ${cutVolume} @ ₩${cutPrice.toLocaleString()}, Remaining Qty=${this.position.amount}, PnL=₩${Math.round(pnl).toLocaleString()}`);
+  }
+
+  /**
    * Called when partial fill occurs on a Full Exit order (Trailing Stop, Absolute Stop, Emergency Exit).
    * Reduces position amount without fully closing to FLAT until 100% completed.
    */

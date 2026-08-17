@@ -184,9 +184,45 @@ export class GlobalRiskGovernor {
     }
 
     // 5. Handle SELL Signals
+    if (signal.type === 'TRAILING_STOP_EXIT') {
+      const TRAILING_PARTIAL_RATIO = 0.5; // 한 번에 보유 물량의 50%만 익절
+      const DUST_GUARD_KRW = 10000; // 업비트 최소 주문(5,000원)보다 여유 있게 설정한 안전 버퍼
+
+      if (position.amount <= 0) {
+        return { approved: false, rejectionReason: `[Risk Block] No coin position available for trailing take-profit.` };
+      }
+
+      let volume = Number((position.amount * TRAILING_PARTIAL_RATIO).toFixed(6));
+      const remainingValueKrw = (position.amount - volume) * currentPrice;
+
+      // 부분 매도 후 남는 물량이 더스트 수준이면, 어차피 다음 사이클에서 또 팔아야 하니 그냥 전량 매도
+      if (remainingValueKrw < DUST_GUARD_KRW) {
+        volume = position.amount;
+      }
+
+      if (volume <= 0) {
+        return { approved: false, rejectionReason: `[Risk Block] Trailing take-profit volume too small.` };
+      }
+
+      const clientOrderId = `ORD_${signal.type}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+      return {
+        approved: true,
+        calculatedVolume: volume,
+        orderRequest: {
+          clientOrderId,
+          signalId: signal.id,
+          signalType: signal.type,
+          symbol: signal.symbol,
+          side: 'SELL',
+          requestedVolume: volume,
+          reason: signal.reason,
+          createdAt: Date.now()
+        }
+      };
+    }
+
     if (
       signal.type === 'ABSOLUTE_STOP_EXIT' ||
-      signal.type === 'TRAILING_STOP_EXIT' ||
       signal.type === 'EMERGENCY_FULL_EXIT'
     ) {
       const volume = position.amount;

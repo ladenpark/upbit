@@ -883,6 +883,240 @@ async function runAllTests() {
   assert(posAfterBreakout.initialStopPrice !== null && posAfterBreakout.initialStopPrice < currentBullPrice, '[Breakout Entry] Static Stop Loss securely locked below entry');
 
   // ──────────────────────────────────────────────────────
+  // TEST GROUP 15: Trailing Partial Take-Profit (50% Scaling & Dust Guard) - Scenarios 1 to 6
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 15: Trailing Partial Take-Profit (50% Partial Exit & Dust Guard)');
+
+  const partialTrailingPosManager = new PositionManager(defaultParams);
+  partialTrailingPosManager.onPositionClosed(0, 'INIT_FLAT');
+  // Pristine test isolation
+  (partialTrailingPosManager as any).position.realizedPnl = 0;
+  (partialTrailingPosManager as any).position.cooldownUntil = 0;
+  partialTrailingPosManager.onInitialEntryFilled(2800000, 1.0, 2800000, 30000, 3.0, 2.0);
+
+  // [Scenario 1] 1.0 ETH position -> RiskGovernor calculates 50% partial exit = 0.5 ETH
+  const posSnap1 = partialTrailingPosManager.getSnapshot();
+  const trailingSignal1: Signal = {
+    id: 'SIG_TRAILING_PARTIAL_1',
+    timestamp: Date.now(),
+    timeframe: 'tick',
+    source: 'TRAILING_STOP_ENGINE',
+    type: 'TRAILING_STOP_EXIT',
+    priority: 3,
+    symbol: 'KRW-ETH',
+    price: 3000000,
+    reason: 'Trailing take-profit triggered',
+    indicatorSnapshot: {
+      baseline: 2800000,
+      atr: 30000,
+      upperBand: 2890000,
+      lowerBand: 2710000,
+      currentStopLoss: 2600000,
+      marketRegime: 'BULL',
+      slope: 0.2,
+      volatilityRatio: 1.0
+    }
+  };
+
+  const riskEval1 = riskGovernor.evaluateSignal(
+    trailingSignal1,
+    'RUNNING',
+    'LIVE',
+    5000000,
+    posSnap1,
+    3000000,
+    [],
+    0
+  );
+
+  assert(riskEval1.approved === true, '[Scenario 1] TRAILING_STOP_EXIT is approved by RiskGovernor');
+  assert(riskEval1.calculatedVolume === 0.5, '[Scenario 1] Exactly 50% volume (0.5 ETH) calculated for 1.0 ETH position');
+
+  // Execute partial exit fill
+  const pnl1 = (3000000 - 2800000) * 0.5; // +100,000 KRW
+  partialTrailingPosManager.onTrailingPartialFilled(0.5, 3000000, pnl1);
+  const posSnapAfterExit1 = partialTrailingPosManager.getSnapshot();
+  assert(posSnapAfterExit1.amount === 0.5, '[Scenario 1] Position amount is exactly 0.5 ETH remaining after 1st partial exit');
+  assert(posSnapAfterExit1.state === 'ENTRY_FILLED', '[Scenario 1] Position state remains open (ENTRY_FILLED)');
+  assert(posSnapAfterExit1.realizedPnl === 100000, '[Scenario 1] Realized PnL correctly accumulated ₩100,000');
+
+  // [Scenario 2] Trailing is disarmed (trailingActive=false, trailingPeakPrice=null)
+  assert(posSnapAfterExit1.trailingActive === false, '[Scenario 2] trailingActive is disarmed to false after partial exit');
+  assert(posSnapAfterExit1.trailingPeakPrice === null, '[Scenario 2] trailingPeakPrice is reset to null to require fresh higher high');
+
+  // [Scenario 3] 2nd Trailing partial exit on remaining 0.5 ETH -> sells 0.25 ETH, 0.25 ETH remains
+  const riskEval2 = riskGovernor.evaluateSignal(
+    trailingSignal1,
+    'RUNNING',
+    'LIVE',
+    5000000,
+    posSnapAfterExit1,
+    3100000,
+    [],
+    0
+  );
+  assert(riskEval2.approved === true, '[Scenario 3] 2nd TRAILING_STOP_EXIT is approved');
+  assert(riskEval2.calculatedVolume === 0.25, '[Scenario 3] Exactly 50% volume (0.25 ETH) calculated for 0.5 ETH position');
+
+  const pnl2 = (3100000 - 2800000) * 0.25; // +75,000 KRW
+  partialTrailingPosManager.onTrailingPartialFilled(0.25, 3100000, pnl2);
+  const posSnapAfterExit2 = partialTrailingPosManager.getSnapshot();
+  assert(posSnapAfterExit2.amount === 0.25, '[Scenario 3] Position amount is exactly 0.25 ETH remaining after 2nd partial exit');
+  assert(posSnapAfterExit2.realizedPnl === 175000, '[Scenario 3] Realized PnL is now ₩175,000');
+  assert(posSnapAfterExit2.trailingActive === false && posSnapAfterExit2.trailingPeakPrice === null, '[Scenario 3] Trailing state remains cleanly disarmed');
+
+  // [Scenario 4] Dust Guard test: remaining value < 10,000 KRW forces full liquidation
+  const dustPos: PositionSnapshot = {
+    ...posSnapAfterExit2,
+    amount: 0.003 // 0.003 ETH @ 2,500,000 = 7,500 KRW (< 10,000 KRW dust guard threshold)
+  };
+  const dustRiskEval = riskGovernor.evaluateSignal(
+    trailingSignal1,
+    'RUNNING',
+    'LIVE',
+    5000000,
+    dustPos,
+    2500000,
+    [],
+    0
+  );
+  assert(dustRiskEval.approved === true, '[Scenario 4] Dust guard signal approved');
+  assert(dustRiskEval.calculatedVolume === 0.003, '[Scenario 4] Dust guard forced 100% full liquidation (0.003 ETH instead of 0.0015 ETH)');
+
+  // When 0.003 is sold, position becomes FLAT
+  partialTrailingPosManager.onTrailingPartialFilled(0.25, 3200000, 100000); // close remaining 0.25
+  const finalSnap = partialTrailingPosManager.getSnapshot();
+  assert(finalSnap.amount === 0, '[Scenario 4] Position amount becomes 0');
+  assert(finalSnap.state === 'FLAT', '[Scenario 4] Position state transitions to FLAT');
+  assert(finalSnap.entryPrice === null, '[Scenario 4] Entry price cleared on 100% closure');
+
+  // [Scenario 5] Verify other exits (ABSOLUTE_STOP_EXIT, EMERGENCY_FULL_EXIT, PARTIAL_LOSS_CUT, EMERGENCY_TREND_CUT, DCA_BUY)
+  const fullPosSnap: PositionSnapshot = { ...posSnap1, amount: 1.0 };
+  const absStopEval = riskGovernor.evaluateSignal({ ...trailingSignal1, type: 'ABSOLUTE_STOP_EXIT', priority: 1 }, 'RUNNING', 'LIVE', 5000000, fullPosSnap, 2500000, [], 0);
+  assert(absStopEval.approved === true && absStopEval.calculatedVolume === 1.0, '[Scenario 5] ABSOLUTE_STOP_EXIT remains 100% full exit (1.0 ETH)');
+
+  const emgFullEval = riskGovernor.evaluateSignal({ ...trailingSignal1, type: 'EMERGENCY_FULL_EXIT', priority: 2 }, 'RUNNING', 'LIVE', 5000000, fullPosSnap, 2500000, [], 0);
+  assert(emgFullEval.approved === true && emgFullEval.calculatedVolume === 1.0, '[Scenario 5] EMERGENCY_FULL_EXIT remains 100% full exit (1.0 ETH)');
+
+  const partLossEval = riskGovernor.evaluateSignal({ ...trailingSignal1, type: 'PARTIAL_LOSS_CUT', priority: 4 }, 'RUNNING', 'LIVE', 5000000, fullPosSnap, 2500000, [], 0);
+  assert(partLossEval.approved === true && partLossEval.calculatedVolume === 0.4, '[Scenario 5] PARTIAL_LOSS_CUT remains 40% partial exit (0.4 ETH)');
+
+  const emgTrendEval = riskGovernor.evaluateSignal({ ...trailingSignal1, type: 'EMERGENCY_TREND_CUT', priority: 2 }, 'RUNNING', 'LIVE', 5000000, fullPosSnap, 2500000, [], 0);
+  assert(emgTrendEval.approved === true && emgTrendEval.calculatedVolume === 0.4, '[Scenario 5] EMERGENCY_TREND_CUT remains 40% emergency cut (0.4 ETH)');
+
+  // [Scenario 6] TRAILING_STOP_EXIT approved even when BUY is pending
+  const pendingBuyOrdersList: OrderRecord[] = [{
+    id: 'ORD_PENDING_BUY_TEST', clientOrderId: 'ORD_CLI_BUY_1', signalId: 'SIG_BUY_1', signalType: 'ENTRY_BUY',
+    symbol: 'KRW-ETH', side: 'BUY', status: 'ORDER_SUBMITTING', requestedBudgetOrVolume: 500000,
+    filledVolume: 0, avgFillPrice: 0, fee: 0, reason: 'Test pending BUY', fills: [],
+    createdAt: Date.now(), updatedAt: Date.now()
+  }];
+  const trailingWithPendingBuyEval = riskGovernor.evaluateSignal(
+    trailingSignal1, 'RUNNING', 'LIVE',
+    5000000, fullPosSnap, 3000000,
+    pendingBuyOrdersList, 0
+  );
+  assert(trailingWithPendingBuyEval.approved === true, '[Scenario 6] TRAILING_STOP_EXIT is not blocked by pending BUY orders');
+  assert(trailingWithPendingBuyEval.calculatedVolume === 0.5, '[Scenario 6] Partial trailing volume is 0.5 ETH during pending BUY');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 16: Pyramiding Bull Gate & Signal Priority - Scenarios 7 to 9
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 16: Pyramiding Bull Gate & Signal Priority');
+
+  const pyramidStrategyCore = new ATRStrategyCore();
+  const baseBullHistory = Array.from({ length: 20 }, (_, i) => 2600000 + i * 10000); // strong upward slope
+
+  // [Scenario 7] BULL market with trailingActive=true -> PYRAMID_BUY is generated when pnl >= 1.5%
+  const armedBullPosition: PositionSnapshot = {
+    ...posSnap1,
+    entryPrice: 2700000,
+    amount: 1.0,
+    pyramidingCount: 0,
+    trailingActive: true, // Trailing is ARMED
+    trailingPeakPrice: 2780000
+  };
+
+  const currentBullPriceForPyr = 2750000; // PnL = (2750000 - 2700000)/2700000 = +1.85% (>= 1.5%)
+  const bullBaselineForPyr = 2650000;
+  const bullAtrForPyr = 30000; // upperBand = 2650000 + 30000 * 2.4 = 2722000; current price 2750000 > upperBand
+
+  // When peak was 2780000 and current is 2750000, drop from peak is (2780000 - 2750000)/2780000 = 1.07% (>= 0.8% callback)
+  // To test ONLY pyramiding rule without trailing trigger, set peakPrice = 2750000 (0% drop from peak)
+  const armedBullPosNoDrop: PositionSnapshot = {
+    ...armedBullPosition,
+    trailingPeakPrice: 2750000 // 0% drop from peak, so Trailing Stop Exit does NOT trigger
+  };
+
+  const signalsBull = pyramidStrategyCore.generateSignals(
+    currentBullPriceForPyr,
+    bullBaselineForPyr,
+    bullAtrForPyr,
+    defaultParams,
+    armedBullPosNoDrop,
+    0.01,
+    baseBullHistory,
+    { trend: 'BULL', htfSlope: 0.5 }
+  );
+
+  const pyramidSignal = signalsBull.find((s) => s.type === 'PYRAMID_BUY');
+  assert(pyramidSignal !== undefined, '[Scenario 7] PYRAMID_BUY generated in BULL market even when trailingActive=true');
+  assert(pyramidSignal?.priority === 6, '[Scenario 7] PYRAMID_BUY signal priority is 6');
+
+  // [Scenario 8] SIDEWAYS or BEAR market -> PYRAMID_BUY is strictly blocked
+  const sidewaysHistory = Array.from({ length: 20 }, () => 2700000); // flat slope
+  const signalsSideways = pyramidStrategyCore.generateSignals(
+    currentBullPriceForPyr,
+    bullBaselineForPyr,
+    bullAtrForPyr,
+    defaultParams,
+    armedBullPosNoDrop,
+    0.01,
+    sidewaysHistory,
+    { trend: 'SIDEWAYS', htfSlope: 0 }
+  );
+
+  const pyrInSideways = signalsSideways.find((s) => s.type === 'PYRAMID_BUY');
+  assert(pyrInSideways === undefined, '[Scenario 8] PYRAMID_BUY is strictly BLOCKED in SIDEWAYS market');
+
+  const bearHistory = Array.from({ length: 20 }, (_, i) => 2800000 - i * 10000); // downward slope
+  const signalsBear = pyramidStrategyCore.generateSignals(
+    currentBullPriceForPyr,
+    bullBaselineForPyr,
+    bullAtrForPyr,
+    defaultParams,
+    armedBullPosNoDrop,
+    0.01,
+    bearHistory,
+    { trend: 'BEAR', htfSlope: -0.5 }
+  );
+
+  const pyrInBear = signalsBear.find((s) => s.type === 'PYRAMID_BUY');
+  assert(pyrInBear === undefined, '[Scenario 8] PYRAMID_BUY is strictly BLOCKED in BEAR market');
+
+  // [Scenario 9] Priority preservation: When Trailing Stop AND Pyramiding conditions both match,
+  // TRAILING_STOP_EXIT (priority 3) fires and early-returns, preventing concurrent PYRAMID_BUY
+  const armedBullPosWithDrop: PositionSnapshot = {
+    ...armedBullPosition,
+    trailingPeakPrice: 2780000 // Peak was 2,780,000; current is 2,750,000 (-1.08% drop >= 0.8% callback)
+  };
+
+  const concurrentSignals = pyramidStrategyCore.generateSignals(
+    currentBullPriceForPyr,
+    bullBaselineForPyr,
+    bullAtrForPyr,
+    defaultParams,
+    armedBullPosWithDrop,
+    0.01,
+    baseBullHistory,
+    { trend: 'BULL', htfSlope: 0.5 }
+  );
+
+  assert(concurrentSignals.length === 1, '[Scenario 9] Exactly 1 signal generated on concurrent condition tick');
+  assert(concurrentSignals[0].type === 'TRAILING_STOP_EXIT', '[Scenario 9] TRAILING_STOP_EXIT (Priority 3) takes precedence over Pyramiding (Priority 6)');
+  assert(concurrentSignals.find((s) => s.type === 'PYRAMID_BUY') === undefined, '[Scenario 9] PYRAMID_BUY is NOT co-emitted in the same tick');
+
+  // ──────────────────────────────────────────────────────
   // RESULTS
   // ──────────────────────────────────────────────────────
   console.log('\n======================================================');
