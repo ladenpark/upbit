@@ -9,6 +9,7 @@ export type SignalType =
   | 'BREAKOUT_BUY'
   | 'DCA_BUY'
   | 'PYRAMID_BUY'
+  | 'BOX_PYRAMID_BUY'
   | 'REENTRY_BUY'
   | 'PARTIAL_LOSS_CUT'
   | 'EMERGENCY_TREND_CUT'
@@ -23,7 +24,7 @@ export type SignalPriority = 1 | 2 | 3 | 4 | 5 | 6;
 // 3 = TRAILING_STOP_EXIT, SCALP_TAKE_PROFIT
 // 4 = REENTRY_BUY
 // 5 = DCA_BUY
-// 6 = ENTRY_BUY, BREAKOUT_BUY, PYRAMID_BUY (Lowest)
+// 6 = ENTRY_BUY, BREAKOUT_BUY, PYRAMID_BUY, BOX_PYRAMID_BUY (Lowest)
 
 export interface Signal {
   id: string;
@@ -162,6 +163,7 @@ export interface PositionSnapshot {
   }[];
   pyramidingCount: number;
   maxPyramidingOrders: number;
+  boxPyramidCount: number;
   // Trailing Take Profit State
   trailingActive: boolean;
   trailingPeakPrice: number | null;

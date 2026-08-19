@@ -91,7 +91,7 @@ async function runAllTests() {
       { slotNumber: 2, status: 'AVAILABLE' },
       { slotNumber: 3, status: 'AVAILABLE' }
     ],
-    pyramidingCount: 0, maxPyramidingOrders: 2,
+    pyramidingCount: 0, maxPyramidingOrders: 2, boxPyramidCount: 0,
     trailingActive: false, trailingPeakPrice: null, cooldownUntil: 0
   };
 
@@ -146,7 +146,7 @@ async function runAllTests() {
       { slotNumber: 2, status: 'AVAILABLE' },
       { slotNumber: 3, status: 'AVAILABLE' }
     ],
-    pyramidingCount: 0, maxPyramidingOrders: 2,
+    pyramidingCount: 0, maxPyramidingOrders: 2, boxPyramidCount: 0,
     trailingActive: false, trailingPeakPrice: null, cooldownUntil: 0
   };
 

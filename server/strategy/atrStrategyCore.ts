@@ -332,6 +332,34 @@ export class ATRStrategyCore {
       return signals;
     }
 
+    // --- Rule 7-b: Sideways Box-Range Pyramid Buy (Priority 6, 독립 카운터, 최대 1회) ---
+    const BOX_PYRAMID_MAX_ADDS = 1; // 박스권에서는 최대 1회만 (하락 리스크 제한)
+    const BOX_PYRAMID_STEP_PERCENT = 0.25; // 짤짤이 목표수익(0.5~0.8%)보다 낮은 지점에서만
+
+    if (
+      hasPosition &&
+      params.pyramidingEnabled &&
+      params.autoPilotEnabled &&
+      adaptive.marketRegime === 'SIDEWAYS' &&
+      !position.trailingActive &&
+      position.boxPyramidCount < BOX_PYRAMID_MAX_ADDS &&
+      pnlPercent >= BOX_PYRAMID_STEP_PERCENT
+    ) {
+      signals.push({
+        id: `SIG_BOX_PYRAMID_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'BOX_RANGE_SCALP_ENGINE',
+        type: 'BOX_PYRAMID_BUY',
+        priority: 6,
+        symbol: params.symbol,
+        price: currentPrice,
+        reason: `[박스권 불타기 추가매수] 보유 포지션 +${pnlPercent.toFixed(2)}% 수익 중 소액 추가매수 (국면: SIDEWAYS)`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
     // --- Rule 8: Initial 1st Entry Buy (Priority 6) ---
     if (!hasPosition && position.state === 'FLAT' && currentPrice <= lowerBand) {
       signals.push({

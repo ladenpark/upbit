@@ -330,6 +330,7 @@ export class GlobalRiskGovernor {
       signal.type === 'BREAKOUT_BUY' ||
       signal.type === 'DCA_BUY' ||
       signal.type === 'PYRAMID_BUY' ||
+      signal.type === 'BOX_PYRAMID_BUY' ||
       signal.type === 'REENTRY_BUY'
     ) {
       const limits = this.calculateExposureLimits(actualKrwBalance, position.amount, currentPrice, pendingOrdersAmountKrw);
@@ -350,7 +351,11 @@ export class GlobalRiskGovernor {
 
       // 박스권 스캘핑 진입은 일반 진입의 절반 크기로 제한
       const isScalpEntry = signal.reason.includes('스캘핑 진입');
-      if (isScalpEntry) {
+      const isBoxPyramidEntry = signal.reason.includes('박스권 불타기 추가매수');
+
+      if (isBoxPyramidEntry) {
+        targetBudget *= 0.25; // 박스권 추가매수는 일반 진입의 1/4로 엄격 제한
+      } else if (isScalpEntry) {
         targetBudget *= 0.5;
       }
 

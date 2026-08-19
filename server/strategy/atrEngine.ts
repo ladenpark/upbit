@@ -489,6 +489,16 @@ export class ATREngine {
         exchange: this.params.exchange,
         reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
+    } else if (signalType === 'BOX_PYRAMID_BUY') {
+      this.positionManager.onBoxPyramidFilled(fillPrice, effectiveVolume);
+      this.totalTrades += 1;
+      this.addLog({
+        type: 'BUY',
+        price: fillPrice,
+        amount: effectiveVolume,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
     } else if (signalType === 'PARTIAL_LOSS_CUT') {
       const cutVolume = effectiveVolume;
       const entry = position.entryPrice || fillPrice;
@@ -610,7 +620,8 @@ export class ATREngine {
     // Check if this specific fill was a losing sell
     if (
       signalType !== 'ENTRY_BUY' && signalType !== 'BREAKOUT_BUY' &&
-      signalType !== 'DCA_BUY' && signalType !== 'PYRAMID_BUY' && signalType !== 'REENTRY_BUY'
+      signalType !== 'DCA_BUY' && signalType !== 'PYRAMID_BUY' &&
+      signalType !== 'BOX_PYRAMID_BUY' && signalType !== 'REENTRY_BUY'
     ) {
       const entry = position.entryPrice || fillPrice;
       const thisTradePnl = (fillPrice - entry) * effectiveVolume;

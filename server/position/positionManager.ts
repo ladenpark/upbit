@@ -64,6 +64,7 @@ export class PositionManager {
       ],
       pyramidingCount: 0,
       maxPyramidingOrders: this.params.maxPyramidingOrders,
+      boxPyramidCount: 0,
       trailingActive: false,
       trailingPeakPrice: null,
       cooldownUntil: 0
@@ -123,6 +124,7 @@ export class PositionManager {
       status: 'AVAILABLE'
     }));
     this.position.pyramidingCount = 0;
+    this.position.boxPyramidCount = 0;
     this.position.trailingActive = false;
     this.position.trailingPeakPrice = null;
 
@@ -238,6 +240,26 @@ export class PositionManager {
   }
 
   /**
+   * Called when a Box-Range Pyramid buy order fills (SIDEWAYS regime add-on).
+   * Completely independent from onPyramidFilled()/pyramidingCount — separate risk budget.
+   */
+  public onBoxPyramidFilled(fillPrice: number, fillVolume: number) {
+    const currentQty = this.position.amount;
+    const currentEntry = this.position.entryPrice || fillPrice;
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(6));
+    const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
+
+    this.position.boxPyramidCount += 1;
+    this.position.amount = newTotalQty;
+    this.position.entryPrice = newWeightedAvgPrice;
+    this.position.totalCostKrw += fillPrice * fillVolume;
+    this.position.lastUpdatedAt = Date.now();
+
+    this.saveStateToFile();
+    console.log(`[PositionManager] Box-Range Pyramid #${this.position.boxPyramidCount} Filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()}`);
+  }
+
+  /**
    * Called on Partial Loss Cut:
    * Sells portion, transitions to DEFENSIVE, frees 1 DCA slot for deeper dip, but requires REENTRY_WAIT before buying.
    */
@@ -305,6 +327,7 @@ export class PositionManager {
       this.position.entryPrice = null;
       this.position.state = 'FLAT';
       this.position.pyramidingCount = 0;
+      this.position.boxPyramidCount = 0;
     }
 
     this.saveStateToFile();
@@ -346,6 +369,7 @@ export class PositionManager {
     this.position.trailingActive = false;
     this.position.trailingPeakPrice = null;
     this.position.pyramidingCount = 0;
+    this.position.boxPyramidCount = 0;
     this.position.lastUpdatedAt = Date.now();
 
     this.setCooldown(30, reason);
