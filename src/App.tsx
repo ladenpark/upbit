@@ -108,6 +108,21 @@ export default function App() {
   const [pyramidingStepPercent, setPyramidingStepPercent] = useState<number>(1.5);
   const [pyramidingCount, setPyramidingCount] = useState<number>(0);
   const [boxPyramidCount, setBoxPyramidCount] = useState<number>(0);
+  const [cooldownUntil, setCooldownUntil] = useState<number>(0);
+  const [remainingCooldown, setRemainingCooldown] = useState<number>(0);
+
+  // 쿨다운(재진입 대기) 타이머
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      if (cooldownUntil > now) {
+        setRemainingCooldown(Math.ceil((cooldownUntil - now) / 1000));
+      } else {
+        setRemainingCooldown(0);
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [cooldownUntil]);
   const [partialLossCutEnabled, setPartialLossCutEnabled] = useState<boolean>(true);
   const [partialLossCutPercent, setPartialLossCutPercent] = useState<number>(40);
   const [partialLossCutThreshold, setPartialLossCutThreshold] = useState<number>(4.5);
@@ -290,6 +305,7 @@ export default function App() {
             if (s.safetyOrderCount !== undefined) setSafetyOrderCount(s.safetyOrderCount);
             if (s.pyramidingCount !== undefined) setPyramidingCount(s.pyramidingCount);
             if (s.boxPyramidCount !== undefined) setBoxPyramidCount(s.boxPyramidCount);
+            if (s.cooldownUntil !== undefined) setCooldownUntil(s.cooldownUntil);
             if (s.awaitingReentry !== undefined) setAwaitingReentry(s.awaitingReentry);
             if (s.isTrailingActive !== undefined) setIsTrailingActive(s.isTrailingActive);
             if (s.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.trailingPeakPrice);
@@ -1469,6 +1485,13 @@ export default function App() {
                             </div>
                           </div>
                         </div>
+
+                        {remainingCooldown > 0 && (
+                          <div className="p-2 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-300 flex items-center justify-between text-xs font-bold animate-pulse">
+                            <span className="flex items-center gap-1.5"><ShieldAlert className="w-4 h-4" /> 진입 쿨다운 중 (연속 체결 방지)</span>
+                            <span className="font-mono bg-rose-500/30 px-2 py-0.5 rounded-md">{remainingCooldown}초 후 해제</span>
+                          </div>
+                        )}
 
                         {/* Filter Tabs */}
                         <div className="flex items-center p-0.5 bg-slate-950/80 rounded-xl border border-slate-700/60 text-[10px] font-bold">
