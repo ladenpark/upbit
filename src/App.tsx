@@ -1421,6 +1421,14 @@ export default function App() {
                 const distBounce = bounceThreshold - currentPrice;
                 const bounceConditionMet = currentPrice > recentLow && wasGenuineDip && stillBelowBaseline;
 
+                // Rule 7-b: Box-Range Pyramid Buy
+                const BOX_PYRAMID_STEP_PERCENT = 0.25;
+                const effectiveEntryPrice = entryPrice || currentPrice;
+                const boxPyramidTargetPrice = effectiveEntryPrice * (1 + BOX_PYRAMID_STEP_PERCENT / 100);
+                const isBoxPyramidActive = positionAmount > 0 && pyramidingEnabled && autoPilotEnabled && marketRegime === 'SIDEWAYS' && !isTrailingActive && boxPyramidCount < 1 && currentPrice >= boxPyramidTargetPrice;
+                const distBoxPyramid = boxPyramidTargetPrice - currentPrice;
+                const distBoxPyramidPct = (distBoxPyramid / currentPrice) * 100;
+
                 const isBreakoutActive = !positionAmount && currentPrice > baselineValue && (marketRegime === 'BULL' || currentSlope >= 0.10);
                 const distBaseline = currentPrice - baselineValue;
                 const distBaselinePct = (distBaseline / currentPrice) * 100;
@@ -1613,6 +1621,53 @@ export default function App() {
                                 최근 10분 저점: <strong className="text-slate-800">₩{Math.round(recentLow).toLocaleString()}</strong>
                               </span>
                               <span className="text-slate-400">목표 반등가: ₩{Math.round(bounceThreshold).toLocaleString()}</span>
+                            </div>
+                          </div>
+
+                          {/* 1.6 Rule 7-b: 박스권 소액 불타기 */}
+                          <div className={`p-3 rounded-2xl border transition-all ${
+                            isBoxPyramidActive
+                              ? 'bg-fuchsia-50 border-fuchsia-400 ring-2 ring-fuchsia-200 shadow-xs'
+                              : positionAmount > 0 && marketRegime === 'SIDEWAYS' && boxPyramidCount < 1
+                              ? 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
+                              : 'bg-slate-50/50 border-slate-100 opacity-60'
+                          }`}>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded-md bg-fuchsia-100 text-fuchsia-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 7-b
+                                </span>
+                                <span className="font-extrabold text-xs text-slate-900">박스권 소액 불타기</span>
+                                <span className="text-[10px] text-slate-500 font-medium">(0.25 Unit)</span>
+                              </div>
+                              <div>
+                                {isBoxPyramidActive ? (
+                                  <span className="px-2 py-0.5 rounded-md bg-fuchsia-600 text-white font-black text-[10px] animate-pulse shadow-sm">
+                                    🚀 추가매수 발동!
+                                  </span>
+                                ) : positionAmount === 0 ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">보유량 없음</span>
+                                ) : marketRegime !== 'SIDEWAYS' ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">SIDEWAYS 전용</span>
+                                ) : boxPyramidCount >= 1 ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">1회 한도 소진됨</span>
+                                ) : (
+                                  <span className="text-[10px] font-mono font-bold text-fuchsia-700">
+                                    +0.25% 수익 도달 대기 (+{Math.round(distBoxPyramid).toLocaleString()}원)
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            {positionAmount > 0 && marketRegime === 'SIDEWAYS' && boxPyramidCount < 1 && !isBoxPyramidActive && (
+                              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2.5 overflow-hidden flex">
+                                <div className="bg-fuchsia-400 h-full rounded-full transition-all" style={{ width: `${Math.max(5, 100 - (distBoxPyramid / (effectiveEntryPrice * 0.0025)) * 100)}%` }}></div>
+                              </div>
+                            )}
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
+                              <span className="font-mono">
+                                평단가: <strong className="text-slate-800">₩{Math.round(effectiveEntryPrice).toLocaleString()}</strong>
+                              </span>
+                              <span className="text-slate-400">목표가: ₩{Math.round(boxPyramidTargetPrice).toLocaleString()}</span>
                             </div>
                           </div>
 
