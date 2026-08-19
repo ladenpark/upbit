@@ -1401,6 +1401,19 @@ export default function App() {
                 const distLowerBandPct = (distLowerBand / currentPrice) * 100;
                 const isLowerBandActive = !positionAmount && currentPrice <= calcLowerBand;
 
+                // Rule 8-c: Box-Range Bounce
+                const SCALP_BOUNCE_LOOKBACK = 10;
+                const SCALP_BOUNCE_CONFIRM_PERCENT = 0.15;
+                const recentSlice = priceHistory.slice(-SCALP_BOUNCE_LOOKBACK).map((p: any) => p.price);
+                const recentLow = recentSlice.length > 0 ? Math.min(...recentSlice) : currentPrice;
+                const bounceThreshold = recentLow * (1 + SCALP_BOUNCE_CONFIRM_PERCENT / 100);
+                const wasGenuineDip = recentLow <= baselineValue;
+                const stillBelowBaseline = currentPrice <= baselineValue;
+                const hasBounced = currentPrice > recentLow && currentPrice >= bounceThreshold;
+                const isScalpBounceActive = !positionAmount && autoPilotEnabled && marketRegime !== 'BULL' && priceHistory.length >= SCALP_BOUNCE_LOOKBACK && wasGenuineDip && stillBelowBaseline && hasBounced;
+                const distBounce = bounceThreshold - currentPrice;
+                const bounceConditionMet = currentPrice > recentLow && wasGenuineDip && stillBelowBaseline;
+
                 const isBreakoutActive = !positionAmount && currentPrice > baselineValue && (marketRegime === 'BULL' || currentSlope >= 0.10);
                 const distBaseline = currentPrice - baselineValue;
                 const distBaselinePct = (distBaseline / currentPrice) * 100;
@@ -1517,28 +1530,82 @@ export default function App() {
                                 <span className="px-1.5 py-0.5 rounded-md bg-cyan-100 text-cyan-800 font-extrabold font-mono text-[9.5px]">
                                   Rule 8-b
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">박스권 하단 스캘핑</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(0.5 Unit · ₩{Math.round(scalpBudget).toLocaleString()})</span>
+                                <span className="font-extrabold text-xs text-slate-900">하단 스캘핑 (기준선)</span>
+                                <span className="text-[10px] text-slate-500 font-medium">(0.5 Unit)</span>
                               </div>
                               <div>
                                 {isScalpLowerActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-cyan-600 text-white font-black text-[10px] animate-pulse">
+                                  <span className="px-2 py-0.5 rounded-md bg-cyan-600 text-white font-black text-[10px] animate-pulse shadow-sm">
                                     🎯 발동 구간
                                   </span>
                                 ) : marketRegime === 'BULL' ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">BULL 제외</span>
+                                  <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 font-bold text-[9px]">BULL 제외</span>
                                 ) : (
                                   <span className={`text-[10px] font-mono font-bold ${distScalpLower > 0 ? 'text-cyan-700' : 'text-slate-500'}`}>
-                                    {distScalpLower > 0 ? `+${Math.round(distScalpLower).toLocaleString()}원 (+${distScalpLowerPct.toFixed(2)}%) 하락 필요` : '도달'}
+                                    {distScalpLower > 0 ? `+${Math.round(distScalpLower).toLocaleString()}원 하락 필요` : '도달'}
                                   </span>
                                 )}
                               </div>
                             </div>
+                            {distScalpLower > 0 && marketRegime !== 'BULL' && (
+                              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2.5 overflow-hidden flex">
+                                <div className="bg-cyan-400 h-full rounded-full transition-all" style={{ width: `${Math.max(5, 100 - distScalpLowerPct * 20)}%` }}></div>
+                              </div>
+                            )}
                             <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
                               <span className="font-mono">
-                                진입 기준: <strong className="text-slate-800">₩{Math.round(calcScalpLower).toLocaleString()} 이하</strong> (ATR×{dynamicScalpMult})
+                                진입 기준: <strong className="text-slate-800">₩{Math.round(calcScalpLower).toLocaleString()} 이하</strong>
                               </span>
                               <span className="text-slate-400">하한 가드: ₩{Math.round(calcLowerBand).toLocaleString()}</span>
+                            </div>
+                          </div>
+
+                          {/* 1.5 Rule 8-c: 저점 반등 스캘핑 */}
+                          <div className={`p-3 rounded-2xl border transition-all ${
+                            isScalpBounceActive
+                              ? 'bg-fuchsia-50 border-fuchsia-400 ring-2 ring-fuchsia-200 shadow-xs'
+                              : bounceConditionMet
+                              ? 'bg-fuchsia-50/50 border-fuchsia-200 shadow-2xs'
+                              : 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
+                          }`}>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded-md bg-fuchsia-100 text-fuchsia-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 8-c
+                                </span>
+                                <span className="font-extrabold text-xs text-slate-900">저점 반등 확인 매수</span>
+                                <span className="text-[10px] text-slate-500 font-medium">(0.5 Unit)</span>
+                              </div>
+                              <div>
+                                {isScalpBounceActive ? (
+                                  <span className="px-2 py-0.5 rounded-md bg-fuchsia-600 text-white font-black text-[10px] animate-pulse shadow-sm">
+                                    🚀 반등 확인! (진입)
+                                  </span>
+                                ) : marketRegime === 'BULL' ? (
+                                  <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 font-bold text-[9px]">BULL 제외</span>
+                                ) : priceHistory.length < SCALP_BOUNCE_LOOKBACK ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">데이터 수집중</span>
+                                ) : !wasGenuineDip ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">유효한 저점 없음</span>
+                                ) : !stillBelowBaseline ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">기준선 초과 (종료)</span>
+                                ) : (
+                                  <span className="text-[10px] font-mono font-bold text-fuchsia-700">
+                                    +0.15% 반등 대기 (+{Math.round(distBounce).toLocaleString()}원)
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            {wasGenuineDip && stillBelowBaseline && marketRegime !== 'BULL' && !isScalpBounceActive && (
+                              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2.5 overflow-hidden flex">
+                                <div className="bg-fuchsia-400 h-full rounded-full transition-all" style={{ width: `${Math.max(5, 100 - (distBounce / bounceThreshold) * 10000)}%` }}></div>
+                              </div>
+                            )}
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
+                              <span className="font-mono">
+                                최근 10분 저점: <strong className="text-slate-800">₩{Math.round(recentLow).toLocaleString()}</strong>
+                              </span>
+                              <span className="text-slate-400">목표 반등가: ₩{Math.round(bounceThreshold).toLocaleString()}</span>
                             </div>
                           </div>
 
