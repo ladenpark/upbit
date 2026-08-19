@@ -275,7 +275,8 @@ export class GlobalRiskGovernor {
 
     if (
       signal.type === 'ABSOLUTE_STOP_EXIT' ||
-      signal.type === 'EMERGENCY_FULL_EXIT'
+      signal.type === 'EMERGENCY_FULL_EXIT' ||
+      signal.type === 'SCALP_TAKE_PROFIT'
     ) {
       const volume = position.amount;
       if (volume <= 0) {
@@ -346,6 +347,12 @@ export class GlobalRiskGovernor {
         ? dynamicRatio / 100
         : (this.params.orderRatio || 25) / 100;
       let targetBudget = limits.totalCapitalKrw * effectiveOrderRatio;
+
+      // 박스권 스캘핑 진입은 일반 진입의 절반 크기로 제한
+      const isScalpEntry = signal.reason.includes('스캘핑 진입');
+      if (isScalpEntry) {
+        targetBudget *= 0.5;
+      }
 
       if (signal.type === 'DCA_BUY') {
         const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');

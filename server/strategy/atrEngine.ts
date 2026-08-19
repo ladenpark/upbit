@@ -109,6 +109,48 @@ export class ATREngine {
     // Restore persisted trade logs from disk so UI doesn't reset on restart
     this.logs = PositionManager.loadTradeLogs().slice(0, 60);
 
+    // Compute exact historical realized PnL and trade counts from order history (FIFO matching)
+    const allFilledOrders = this.orderManager.getAllOrders().filter((o) => o.status === 'FILLED' || o.filledVolume > 0);
+    let historicalPnl = 0;
+    let closedTradesCount = 0;
+    let winCount = 0;
+    const buyQueue: { vol: number; price: number; fee: number }[] = [];
+
+    allFilledOrders.forEach((o) => {
+      if (o.side === 'BUY') {
+        buyQueue.push({ vol: o.filledVolume, price: o.avgFillPrice, fee: o.fee || 0 });
+      } else if (o.side === 'SELL' && o.avgFillPrice > 0) {
+        let sellVol = o.filledVolume;
+        const sellPrice = o.avgFillPrice;
+        const sellFee = o.fee || 0;
+        let tradeCost = 0;
+        const tradeRevenue = sellVol * sellPrice;
+
+        while (sellVol > 0 && buyQueue.length > 0) {
+          const b = buyQueue[0];
+          if (b.vol <= sellVol) {
+            tradeCost += b.vol * b.price + b.fee;
+            sellVol -= b.vol;
+            buyQueue.shift();
+          } else {
+            const partialCost = sellVol * b.price + (b.fee * (sellVol / b.vol));
+            tradeCost += partialCost;
+            b.fee -= (b.fee * (sellVol / b.vol));
+            b.vol -= sellVol;
+            sellVol = 0;
+          }
+        }
+        const pnl = tradeRevenue - tradeCost - sellFee;
+        historicalPnl += pnl;
+        closedTradesCount += 1;
+        if (pnl > 0) winCount += 1;
+      }
+    });
+
+    this.totalRealizedPnl = Math.round(historicalPnl);
+    this.totalTrades = closedTradesCount;
+    this.winTrades = winCount;
+
     this.initDefaultHistory();
 
     // Fetch initial dynamic ATR from candles
@@ -212,13 +254,33 @@ export class ATREngine {
   public async handleMarketTick(price: number, timestamp: number) {
     this.currentPrice = price;
 
-    // Update ATR baseline & bands
-    const effectiveAtr = this.atrValue;
-    const lowerBand = this.baselineValue - (effectiveAtr * this.params.atrMultiplier);
-    const upperBand = this.baselineValue + (effectiveAtr * this.params.atrMultiplier);
+    // Build price history array for adaptive indicators (computed early for band consistency)
+    const historyPrices = this.priceHistory.map((p) => p.price);
+    historyPrices.push(price);
+
+    // Evaluate dynamic auto-pilot indicators FIRST so bands are consistent everywhere
+    const adaptive = this.strategyCore.evaluateAdaptiveParams(
+      price,
+      this.baselineValue,
+      this.atrValue,
+      this.params,
+      historyPrices,
+      this.higherTfTrend
+    );
+
+    if (adaptive.marketRegime !== this.marketRegime) {
+      this.marketRegime = adaptive.marketRegime;
+    }
+
+    // Update ATR baseline & bands — use dynamic multiplier when AutoPilot is on
+    const minAtrFloor = Math.max(5000, Math.round(price * 0.0025));
+    const effectiveAtr = Math.max(this.atrValue, minAtrFloor);
+    const effectiveMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
+    const lowerBand = this.baselineValue - (effectiveAtr * effectiveMultiplier);
+    const upperBand = this.baselineValue + (effectiveAtr * effectiveMultiplier);
     const staticStopPrice = this.positionManager.getSnapshot().initialStopPrice || (lowerBand - (effectiveAtr * this.params.stopLossMultiplier));
 
-    // Update trailing state if price touches upper band
+    // Update trailing state if price touches upper band (now using dynamic band)
     this.positionManager.updateTrailingState(price, upperBand);
 
     // Calculate drop speed over explicit 5-second window
@@ -240,25 +302,7 @@ export class ATREngine {
       });
     }
 
-    // Build price history array for adaptive indicators
-    const historyPrices = this.priceHistory.map((p) => p.price);
-    historyPrices.push(price);
-
-    // Evaluate dynamic auto-pilot indicators with Higher-TF Confluence
-    const adaptive = this.strategyCore.evaluateAdaptiveParams(
-      price,
-      this.baselineValue,
-      this.atrValue,
-      this.params,
-      historyPrices,
-      this.higherTfTrend
-    );
-
-    if (adaptive.marketRegime !== this.marketRegime) {
-      this.marketRegime = adaptive.marketRegime;
-    }
-
-    // 1. Generate Strategy Signals
+    // 1. Generate Strategy Signals (evaluateAdaptiveParams is called again inside with identical inputs — same result)
     const position = this.positionManager.getSnapshot();
     const candidateSignals = this.strategyCore.generateSignals(
       price,
@@ -270,6 +314,10 @@ export class ATREngine {
       historyPrices,
       this.higherTfTrend
     );
+
+    if (candidateSignals.length > 0) {
+      console.log(`[ATREngine] 🎯 Signals Generated (${candidateSignals.length}):`, candidateSignals.map((s) => `[${s.type}] ${s.reason}`));
+    }
 
     // 2. Pass highest-priority signal through Global Risk Governor
     if (candidateSignals.length > 0) {
@@ -295,7 +343,7 @@ export class ATREngine {
         this.addLog({
           type: 'SYSTEM',
           price,
-          reason: `[위험관리 승인] ${topSignal.reason} ➡️ 주문 발송 중...`
+          reason: `[위험관리 승인] ${topSignal.reason} ➡️ 주문 발송 중... (예산: ₩${Math.round(riskResult.calculatedBudgetKrw || 0).toLocaleString()})`
         });
 
         // DRY-RUN MODE: Simulate fill without touching exchange
@@ -317,21 +365,34 @@ export class ATREngine {
           this.handleOrderFilled(topSignal.type, dryRecord, price);
         } else {
           // 3. Execute Order via OrderManager (OrderManager autonomously manages reserve/commit/release lifecycle)
-          await this.orderManager.submitOrder(
-            riskResult.orderRequest,
-            this.secretManager.getKeys(),
-            this.params.exchange,
-            (record) => {
-              this.handleOrderFilled(topSignal.type, record, price);
-            },
-            (error) => {
-              this.addLog({
-                type: 'SYSTEM',
-                price,
-                reason: `❌ [주문 실패] ${error}`
-              });
-            }
-          );
+          try {
+            await this.orderManager.submitOrder(
+              riskResult.orderRequest,
+              this.secretManager.getKeys(),
+              this.params.exchange,
+              (record) => {
+                this.handleOrderFilled(topSignal.type, record, price);
+              },
+              (error) => {
+                this.addLog({
+                  type: 'SYSTEM',
+                  price,
+                  reason: `❌ [주문 실패] ${error}`
+                });
+              }
+            );
+          } catch (err: any) {
+            this.addLog({
+              type: 'SYSTEM',
+              price,
+              reason: `❌ [주문 제출 예외] ${err.message}`
+            });
+          }
+        }
+      } else {
+        // Log rejection reason if risk check fails
+        if (riskResult.rejectionReason && !riskResult.rejectionReason.includes('pending execution')) {
+          console.warn(`[ATREngine] ⚠️ Signal Rejected: ${topSignal.type} - ${riskResult.rejectionReason}`);
         }
       }
     }
@@ -389,6 +450,7 @@ export class ATREngine {
           this.params.stopLossMultiplier
         );
       }
+      this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -404,6 +466,7 @@ export class ATREngine {
         const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE') || { slotNumber: 1 };
         this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume);
       }
+      this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -418,6 +481,7 @@ export class ATREngine {
       } else {
         this.positionManager.onPyramidFilled(fillPrice, effectiveVolume);
       }
+      this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -502,7 +566,8 @@ export class ATREngine {
       });
     } else if (
       signalType === 'ABSOLUTE_STOP_EXIT' ||
-      signalType === 'EMERGENCY_FULL_EXIT'
+      signalType === 'EMERGENCY_FULL_EXIT' ||
+      signalType === 'SCALP_TAKE_PROFIT'
     ) {
       const sellVolume = effectiveVolume;
       const entry = position.entryPrice || fillPrice;
@@ -806,9 +871,25 @@ export class ATREngine {
       0
     );
 
+    // Evaluate dynamic adaptive indicators for UI visualization
+    const historyPrices = this.priceHistory.map((p) => p.price);
+    historyPrices.push(this.currentPrice);
+    const adaptive = this.strategyCore.evaluateAdaptiveParams(
+      this.currentPrice,
+      this.baselineValue,
+      this.atrValue,
+      this.params,
+      historyPrices,
+      this.higherTfTrend
+    );
+    const dropSpeed = this.marketManager ? this.marketManager.calculateDropSpeed(this.params.trendDropWindowSeconds || 5) : 0;
+
     // Calculate Next Order Info Pages for UI Swipeable Card
     const pages: NextOrderItem[] = [];
-    const baseUnitBudget = exposure.totalCapitalKrw * ((this.params.orderRatio || 25) / 100);
+    const effectiveOrderRatio = (this.params.autoPilotEnabled && adaptive.dynamicOrderRatio > 0)
+      ? adaptive.dynamicOrderRatio
+      : (this.params.orderRatio || 25);
+    const baseUnitBudget = exposure.totalCapitalKrw * (effectiveOrderRatio / 100);
 
     if (pos.amount > 0 && pos.state !== 'FLAT') {
       const entry = pos.entryPrice || this.currentPrice;
@@ -819,15 +900,16 @@ export class ATREngine {
         const dcaScale = Number(Math.pow(this.params.safetyOrderVolumeScale, nextDcaSlot.slotNumber).toFixed(2));
         const dcaBudgetRaw = baseUnitBudget * dcaScale;
         const dcaBudget = Math.floor(Math.min(dcaBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
-        const targetDcaPrice = entry * (1 - (this.params.safetyOrderStepPercent * nextDcaSlot.slotNumber) / 100);
+        const dcaStep = this.params.autoPilotEnabled ? adaptive.dynamicDcaStep : this.params.safetyOrderStepPercent;
+        const targetDcaPrice = entry * (1 - (dcaStep * nextDcaSlot.slotNumber) / 100);
         pages.push({
           category: 'DCA',
           categoryLabel: '하락 시 물타기',
           type: `DCA #${nextDcaSlot.slotNumber}차 물타기`,
           budgetKrw: dcaBudget,
-          unitPercent: this.params.orderRatio || 25,
+          unitPercent: effectiveOrderRatio,
           scaleMultiplier: dcaScale,
-          targetPriceLabel: `₩${Math.round(targetDcaPrice).toLocaleString()} (-${(this.params.safetyOrderStepPercent * nextDcaSlot.slotNumber).toFixed(1)}% 하락 시)`,
+          targetPriceLabel: `₩${Math.round(targetDcaPrice).toLocaleString()} (-${(dcaStep * nextDcaSlot.slotNumber).toFixed(1)}% 하락 시)`,
           themeColor: 'indigo'
         });
       } else {
@@ -836,7 +918,7 @@ export class ATREngine {
           categoryLabel: '물타기 완료',
           type: 'DCA 슬롯 소진',
           budgetKrw: 0,
-          unitPercent: this.params.orderRatio || 25,
+          unitPercent: effectiveOrderRatio,
           scaleMultiplier: 0,
           targetPriceLabel: '최대 물타기 완료 (손절선 감시)',
           themeColor: 'indigo'
@@ -853,7 +935,7 @@ export class ATREngine {
           categoryLabel: '상승 시 불타기',
           type: `상승 불타기 #${nextPyrStep}차`,
           budgetKrw: pyrBudget,
-          unitPercent: this.params.orderRatio || 25,
+          unitPercent: effectiveOrderRatio,
           scaleMultiplier: 1.0,
           targetPriceLabel: `₩${Math.round(targetPyrPrice).toLocaleString()} (+${(this.params.pyramidingStepPercent * nextPyrStep).toFixed(1)}% 상승 시)`,
           themeColor: 'amber'
@@ -864,39 +946,107 @@ export class ATREngine {
           categoryLabel: '불타기 완료',
           type: '불타기 한도 소진',
           budgetKrw: 0,
-          unitPercent: this.params.orderRatio || 25,
+          unitPercent: effectiveOrderRatio,
           scaleMultiplier: 0,
           targetPriceLabel: '최고점 트레일링 익절 대기 중',
           themeColor: 'amber'
         });
       }
+
+      // Page 3: 박스권 짤짤이 익절 (Rule 3-b)
+      if (adaptive.marketRegime === 'SIDEWAYS') {
+        const scalpTpTargetPrice = entry * (1 + adaptive.dynamicScalpTakeProfitPercent / 100);
+        pages.push({
+          category: 'SCALP_TP',
+          categoryLabel: '박스권 짤짤이 익절',
+          type: `스캘핑 전량 익절 (+${adaptive.dynamicScalpTakeProfitPercent.toFixed(1)}%)`,
+          budgetKrw: Math.round(pos.amount * this.currentPrice),
+          unitPercent: 100,
+          scaleMultiplier: 1.0,
+          targetPriceLabel: `₩${Math.round(scalpTpTargetPrice).toLocaleString()} (+${adaptive.dynamicScalpTakeProfitPercent.toFixed(1)}% 도달 시)`,
+          themeColor: 'teal'
+        });
+      }
+
+      // Page 4: 트레일링 50% 분할 익절 (Rule 4)
+      const minAtrFloor = Math.max(5000, Math.round(this.currentPrice * 0.0025));
+      const effectiveAtr = Math.max(this.atrValue, minAtrFloor);
+      const effectiveMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
+      const upperBandCalc = this.baselineValue + (effectiveAtr * effectiveMultiplier);
+      const entryPriceVal = pos.entryPrice || 0;
+      const armingTargetPrice = Math.max(upperBandCalc, entryPriceVal);
+
+      pages.push({
+        category: 'TRAILING_TP',
+        categoryLabel: '트레일링 50% 익절',
+        type: pos.trailingActive ? `최고점 대비 -${adaptive.dynamicTrailingCallback}% 하락 시 익절` : `상단 밴드 터치 시 무장 (수익 구간)`,
+        budgetKrw: Math.round((pos.amount * 0.5) * this.currentPrice),
+        unitPercent: 50,
+        scaleMultiplier: 0.5,
+        targetPriceLabel: pos.trailingActive
+          ? `최고가 ₩${Math.round(pos.trailingPeakPrice || this.currentPrice).toLocaleString()} 추적 중`
+          : `₩${Math.round(armingTargetPrice).toLocaleString()} 이상 터치 시 (평단가 보존)`,
+        themeColor: 'emerald'
+      });
     } else {
       // 무포지션 FLAT 상태일 때:
       const entryBudget = Math.floor(Math.min(baseUnitBudget, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
-      const lowerBandCalc = this.baselineValue - (this.atrValue * this.params.atrMultiplier);
+      const scalpBudget = Math.floor(Math.min(baseUnitBudget * 0.5, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
+      
+      const minAtrFloor = Math.max(5000, Math.round(this.currentPrice * 0.0025));
+      const effectiveAtr = Math.max(this.atrValue, minAtrFloor);
+      const effectiveMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
+      const lowerBandCalc = this.baselineValue - (effectiveAtr * effectiveMultiplier);
       const lowerTarget = Math.round(lowerBandCalc > 0 ? lowerBandCalc : this.currentPrice * 0.98);
 
-      // Page 1: 저점 눌림목 진입
+      const lowerScalpCalc = this.baselineValue - (effectiveAtr * adaptive.dynamicScalpBandMultiplier);
+      const upperScalpCalc = this.baselineValue + (effectiveAtr * adaptive.dynamicScalpBandMultiplier);
+
+      // Page 1: 박스권 하단 스캘핑 진입 (Rule 8-b)
+      pages.push({
+        category: 'SCALP_DIP',
+        categoryLabel: '박스권 하단 스캘핑',
+        type: '하단 스캘핑 (0.5 Unit)',
+        budgetKrw: scalpBudget,
+        unitPercent: Math.round(effectiveOrderRatio * 0.5),
+        scaleMultiplier: 0.5,
+        targetPriceLabel: `₩${Math.round(lowerScalpCalc).toLocaleString()} 이하 터치 시`,
+        themeColor: 'cyan'
+      });
+
+      // Page 2: 박스권 상단 스캘핑 진입 (Rule 9-b)
+      pages.push({
+        category: 'SCALP_BREAKOUT',
+        categoryLabel: '박스권 상단 스캘핑',
+        type: '상단 스캘핑 (0.5 Unit)',
+        budgetKrw: scalpBudget,
+        unitPercent: Math.round(effectiveOrderRatio * 0.5),
+        scaleMultiplier: 0.5,
+        targetPriceLabel: `기준선 ~ ₩${Math.round(upperScalpCalc).toLocaleString()} 구간`,
+        themeColor: 'teal'
+      });
+
+      // Page 3: 1차 저점 과매도 진입 (Rule 8)
       pages.push({
         category: 'DIP',
-        categoryLabel: '저점 눌림목 매수',
+        categoryLabel: '하단밴드 과매도 매수',
         type: '1차 저점 진입 (1 Unit)',
         budgetKrw: entryBudget,
-        unitPercent: this.params.orderRatio || 25,
+        unitPercent: effectiveOrderRatio,
         scaleMultiplier: 1.0,
         targetPriceLabel: `하단 ₩${lowerTarget.toLocaleString()} 이하 터치 시`,
         themeColor: 'blue'
       });
 
-      // Page 2: 상승 돌파 진입
+      // Page 4: 1차 상승 모멘텀 돌파 (Rule 9)
       pages.push({
         category: 'BREAKOUT',
         categoryLabel: '상승 추세 돌파 매수',
         type: '1차 돌파 진입 (1 Unit)',
         budgetKrw: entryBudget,
-        unitPercent: this.params.orderRatio || 25,
+        unitPercent: effectiveOrderRatio,
         scaleMultiplier: 1.0,
-        targetPriceLabel: `기준선(₩${Math.round(this.baselineValue).toLocaleString()}) 상향 돌파 시`,
+        targetPriceLabel: `기준선(₩${Math.round(this.baselineValue).toLocaleString()}) 상향 + BULL/모멘텀`,
         themeColor: 'emerald'
       });
     }
@@ -904,7 +1054,7 @@ export class ATREngine {
     const nextOrderInfo = {
       type: pages[0]?.type || '1차 신규 진입',
       budgetKrw: pages[0]?.budgetKrw || 0,
-      unitPercent: this.params.orderRatio || 25,
+      unitPercent: pages[0]?.unitPercent || (this.params.orderRatio || 25),
       scaleMultiplier: pages[0]?.scaleMultiplier || 1.0,
       targetPriceLabel: pages[0]?.targetPriceLabel || '',
       pages
@@ -915,6 +1065,8 @@ export class ATREngine {
       botState: this.botState,
       marketState: this.marketManager ? this.marketManager.marketState : 'DISCONNECTED',
       marketRegime: this.marketRegime,
+      adaptive,
+      dropSpeed,
       currentPrice: this.currentPrice,
       atrValue: this.atrValue,
       baselineValue: this.baselineValue,

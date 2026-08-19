@@ -13,13 +13,14 @@ export type SignalType =
   | 'PARTIAL_LOSS_CUT'
   | 'EMERGENCY_TREND_CUT'
   | 'TRAILING_STOP_EXIT'
+  | 'SCALP_TAKE_PROFIT'
   | 'ABSOLUTE_STOP_EXIT'
   | 'EMERGENCY_FULL_EXIT';
 
 export type SignalPriority = 1 | 2 | 3 | 4 | 5 | 6; 
 // 1 = EMERGENCY_FULL_EXIT, ABSOLUTE_STOP_EXIT (Highest)
 // 2 = EMERGENCY_TREND_CUT, PARTIAL_LOSS_CUT
-// 3 = TRAILING_STOP_EXIT
+// 3 = TRAILING_STOP_EXIT, SCALP_TAKE_PROFIT
 // 4 = REENTRY_BUY
 // 5 = DCA_BUY
 // 6 = ENTRY_BUY, BREAKOUT_BUY, PYRAMID_BUY (Lowest)
@@ -67,7 +68,8 @@ export const PROTECTIVE_SELL_SIGNALS: SignalType[] = [
   'TRAILING_STOP_EXIT',
   'PARTIAL_LOSS_CUT',
   'EMERGENCY_TREND_CUT',
-  'EMERGENCY_FULL_EXIT'
+  'EMERGENCY_FULL_EXIT',
+  'SCALP_TAKE_PROFIT'
 ];
 
 export interface ExposureReservation {
@@ -190,15 +192,27 @@ export interface ExposureLimits {
   remainingAllowableExposureKrw: number;
 }
 
+export interface AdaptiveIndicators {
+  dynamicAtr: number;
+  dynamicOrderRatio: number;
+  dynamicDcaStep: number;
+  dynamicTrailingCallback: number;
+  dynamicScalpBandMultiplier: number;
+  dynamicScalpTakeProfitPercent: number;
+  marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
+  slope: number;
+  volatilityRatio: number;
+}
+
 export interface NextOrderItem {
-  category: 'DIP' | 'BREAKOUT' | 'DCA' | 'PYRAMID' | 'COMPLETED';
+  category: 'DIP' | 'BREAKOUT' | 'DCA' | 'PYRAMID' | 'COMPLETED' | 'SCALP_DIP' | 'SCALP_BREAKOUT' | 'SCALP_TP' | 'TRAILING_TP';
   categoryLabel: string;
   type: string;
   budgetKrw: number;
   unitPercent: number;
   scaleMultiplier: number;
   targetPriceLabel: string;
-  themeColor: 'indigo' | 'emerald' | 'amber' | 'blue';
+  themeColor: 'indigo' | 'emerald' | 'amber' | 'blue' | 'cyan' | 'purple' | 'rose' | 'teal';
 }
 
 export interface NextOrderInfo {

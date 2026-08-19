@@ -19,5 +19,40 @@
     "amountKrw": 300000,
     "createdAt": 1786963766301,
     "status": "RELEASED"
+  },
+  {
+    "id": "RES_1787052059972_xe80kf",
+    "clientOrderId": "ORD_BREAKOUT_BUY_1787052059911_plbng",
+    "amountKrw": 2009818,
+    "createdAt": 1787052059972,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1787052061839_wktu4",
+    "clientOrderId": "ORD_BREAKOUT_BUY_1787052061836_xnu3ja",
+    "amountKrw": 2009818,
+    "createdAt": 1787052061839,
+    "status": "RELEASED"
+  },
+  {
+    "id": "RES_1787063744273_8t9lm",
+    "clientOrderId": "ORD_BREAKOUT_BUY_1787063744271_y7to81",
+    "amountKrw": 905299,
+    "createdAt": 1787063744273,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1787120188271_t351es",
+    "clientOrderId": "ORD_BREAKOUT_BUY_1787120188270_e84ah8e",
+    "amountKrw": 904430,
+    "createdAt": 1787120188271,
+    "status": "COMMITTED"
+  },
+  {
+    "id": "RES_1787123611724_412cnb",
+    "clientOrderId": "ORD_BREAKOUT_BUY_1787123611722_m0cjoo",
+    "amountKrw": 904654,
+    "createdAt": 1787123611724,
+    "status": "COMMITTED"
   }
 ]

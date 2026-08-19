@@ -354,12 +354,14 @@ export class PositionManager {
   }
 
   public updateTrailingState(currentPrice: number, upperBand: number) {
-    if (this.position.amount > 0 && currentPrice >= upperBand) {
+    const entryPrice = this.position.entryPrice || 0;
+    // Arming requires BOTH upper band touch AND price strictly above entry price (Profit Lock-in Gate)
+    if (this.position.amount > 0 && currentPrice >= upperBand && currentPrice > entryPrice) {
       if (!this.position.trailingActive) {
         this.position.trailingActive = true;
         this.position.trailingPeakPrice = currentPrice;
         this.position.state = 'TAKE_PROFIT';
-        console.log(`[PositionManager] Trailing Take Profit ACTIVATED @ ₩${currentPrice.toLocaleString()}`);
+        console.log(`[PositionManager] Trailing Take Profit ACTIVATED @ ₩${currentPrice.toLocaleString()} (Entry: ₩${Math.round(entryPrice).toLocaleString()})`);
       } else if (this.position.trailingPeakPrice && currentPrice > this.position.trailingPeakPrice) {
         this.position.trailingPeakPrice = currentPrice;
       }
@@ -386,10 +388,11 @@ export class PositionManager {
       stateChanged = true;
     }
 
-    if (realCoinQuantity === 0) {
+    if (realCoinQuantity < 0.0001) {
       if (this.position.state !== 'FLAT' || this.position.entryPrice !== null) {
         this.position.state = 'FLAT';
         this.position.entryPrice = null;
+        this.position.amount = 0;
         stateChanged = true;
       }
     } else {

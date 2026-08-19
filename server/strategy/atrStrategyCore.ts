@@ -26,6 +26,8 @@ export class ATRStrategyCore {
         dynamicOrderRatio: params.orderRatio,
         dynamicDcaStep: params.safetyOrderStepPercent,
         dynamicTrailingCallback: params.trailingCallbackPercent,
+        dynamicScalpBandMultiplier: 0.8,
+        dynamicScalpTakeProfitPercent: 0.5,
         marketRegime: 'SIDEWAYS' as const,
         slope: 0,
         volatilityRatio: 1.5
@@ -81,11 +83,27 @@ export class ATRStrategyCore {
       dynamicTrailingCallback = 1.2;
     }
 
+    // 5. Scalp Entry Band Multiplier (진입 전용 밴드 폭)
+    let dynamicScalpBandMultiplier = 0.8; // SIDEWAYS: ATR의 0.8배
+    if (marketRegime === 'BULL') {
+      dynamicScalpBandMultiplier = 1.0; // BULL: Rule 9(돌파) 우선
+    } else if (marketRegime === 'BEAR') {
+      dynamicScalpBandMultiplier = 1.4; // BEAR: 함부로 저점 잡지 않도록 보수적
+    }
+
+    // 6. Box-Range Scalp Take-Profit Target: 0.5% ~ 0.8% (수수료 0.10% 제외 순수익 0.4%~0.7% 실현)
+    let dynamicScalpTakeProfitPercent = 0.5;
+    if (volatilityRatio > 2.0) {
+      dynamicScalpTakeProfitPercent = 0.8;
+    }
+
     return {
       dynamicAtr,
       dynamicOrderRatio,
       dynamicDcaStep,
       dynamicTrailingCallback,
+      dynamicScalpBandMultiplier,
+      dynamicScalpTakeProfitPercent,
       marketRegime,
       slope,
       volatilityRatio
@@ -111,15 +129,19 @@ export class ATRStrategyCore {
     const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, priceHistory, higherTfTrend);
     const effectiveAtrMultiplier = params.autoPilotEnabled ? adaptive.dynamicAtr : params.atrMultiplier;
 
-    const lowerBand = baselineValue - (atrValue * effectiveAtrMultiplier);
-    const upperBand = baselineValue + (atrValue * effectiveAtrMultiplier);
+    // Minimum ATR Floor to prevent tick-size quantization trap (minimum 0.25% of price or 5,000 KRW)
+    const minAtrFloor = Math.max(5000, Math.round(currentPrice * 0.0025));
+    const effectiveAtr = Math.max(atrValue, minAtrFloor);
+
+    const lowerBand = baselineValue - (effectiveAtr * effectiveAtrMultiplier);
+    const upperBand = baselineValue + (effectiveAtr * effectiveAtrMultiplier);
 
     const snapshot = {
       baseline: baselineValue,
-      atr: atrValue,
+      atr: effectiveAtr,
       upperBand,
       lowerBand,
-      currentStopLoss: position.initialStopPrice || (lowerBand - (atrValue * params.stopLossMultiplier)),
+      currentStopLoss: position.initialStopPrice || (lowerBand - (effectiveAtr * params.stopLossMultiplier)),
       marketRegime: adaptive.marketRegime,
       slope: adaptive.slope,
       volatilityRatio: adaptive.volatilityRatio,
@@ -194,6 +216,29 @@ export class ATRStrategyCore {
       return signals;
     }
 
+    // --- Rule 3-b: Box-Range Scalp Take-Profit (Priority 3, SIDEWAYS only, Full Exit) ---
+    if (
+      hasPosition &&
+      params.autoPilotEnabled &&
+      adaptive.marketRegime === 'SIDEWAYS' &&
+      !position.trailingActive &&
+      pnlPercent >= adaptive.dynamicScalpTakeProfitPercent
+    ) {
+      signals.push({
+        id: `SIG_SCALP_TP_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'BOX_RANGE_SCALP_ENGINE',
+        type: 'SCALP_TAKE_PROFIT',
+        priority: 3,
+        symbol: params.symbol,
+        price: currentPrice,
+        reason: `[박스권 짤짤이 익절] 목표 수익률 +${adaptive.dynamicScalpTakeProfitPercent.toFixed(2)}% 도달 (수익률: +${pnlPercent.toFixed(2)}%) ➡️ 전량 매도`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
     // --- Rule 4: Trailing Take Profit (Priority 3) ---
     if (hasPosition && params.trailingStopEnabled) {
       const effectiveCallback = params.autoPilotEnabled ? adaptive.dynamicTrailingCallback : params.trailingCallbackPercent;
@@ -201,7 +246,11 @@ export class ATRStrategyCore {
       if (position.trailingActive && position.trailingPeakPrice) {
         const peakPrice = position.trailingPeakPrice;
         const pullbackPercent = ((peakPrice - currentPrice) / peakPrice) * 100;
-        if (pullbackPercent >= effectiveCallback) {
+        
+        // Profit Lock Gate: Trailing exit is strictly executed ONLY when in net profit above entry price
+        const isNetProfit = pnlPercent >= 0.1 && (position.entryPrice ? currentPrice > position.entryPrice : true);
+
+        if (pullbackPercent >= effectiveCallback && isNetProfit) {
           signals.push({
             id: `SIG_TRAILING_EXIT_${now}`,
             timestamp: now,
@@ -300,6 +349,73 @@ export class ATRStrategyCore {
       return signals;
     }
 
+    // --- Rule 8-b: Sideways Box-Range Scalp Buy (Priority 6) ---
+    if (
+      !hasPosition &&
+      position.state === 'FLAT' &&
+      params.autoPilotEnabled &&
+      adaptive.marketRegime !== 'BULL' &&
+      currentPrice <= (baselineValue - (effectiveAtr * adaptive.dynamicScalpBandMultiplier)) &&
+      currentPrice > lowerBand
+    ) {
+      signals.push({
+        id: `SIG_SCALP_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'BOX_RANGE_SCALP_ENGINE',
+        type: 'ENTRY_BUY',
+        priority: 6,
+        symbol: params.symbol,
+        price: currentPrice,
+        reason: `[박스권 스캘핑 진입] 기준선 대비 소폭 눌림 포착 (국면: ${adaptive.marketRegime})`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
+    // --- Rule 8-c: Box-Range Bounce-Confirmation Scalp Buy (Priority 6) ---
+    // Rule 8-b(기준선 기반)가 완만한 하락에서는 기준선이 가격을 쫓아가느라 잘 안 걸리는 문제를 보완.
+    // 기준선이 아니라 "실제로 확정된 최근 저점" 대비 소폭 반등을 확인하고 진입한다.
+    const SCALP_BOUNCE_LOOKBACK = 10; // 최근 몇 개 캔들(약 10분)에서 저점을 찾을지
+    const SCALP_BOUNCE_CONFIRM_PERCENT = 0.15; // 저점 대비 이만큼 반등해야 "돌아섰다"고 인정
+
+    if (
+      !hasPosition &&
+      position.state === 'FLAT' &&
+      params.autoPilotEnabled &&
+      adaptive.marketRegime !== 'BULL' &&
+      priceHistory.length >= SCALP_BOUNCE_LOOKBACK
+    ) {
+      const lookbackSlice = priceHistory.slice(-SCALP_BOUNCE_LOOKBACK);
+      const recentLow = Math.min(...lookbackSlice);
+
+      // 그 저점이 실제로 기준선보다 낮았을 때만 유효한 "눌림"으로 인정 (노이즈성 미세 등락 배제)
+      const wasGenuineDip = recentLow <= baselineValue;
+
+      // 저점 대비 확인폭만큼 반등했는지
+      const bounceThreshold = recentLow * (1 + SCALP_BOUNCE_CONFIRM_PERCENT / 100);
+      const hasBounced = currentPrice > recentLow && currentPrice >= bounceThreshold;
+
+      // 이미 기준선을 넘어버린 가격은 Rule 9/9-b 영역이니 여기선 제외
+      const stillBelowBaseline = currentPrice <= baselineValue;
+
+      if (wasGenuineDip && hasBounced && stillBelowBaseline) {
+        signals.push({
+          id: `SIG_SCALP_BOUNCE_${now}`,
+          timestamp: now,
+          timeframe: 'tick',
+          source: 'BOX_RANGE_SCALP_ENGINE',
+          type: 'ENTRY_BUY',
+          priority: 6,
+          symbol: params.symbol,
+          price: currentPrice,
+          reason: `[박스권 스캘핑 진입] 저점(₩${Math.round(recentLow).toLocaleString()}) 대비 +${SCALP_BOUNCE_CONFIRM_PERCENT}% 반등 확인 매수 (국면: ${adaptive.marketRegime})`,
+          indicatorSnapshot: snapshot
+        });
+        return signals;
+      }
+    }
+
     // --- Rule 9: Breakout 1st Entry Buy (Priority 6) ---
     if (
       !hasPosition &&
@@ -318,6 +434,30 @@ export class ATRStrategyCore {
         symbol: params.symbol,
         price: currentPrice,
         reason: `[1차 돌파 진입] 상승 추세(BULL) 모멘텀(기울기: +${adaptive.slope.toFixed(2)}%) 돌파 매수`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
+    // --- Rule 9-b: Sideways Box-Range Upside Scalp Buy (Priority 6) ---
+    if (
+      !hasPosition &&
+      position.state === 'FLAT' &&
+      params.autoPilotEnabled &&
+      adaptive.marketRegime === 'SIDEWAYS' &&
+      currentPrice > baselineValue &&
+      currentPrice <= (baselineValue + (effectiveAtr * adaptive.dynamicScalpBandMultiplier))
+    ) {
+      signals.push({
+        id: `SIG_SCALP_UP_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'BOX_RANGE_SCALP_ENGINE',
+        type: 'BREAKOUT_BUY',
+        priority: 6,
+        symbol: params.symbol,
+        price: currentPrice,
+        reason: `[박스권 상단 스캘핑 진입] 기준선 소폭 상향 돌파 포착 (국면: SIDEWAYS)`,
         indicatorSnapshot: snapshot
       });
       return signals;

@@ -117,7 +117,9 @@ export class OrderManager {
   private mapUpbitState(upbitState: string, executedVolume: number, remainingVolume: number): OrderStatus {
     if (upbitState === 'done') return 'FILLED';
     if (upbitState === 'cancel') {
-      if (executedVolume > 0) return 'PARTIALLY_FILLED';
+      // In Upbit Market Orders, tiny remainder is cancelled after full fill.
+      // If any volume was executed, the order is FILLED and finalized!
+      if (executedVolume > 0) return 'FILLED';
       return 'CANCELLED';
     }
     if (upbitState === 'wait' || upbitState === 'watch') {
@@ -583,13 +585,19 @@ export class OrderManager {
       if (fs.existsSync(ORDERS_FILE)) {
         const raw = fs.readFileSync(ORDERS_FILE, 'utf-8');
         const list: OrderRecord[] = JSON.parse(raw);
+        const now = Date.now();
         list.forEach((ord) => {
+          // If a pending/partially filled order is older than 5 minutes on file restore, mark as CANCELLED (finalized)
+          if ((ord.status === 'PARTIALLY_FILLED' || ord.status === 'OPEN' || ord.status === 'ORDER_SUBMITTING' || ord.status === 'ORDER_SUBMITTED' || ord.status === 'UNKNOWN_PENDING_RECONCILIATION') && (now - ord.createdAt) > 300000) {
+            ord.status = 'CANCELLED';
+            ord.error = 'Finalized on startup restore (stale order cleanup)';
+          }
           this.orders.set(ord.id, ord);
           if (ord.signalId) {
             this.processedSignalIds.add(ord.signalId);
           }
         });
-        console.log(`[OrderManager] Restored ${this.orders.size} orders from history file.`);
+        console.log(`[OrderManager] Restored ${this.orders.size} orders from history file (stale ghost orders cleaned).`);
       }
     } catch (e) {
       console.error('[OrderManager] Failed to load order history:', e);
