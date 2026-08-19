@@ -107,6 +107,7 @@ export default function App() {
   const [maxPyramidingOrders, setMaxPyramidingOrders] = useState<number>(2);
   const [pyramidingStepPercent, setPyramidingStepPercent] = useState<number>(1.5);
   const [pyramidingCount, setPyramidingCount] = useState<number>(0);
+  const [boxPyramidCount, setBoxPyramidCount] = useState<number>(0);
   const [partialLossCutEnabled, setPartialLossCutEnabled] = useState<boolean>(true);
   const [partialLossCutPercent, setPartialLossCutPercent] = useState<number>(40);
   const [partialLossCutThreshold, setPartialLossCutThreshold] = useState<number>(4.5);
@@ -288,6 +289,7 @@ export default function App() {
             }
             if (s.safetyOrderCount !== undefined) setSafetyOrderCount(s.safetyOrderCount);
             if (s.pyramidingCount !== undefined) setPyramidingCount(s.pyramidingCount);
+            if (s.boxPyramidCount !== undefined) setBoxPyramidCount(s.boxPyramidCount);
             if (s.awaitingReentry !== undefined) setAwaitingReentry(s.awaitingReentry);
             if (s.isTrailingActive !== undefined) setIsTrailingActive(s.isTrailingActive);
             if (s.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.trailingPeakPrice);
@@ -1062,6 +1064,11 @@ export default function App() {
                       {!awaitingReentry && !isTrailingActive && pyramidingCount > 0 && (
                         <span className="text-[9px] font-extrabold text-amber-700 bg-amber-100 px-1.5 py-0.2 rounded-md flex items-center gap-0.5">
                           🚀 불타기 {pyramidingCount}/{maxPyramidingOrders}
+                        </span>
+                      )}
+                      {!awaitingReentry && !isTrailingActive && boxPyramidCount > 0 && (
+                        <span className="text-[9px] font-extrabold text-fuchsia-700 bg-fuchsia-100 px-1.5 py-0.2 rounded-md flex items-center gap-0.5 ml-1">
+                          🚀 박스불타기 {boxPyramidCount}/1
                         </span>
                       )}
                       {!awaitingReentry && !isTrailingActive && pyramidingCount === 0 && safetyOrderCount > 0 && (
