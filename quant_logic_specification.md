@@ -113,15 +113,20 @@ Priority 6: BREAKOUT_BUY (Rule 9-b)     (박스권 상단 스캘핑 매수 - 예
   - 발동 조건: `hasPosition` AND `params.dcaEnabled` AND `평단 대비 하락률 >= dynamicDcaStep * SlotNumber` (최대 3회: 1차, 2차, 3차).
   - 수량 스케일: `1.2 ^ SlotNumber` (1차 1.2배, 2차 1.44배, 3차 1.728배).
 
-- **Priority 6: Pyramiding Buy (대세 상승장 불타기)**
+- **Priority 6: Pyramiding Buy (대세 상승장 불타기 - Rule 7)**
   - 발동 조건: `hasPosition` AND `params.pyramidingEnabled` AND `수익률 >= 1.5% * (pyramidingCount + 1)` AND `adaptive.marketRegime === 'BULL'` (최대 2회).
   - 특징: 대세 상승장(`BULL`) 국면에서만 허용 (`SIDEWAYS`나 `BEAR`에서는 엄격 차단).
 
-- **Priority 6: 1차 진입 4대 규칙 (FLAT 상태)**
+- **Priority 6: Box-Range Pyramid Buy (박스권 소액 불타기 - Rule 7-b)**
+  - 발동 조건: `hasPosition` AND `params.pyramidingEnabled` AND `autoPilotEnabled` AND `수익률 >= 0.25%` AND `marketRegime === 'SIDEWAYS'` AND `!trailingActive` (최대 1회).
+  - 특징: 박스권 내 변동성을 활용하여 예산을 일반 진입의 1/4로 엄격히 제한해 진입. 기존 상승장(BULL) 불타기 카운터(`pyramidingCount`)와 완전히 독립적인 별도 카운터(`boxPyramidCount`)로 관리.
+
+- **Priority 6: 1차 진입 5대 규칙 (FLAT 상태)**
   1. **Rule 8 (ENTRY_BUY - 하단 밴드 과매도 진입)**: `현재가 <= lowerBand`
   2. **Rule 8-b (ENTRY_BUY - 박스권 하단 스캘핑 진입)**: `autoPilotEnabled` AND `regime !== 'BULL'` AND `현재가 <= Baseline - (ATR * dynamicScalpBandMultiplier)` AND `현재가 > lowerBand` (예산 50% 축소)
-  3. **Rule 9 (BREAKOUT_BUY - 상승 모멘텀 돌파 진입)**: `현재가 > Baseline` AND (`marketRegime === 'BULL'` OR `slope >= 0.10`)
-  4. **Rule 9-b (BREAKOUT_BUY - 박스권 상단 스캘핑 진입)**: `autoPilotEnabled` AND `regime === 'SIDEWAYS'` AND `현재가 > Baseline` AND `현재가 <= Baseline + (ATR * dynamicScalpBandMultiplier)` (예산 50% 축소)
+  3. **Rule 8-c (ENTRY_BUY - 박스권 저점 반등 확인 진입)**: `autoPilotEnabled` AND `regime !== 'BULL'` AND 과거 10틱 최저점이 기준선 이하일 때 대비 `+0.15%` 반등 확인 시 진입 (예산 75% 축소, 일반 진입의 1/4)
+  4. **Rule 9 (BREAKOUT_BUY - 상승 모멘텀 돌파 진입)**: `현재가 > Baseline` AND (`marketRegime === 'BULL'` OR `slope >= 0.10`)
+  5. **Rule 9-b (BREAKOUT_BUY - 박스권 상단 스캘핑 진입)**: `autoPilotEnabled` AND `regime === 'SIDEWAYS'` AND `현재가 > Baseline` AND `현재가 <= Baseline + (ATR * dynamicScalpBandMultiplier)` (예산 50% 축소)
 
 ---
 
@@ -163,8 +168,9 @@ Priority 6: BREAKOUT_BUY (Rule 9-b)     (박스권 상단 스캘핑 매수 - 예
    - AutoPilot ON인 경우: 신호의 국면별 `dynamicOrderRatio` (BULL 20%, SIDEWAYS 18%, BEAR 10%)
    - AutoPilot OFF인 경우: 사용자 수동 설정값 `params.orderRatio` (기본 20%)
 3. **목표 주문 예산(Target Budget)** = 
-   - 일반 매수 (Rule 8, Rule 9): `Total Capital * Effective Order Ratio`
+   - 일반 매수 (Rule 8, Rule 9, Rule 7): `Total Capital * Effective Order Ratio`
    - 박스권 스캘핑 매수 (Rule 8-b, Rule 9-b): `(Total Capital * Effective Order Ratio) * 0.5` (50% 축소)
+   - 박스권 초소액 진입 (Rule 8-c, Rule 7-b): `(Total Capital * Effective Order Ratio) * 0.25` (75% 축소, 일반 매수의 1/4)
    - DCA 물타기: `Total Capital * Effective Order Ratio * (1.2 ^ slot)`
 4. **최종 주문 예산(Final Budget)** = `min(Target Budget, 가용 KRW 잔여액 * 0.98, 글로벌 잔여 노출 한도)`
 5. **글로벌 최대 포지션 노출 한도**: 총 자산의 **최대 85%**를 절대 초과할 수 없음.
