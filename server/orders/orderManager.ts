@@ -456,7 +456,11 @@ export class OrderManager {
         this.riskGovernor.releaseExposure(record.clientOrderId);
       }
       this.watchingOrderIds.delete(record.id);
-      onError(`Order ${status}: executed_volume=${executedVolume}`);
+      if (executedVolume === 0) {
+        onError(`Order ${status}: executed_volume=0`);
+      } else {
+        console.log(`[OrderManager] ℹ️ Order terminal state (${status}) with executed volume: ${executedVolume}`);
+      }
     }
   }
 
