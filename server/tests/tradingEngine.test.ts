@@ -1408,6 +1408,11 @@ async function runAllTests() {
   const earlyTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.3);
   assert(earlyTrendFollowSignals[0]?.id.startsWith('SIG_BULL_TARGET_ADD'), '[BULL Target] Confirmed BULL continuation deploys cash toward its target exposure');
   assert(earlyTrendFollowSignals[0]?.regimeTargetExposurePercent === 65, '[BULL Target] Target exposure is capped at 65%');
+  const targetBudgetEval = riskGovernor.evaluateSignal(
+    earlyTrendFollowSignals[0], 'RUNNING', 'LIVE', 8_000_000,
+    { ...labPyramidPosition, amount: 2_000, entryPrice: 1_000, totalCostKrw: 2_000_000 }, 1_000, [], 0
+  );
+  assert(targetBudgetEval.approved === true && targetBudgetEval.calculatedBudgetKrw === 500_000, `[Regime Controller] Each target-exposure order is capped at 5% of total capital (actual: ₩${targetBudgetEval.calculatedBudgetKrw}, ${targetBudgetEval.rejectionReason || 'approved'})`);
   const weakTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.0);
   assert(!weakTrendFollowSignals.some((signal) => signal.type === 'REGIME_REBALANCE_BUY'), '[BULL Target] Low-volume rise does not consume additional cash');
 

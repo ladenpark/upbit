@@ -1644,9 +1644,11 @@ export default function App() {
                 const isDca2Remainder = authoritativeNextDcaNumber === 2 && nextDcaPage?.type.includes('잔여 매수');
                 const isBreakoutReady = !hasPosition && currentPrice > baselineValue && (marketRegime === 'BULL' || (adaptiveIndicators?.slope || 0) >= 0.1) && rsiValue <= 68 && volumeMultiplier >= 1.15;
                 const isEmergency = hasPosition && currentPrice < lowerBand && dropSpeed <= -Math.abs(trendDropSpeedThreshold);
+                const regimeTargetExposure = marketRegime === 'BULL' ? 65 : marketRegime === 'BEAR' ? 40 : null;
                 const status = (active: boolean, enabled = true) => active ? '발동' : enabled ? '대기' : '꺼짐';
                 const tone = (active: boolean, enabled = true) => active ? 'bg-emerald-500 text-white border-emerald-500' : enabled ? 'bg-white text-slate-500 border-slate-200' : 'bg-slate-50 text-slate-400 border-slate-100';
                 const buyRows = hasPosition ? [
+                  ...(regimeTargetExposure ? [{ label: '국면 목표 비중', detail: `${marketRegime} · 코인 ${regimeTargetExposure}%까지 2분 간격·1회 최대 5%p 추가`, active: false, enabled: autoPilotEnabled, icon: '◉' }] : []),
                   authoritativeNextDcaNumber === 2
                     ? {
                         label: isDca2Remainder ? 'DCA 2차 잔여 60%' : 'DCA 2차 접근 반등',

@@ -41,6 +41,24 @@ export class ResearchRecorder {
     fs.mkdirSync(path.join(RESEARCH_DIR, 'ticks'), { recursive: true });
     fs.mkdirSync(path.join(RESEARCH_DIR, 'candles'), { recursive: true });
     fs.mkdirSync(path.join(RESEARCH_DIR, 'shadow'), { recursive: true });
+    this.initCountsFromDisk();
+  }
+
+  private countLines(filePath: string): number {
+    try {
+      if (!fs.existsSync(filePath)) return 0;
+      const content = fs.readFileSync(filePath, 'utf-8');
+      return content.split('\n').filter((l) => l.trim().length > 0).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  private initCountsFromDisk() {
+    const today = this.dateKey(Date.now());
+    this.stats.ticksRecorded = this.countLines(path.join(RESEARCH_DIR, 'ticks', `${today}.ndjson`));
+    this.stats.candlesRecorded = this.countLines(path.join(RESEARCH_DIR, 'candles', `${today}.ndjson`));
+    this.stats.shadowDifferences = this.countLines(path.join(RESEARCH_DIR, 'shadow', `${today}.ndjson`));
   }
 
   private dateKey(timestamp: number) {
