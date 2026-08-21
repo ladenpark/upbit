@@ -450,6 +450,10 @@ export class ATREngine {
 
       if (riskResult.approved && riskResult.orderRequest) {
         const clientOrderId = riskResult.orderRequest.clientOrderId;
+        if (topSignal.type === 'REENTRY_BUY' && !this.positionManager.markReentryPending()) {
+          console.warn('[ATREngine] Re-entry signal discarded because its permission was already consumed.');
+          return;
+        }
         console.log(`[ATREngine] 🎯 Signal APPROVED by Global Risk Governor: ${topSignal.type} (${topSignal.reason})`);
 
         this.addLog({
@@ -486,6 +490,7 @@ export class ATREngine {
                 this.handleOrderFilled(topSignal.type, record, price);
               },
               (error) => {
+                if (topSignal.type === 'REENTRY_BUY') this.positionManager.restoreReentryAllowed();
                 this.addLog({
                   type: 'SYSTEM',
                   price,
@@ -589,6 +594,23 @@ export class ATREngine {
         amount: effectiveVolume,
         exchange: this.params.exchange,
         reason: `${record.reason} [수동 추가 체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()} · DCA 슬롯 보존]`
+      });
+    } else if (signalType === 'REENTRY_BUY') {
+      this.positionManager.onReentryBuyFilled(
+        fillPrice,
+        effectiveVolume,
+        this.baselineValue,
+        this.atrValue,
+        this.params.atrMultiplier,
+        this.params.stopLossMultiplier
+      );
+      this.totalTrades += 1;
+      this.addLog({
+        type: 'BUY',
+        price: fillPrice,
+        amount: effectiveVolume,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [재진입 체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()} · 재진입 권한 소진]`
       });
     } else if (signalType === 'DCA_BUY') {
       if (isIncremental) {

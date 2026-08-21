@@ -207,6 +207,12 @@ export class GlobalRiskGovernor {
       return { approved: false, rejectionReason: `[Risk Block] Bot is currently in ${botState} state.` };
     }
 
+    // Re-entry permission is single-use. Once a re-entry request has been
+    // approved, no non-protective buy may race it before exchange confirmation.
+    if (position.state === 'REENTRY_PENDING' && !isProtectiveSell) {
+      return { approved: false, rejectionReason: '[Risk Block] Re-entry order is pending confirmation.' };
+    }
+
     // 2. Market Data Stale Check (Never open new buy orders on stale/disconnected market, allow protective stop exit)
     if (marketState !== 'LIVE' && !isProtectiveSell) {
       return { approved: false, rejectionReason: `[Risk Block] Market data feed is currently ${marketState}.` };

@@ -474,6 +474,41 @@ export class PositionManager {
     }
   }
 
+  /** Atomically consumes the one re-entry permission before an order is sent. */
+  public markReentryPending(): boolean {
+    if (this.position.state !== 'REENTRY_ALLOWED') return false;
+    this.position.state = 'REENTRY_PENDING';
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+    return true;
+  }
+
+  /** Restores re-entry permission only when submission fails before any fill. */
+  public restoreReentryAllowed() {
+    if (this.position.state !== 'REENTRY_PENDING') return;
+    this.position.state = 'REENTRY_ALLOWED';
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+  }
+
+  /**
+   * A re-entry is an additional buy using recycled cash. It preserves DCA
+   * slots but rebuilds all price-dependent protection from the confirmed fill.
+   */
+  public onReentryBuyFilled(
+    fillPrice: number,
+    fillVolume: number,
+    baseline: number,
+    atr: number,
+    atrMultiplier: number,
+    stopLossMultiplier: number
+  ) {
+    this.onManualAdditionalBuyFilled(fillPrice, fillVolume, baseline, atr, atrMultiplier, stopLossMultiplier);
+    this.position.state = 'ENTRY_FILLED';
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+  }
+
   /**
    * Full Position Close (Take Profit, Absolute Stop Loss, or Emergency Full Exit)
    */
@@ -588,9 +623,16 @@ export class PositionManager {
         this.position.entryPrice = fallbackPrice;
         stateChanged = true;
       }
-      if (this.position.state === 'FLAT') {
+      if (this.position.state === 'FLAT' || this.position.state === 'REENTRY_ALLOWED' || this.position.state === 'REENTRY_PENDING') {
         this.position.state = 'ENTRY_FILLED';
         stateChanged = true;
+      }
+      if (this.position.entryPrice && this.position.entryPrice > 0) {
+        const reconciledCost = realCoinQuantity * this.position.entryPrice;
+        if (Math.abs(this.position.totalCostKrw - reconciledCost) > 1) {
+          this.position.totalCostKrw = reconciledCost;
+          stateChanged = true;
+        }
       }
     }
 

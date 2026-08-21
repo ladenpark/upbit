@@ -143,6 +143,7 @@ export type PositionState =
   | 'COOLDOWN'
   | 'REENTRY_WAIT'
   | 'REENTRY_ALLOWED'
+  | 'REENTRY_PENDING'
   | 'TAKE_PROFIT'
   | 'CLOSED'
   | 'ERROR'

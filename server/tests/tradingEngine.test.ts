@@ -1424,6 +1424,25 @@ async function runAllTests() {
   assert(researchStats.candlesRecorded === 1 && researchStats.shadowDifferences === 1, '[Research] Completed candle and shadow difference are recorded independently');
 
   // ──────────────────────────────────────────────────────
+  // TEST GROUP 20: Single-Use Re-entry Lock
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 20: Single-Use Re-entry Lock');
+  const reentryManager = new PositionManager(defaultParams);
+  reentryManager.onInitialEntryFilled(2700000, 1, 2720000, 30000, 3, 2);
+  reentryManager.onPartialLossCutFilled(0.3, 2670000, -9000, 1);
+  reentryManager.enableReentry();
+  assert(reentryManager.getSnapshot().state === 'REENTRY_ALLOWED', '[Re-entry] Defensive state can grant one re-entry permission');
+  assert(reentryManager.markReentryPending() === true && reentryManager.getSnapshot().state === 'REENTRY_PENDING', '[Re-entry] Permission is atomically consumed before order submission');
+  assert(reentryManager.markReentryPending() === false, '[Re-entry] A second re-entry cannot consume the same permission');
+  reentryManager.onReentryBuyFilled(2660000, 0.2, 2700000, 30000, 3, 2);
+  assert(reentryManager.getSnapshot().state === 'ENTRY_FILLED' && reentryManager.getSnapshot().amount === 0.9, '[Re-entry] Any confirmed fill returns position to normal holding state');
+  const reentryPendingRisk = new GlobalRiskGovernor(defaultParams).evaluateSignal(
+    { ...bullBuySignal, type: 'REENTRY_BUY' }, 'RUNNING', 'LIVE', 5000000,
+    { ...labPyramidPosition, state: 'REENTRY_PENDING' }, 2750000, [], 0
+  );
+  assert(reentryPendingRisk.approved === false, '[Re-entry] Risk governor blocks all new buys while re-entry is pending');
+
+  // ──────────────────────────────────────────────────────
   // RESULTS
   // ──────────────────────────────────────────────────────
   console.log('\n======================================================');
