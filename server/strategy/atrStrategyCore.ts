@@ -390,8 +390,12 @@ export class ATRStrategyCore {
           // +0.7% 반등한 뒤에도 실행할 수 있도록 현재가 자체는 접근 구간 밖을 허용한다.
           dropFromEntry >= 2.5;
         const isRecoveryConfirmed = reboundFromLow >= 0.7 && adaptive.slope >= 0.05;
+        // Strategy Lab filters are deliberately opt-in. They only gate the DCA 2
+        // recovery prebuy; the original -4.2% remainder order is never blocked.
+        const isDca2RsiRecoveryConfirmed = !params.experimentDca2RsiRecoveryEnabled || adaptive.rsi >= 35;
+        const isDca2VolumeConfirmed = !params.experimentDca2VolumeConfirmationEnabled || adaptive.volumeMultiplier >= 1.05;
 
-        if (isDca2RecoveryWindow && isRecoveryConfirmed) {
+        if (isDca2RecoveryWindow && isRecoveryConfirmed && isDca2RsiRecoveryConfirmed && isDca2VolumeConfirmed) {
           signals.push({
             id: `SIG_DCA_2_RECOVERY_${now}`,
             timestamp: now,
@@ -403,7 +407,7 @@ export class ATRStrategyCore {
             price: currentPrice,
             dcaBudgetFraction: 0.4,
             dcaExecution: 'RECOVERY_PREBUY',
-            reason: `[DCA 2차 접근 반등 선매수] -${dropFromEntry.toFixed(2)}% 구간에서 최근 저점 대비 +${reboundFromLow.toFixed(2)}% 반등·단기 추세 전환 확인 ➡️ 2차 예산의 40%만 선매수`,
+            reason: `[DCA 2차 접근 반등 선매수] -${dropFromEntry.toFixed(2)}% 구간에서 최근 저점 대비 +${reboundFromLow.toFixed(2)}% 반등·단기 추세 전환 확인${params.experimentDca2RsiRecoveryEnabled ? ` · RSI ${adaptive.rsi.toFixed(0)}≥35` : ''}${params.experimentDca2VolumeConfirmationEnabled ? ` · 거래량 ${adaptive.volumeMultiplier.toFixed(2)}x≥1.05x` : ''} ➡️ 2차 예산의 40%만 선매수`,
             indicatorSnapshot: snapshot
           });
           return signals;
@@ -436,6 +440,9 @@ export class ATRStrategyCore {
     const hasTrailingExitedThisCycle = Boolean(position.trailingExitCount && position.trailingExitCount >= 1);
 
     // --- Rule 7: Pyramiding Buy (Priority 6) ---
+    const isPyramidRsiConfirmed = !params.experimentPyramidRsiGuardEnabled || (adaptive.rsi >= 55 && adaptive.rsi <= 68);
+    const isPyramidVolumeConfirmed = !params.experimentPyramidVolumeConfirmationEnabled || adaptive.volumeMultiplier >= 1.15;
+
     if (
       hasPosition &&
       params.pyramidingEnabled &&
@@ -443,7 +450,9 @@ export class ATRStrategyCore {
       !position.trailingActive &&
       position.pyramidingCount < params.maxPyramidingOrders &&
       pnlPercent >= params.pyramidingStepPercent * (position.pyramidingCount + 1) &&
-      adaptive.marketRegime === 'BULL'
+      adaptive.marketRegime === 'BULL' &&
+      isPyramidRsiConfirmed &&
+      isPyramidVolumeConfirmed
     ) {
       const nextStage = position.pyramidingCount + 1;
       const pyramidBudgetFraction = nextStage === 1 ? 0.50 : 0.35;
@@ -457,7 +466,7 @@ export class ATRStrategyCore {
         symbol: params.symbol,
         price: currentPrice,
         pyramidBudgetFraction,
-        reason: `[상승 불타기 ${nextStage}차] 평단 대비 +${pnlPercent.toFixed(2)}% 상승·추세 유지 확인 ➡️ ${nextStage === 1 ? '0.50' : '0.35'} Unit만 추가 매수`,
+        reason: `[상승 불타기 ${nextStage}차] 평단 대비 +${pnlPercent.toFixed(2)}% 상승·추세 유지 확인${params.experimentPyramidRsiGuardEnabled ? ` · RSI ${adaptive.rsi.toFixed(0)} (55~68)` : ''}${params.experimentPyramidVolumeConfirmationEnabled ? ` · 거래량 ${adaptive.volumeMultiplier.toFixed(2)}x≥1.15x` : ''} ➡️ ${nextStage === 1 ? '0.50' : '0.35'} Unit만 추가 매수`,
         indicatorSnapshot: snapshot
       });
       return signals;

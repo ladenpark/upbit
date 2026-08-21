@@ -52,7 +52,28 @@ function validateConfig(payload: unknown): Partial<BotParams> {
     throw new Error('Invalid Upbit KRW market symbol.');
   }
   if ('exchange' in config && config.exchange !== 'UPBIT') throw new Error('Unsupported exchange.');
+  const experimentKeys = [
+    'experimentDca2RsiRecoveryEnabled',
+    'experimentDca2VolumeConfirmationEnabled',
+    'experimentPyramidRsiGuardEnabled',
+    'experimentPyramidVolumeConfirmationEnabled'
+  ];
+  for (const key of experimentKeys) {
+    if (key in config && typeof config[key] !== 'boolean') throw new Error(`Invalid ${key}. Expected a boolean.`);
+  }
   return config as Partial<BotParams>;
+}
+
+function assertExperimentConfigIsSafe(config: Partial<BotParams>) {
+  const experimentKeys: Array<keyof BotParams> = [
+    'experimentDca2RsiRecoveryEnabled',
+    'experimentDca2VolumeConfirmationEnabled',
+    'experimentPyramidRsiGuardEnabled',
+    'experimentPyramidVolumeConfirmationEnabled'
+  ];
+  if (engine.params.isBotActive && experimentKeys.some((key) => key in config)) {
+    throw new Error('전략 실험 토글은 봇을 정지한 상태에서만 변경할 수 있습니다.');
+  }
 }
 
 // Enable CORS for development frontend
@@ -114,7 +135,11 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
 
       switch (data.type) {
         case 'UPDATE_CONFIG':
-          engine.updateParams(validateConfig(data.payload));
+          {
+            const config = validateConfig(data.payload);
+            assertExperimentConfigIsSafe(config);
+            engine.updateParams(config);
+          }
           break;
 
         case 'TOGGLE_BOT':
@@ -153,7 +178,8 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
         case 'MANUAL_TRADE': {
           const side = data.payload.side as 'BUY' | 'SELL';
           if (side !== 'BUY' && side !== 'SELL') throw new Error('Invalid manual order side.');
-          await engine.executeManualTrade(side);
+          const manualBuyPercent = data.payload.manualBuyPercent;
+          await engine.executeManualTrade(side, manualBuyPercent);
           break;
         }
 
@@ -180,7 +206,9 @@ app.get('/api/state', (req, res) => {
 });
 
 app.post('/api/config', (req, res) => {
-  engine.updateParams(validateConfig(req.body));
+  const config = validateConfig(req.body);
+  assertExperimentConfigIsSafe(config);
+  engine.updateParams(config);
   res.json({ success: true, state: engine.getFullState() });
 });
 

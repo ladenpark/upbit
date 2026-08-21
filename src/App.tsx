@@ -81,8 +81,8 @@ interface PricePoint {
 }
 
 export default function App() {
-  // Mobile Tab view: 'chart' | 'bot' | 'logs' | 'account'
-  const [activeTab, setActiveTab] = useState<'chart' | 'radar' | 'bot' | 'logs' | 'account'>('chart');
+  // Mobile Tab view: 'chart' | 'bot' | 'lab' | 'logs' | 'account'
+  const [activeTab, setActiveTab] = useState<'chart' | 'radar' | 'bot' | 'lab' | 'logs' | 'account'>('chart');
   const [deviceFrameMode, setDeviceFrameMode] = useState<boolean>(true);
 
   // Backend WS Connection State
@@ -150,6 +150,13 @@ export default function App() {
   // AI Auto-Pilot State
   const [autoPilotEnabled, setAutoPilotEnabled] = useState<boolean>(true);
   const [marketRegime, setMarketRegime] = useState<'BULL' | 'SIDEWAYS' | 'BEAR'>('SIDEWAYS');
+
+  // Strategy Lab experiments are opt-in and default to OFF on the server.
+  const [experimentDca2RsiRecoveryEnabled, setExperimentDca2RsiRecoveryEnabled] = useState(false);
+  const [experimentDca2VolumeConfirmationEnabled, setExperimentDca2VolumeConfirmationEnabled] = useState(false);
+  const [experimentPyramidRsiGuardEnabled, setExperimentPyramidRsiGuardEnabled] = useState(false);
+  const [experimentPyramidVolumeConfirmationEnabled, setExperimentPyramidVolumeConfirmationEnabled] = useState(false);
+  const [researchStats, setResearchStats] = useState({ enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, startedAt: 0 });
 
   // API Credentials State (Upbit Exclusive)
   // Exchange secrets must never be retained in browser storage.  They exist
@@ -313,6 +320,10 @@ export default function App() {
               if (s.params.trendAwareCutEnabled !== undefined) setTrendAwareCutEnabled(s.params.trendAwareCutEnabled);
               if (s.params.trendDropSpeedThreshold !== undefined) setTrendDropSpeedThreshold(s.params.trendDropSpeedThreshold);
               if (s.params.autoPilotEnabled !== undefined) setAutoPilotEnabled(s.params.autoPilotEnabled);
+              if (s.params.experimentDca2RsiRecoveryEnabled !== undefined) setExperimentDca2RsiRecoveryEnabled(s.params.experimentDca2RsiRecoveryEnabled);
+              if (s.params.experimentDca2VolumeConfirmationEnabled !== undefined) setExperimentDca2VolumeConfirmationEnabled(s.params.experimentDca2VolumeConfirmationEnabled);
+              if (s.params.experimentPyramidRsiGuardEnabled !== undefined) setExperimentPyramidRsiGuardEnabled(s.params.experimentPyramidRsiGuardEnabled);
+              if (s.params.experimentPyramidVolumeConfirmationEnabled !== undefined) setExperimentPyramidVolumeConfirmationEnabled(s.params.experimentPyramidVolumeConfirmationEnabled);
             }
             if (s.botState !== undefined) setBotLifecycleState(s.botState);
             if (s.marketState !== undefined) setMarketFeedState(s.marketState);
@@ -347,6 +358,7 @@ export default function App() {
             if (s.baselineValue !== undefined) setBaselineValue(s.baselineValue);
             if (s.rsi !== undefined) setRsiValue(s.rsi);
             if (s.volumeMultiplier !== undefined) setVolumeMultiplier(s.volumeMultiplier);
+            if (s.research) setResearchStats(s.research);
             if (s.priceHistory) setPriceHistory(s.priceHistory);
             if (s.logs) setLogs(s.logs);
             if (s.realBalances) setRealBalances(s.realBalances);
@@ -422,6 +434,10 @@ export default function App() {
     trendAwareCutEnabled?: boolean;
     trendDropSpeedThreshold?: number;
     autoPilotEnabled?: boolean;
+    experimentDca2RsiRecoveryEnabled?: boolean;
+    experimentDca2VolumeConfirmationEnabled?: boolean;
+    experimentPyramidRsiGuardEnabled?: boolean;
+    experimentPyramidVolumeConfirmationEnabled?: boolean;
   }) => {
     if (newParams.atrMultiplier !== undefined) setAtrMultiplier(newParams.atrMultiplier);
     if (newParams.orderRatio !== undefined) setOrderRatio(newParams.orderRatio);
@@ -440,6 +456,10 @@ export default function App() {
     if (newParams.trendAwareCutEnabled !== undefined) setTrendAwareCutEnabled(newParams.trendAwareCutEnabled);
     if (newParams.trendDropSpeedThreshold !== undefined) setTrendDropSpeedThreshold(newParams.trendDropSpeedThreshold);
     if (newParams.autoPilotEnabled !== undefined) setAutoPilotEnabled(newParams.autoPilotEnabled);
+    if (newParams.experimentDca2RsiRecoveryEnabled !== undefined) setExperimentDca2RsiRecoveryEnabled(newParams.experimentDca2RsiRecoveryEnabled);
+    if (newParams.experimentDca2VolumeConfirmationEnabled !== undefined) setExperimentDca2VolumeConfirmationEnabled(newParams.experimentDca2VolumeConfirmationEnabled);
+    if (newParams.experimentPyramidRsiGuardEnabled !== undefined) setExperimentPyramidRsiGuardEnabled(newParams.experimentPyramidRsiGuardEnabled);
+    if (newParams.experimentPyramidVolumeConfirmationEnabled !== undefined) setExperimentPyramidVolumeConfirmationEnabled(newParams.experimentPyramidVolumeConfirmationEnabled);
     sendWsCommand('UPDATE_CONFIG', newParams);
   };
 
@@ -752,11 +772,12 @@ export default function App() {
     message: string;
     actionLabel: string;
     badgeLabel: string;
+    manualBuyPercent?: 10 | 20 | 30;
     details: { label: string; value: string; highlight?: boolean }[];
   } | null>(null);
 
-  const handleManualBuy = () => {
-    sendWsCommand('MANUAL_TRADE', { side: 'BUY' });
+  const handleManualBuy = (manualBuyPercent?: 10 | 20 | 30) => {
+    sendWsCommand('MANUAL_TRADE', { side: 'BUY', manualBuyPercent });
     playBeep('BUY');
   };
 
@@ -767,18 +788,21 @@ export default function App() {
 
   const requestManualBuyConfirm = () => {
     const isAdditional = positionAmount > 0;
-    const estBudget = currentEquity * ((orderRatio || 20) / 100);
+    const manualBuyPercent = 10 as const;
+    const selectedPercent = isAdditional ? manualBuyPercent : (orderRatio || 20);
+    const estBudget = currentEquity * (selectedPercent / 100);
     setTradeConfirmModal({
       type: 'BUY',
-      title: isAdditional ? '수동 추가 매수 (DCA) 확인' : '수동 1차 매수 (BUY) 확인',
+      title: isAdditional ? '수동 추가 매수 확인' : '수동 1차 매수 (BUY) 확인',
       badgeLabel: isAdditional ? '추가 매수' : '1차 진입',
       message: isAdditional
-        ? '현재 보유 중인 포지션에 추가 매수하여 평단가를 낮춥니다. 주문을 전송하시겠습니까?'
+        ? '선택한 비중으로 평단가를 조정합니다. 자동 DCA 슬롯은 소비하지 않으며, 체결 뒤 가격 기준은 새 평단으로 다시 계산됩니다.'
         : '업비트 시장가로 1차 매수 주문을 전송합니다. 진행하시겠습니까?',
       actionLabel: isAdditional ? '추가 매수 실행' : '매수 주문 실행',
+      manualBuyPercent: isAdditional ? manualBuyPercent : undefined,
       details: [
         { label: '주문 코인', value: selectedCoin },
-        { label: '예상 주문 금액', value: `${formatPrice(estBudget)} (총자산의 ${orderRatio || 20}%)`, highlight: true },
+        { label: '예상 주문 금액', value: `${formatPrice(estBudget)} (총자산의 ${selectedPercent}%)`, highlight: true },
         { label: '현재 실시간 시세', value: formatPrice(currentPrice) },
         ...(isAdditional && entryPrice ? [{ label: '현재 내 평단가', value: formatPrice(entryPrice) }] : [])
       ]
@@ -806,7 +830,7 @@ export default function App() {
   const handleConfirmTrade = () => {
     if (!tradeConfirmModal) return;
     if (tradeConfirmModal.type === 'BUY') {
-      handleManualBuy();
+      handleManualBuy(tradeConfirmModal.manualBuyPercent);
     } else {
       handleManualSell();
     }
@@ -2718,6 +2742,74 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === 'lab' && (
+            <div className="space-y-3">
+              <div className="bg-gradient-to-br from-violet-700 to-indigo-800 p-4 rounded-2xl text-white shadow-sm">
+                <div className="flex items-start gap-2">
+                  <Brain className="w-5 h-5 mt-0.5" />
+                  <div>
+                    <h2 className="font-extrabold text-sm">전략 실험실</h2>
+                    <p className="text-[10px] text-violet-100 mt-1">백테스트 후보를 하나씩 소액 실거래로 검증하는 공간입니다. 모든 실험은 기본 OFF입니다.</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  ['틱 기록', researchStats.ticksRecorded],
+                  ['완결 1분봉', researchStats.candlesRecorded],
+                  ['규칙 차이', researchStats.shadowDifferences]
+                ].map(([label, value]) => (
+                  <div key={String(label)} className="rounded-xl border border-violet-100 bg-violet-50 p-2 text-center">
+                    <div className="text-[9px] text-violet-600 font-bold">{label}</div>
+                    <div className="mono text-sm font-extrabold text-violet-900 mt-0.5">{Number(value).toLocaleString()}</div>
+                  </div>
+                ))}
+              </div>
+              <p className="px-1 text-[9.5px] text-slate-500">{researchStats.enabled ? '● 수집 중 — 실제 주문 없이 기본 규칙과 각 후보의 신호 차이만 기록합니다.' : '서버 재시작 후 연구 수집기가 시작됩니다.'}</p>
+
+              {isBotActive && (
+                <div className="p-3 rounded-2xl border border-amber-200 bg-amber-50 text-[11px] text-amber-800">
+                  <strong>봇 가동 중:</strong> 실험 토글은 판단 규칙의 중간 변경을 막기 위해 봇을 정지한 상태에서만 바꿀 수 있습니다.
+                </div>
+              )}
+
+              <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">
+                <div className="text-xs font-extrabold text-slate-900">DCA 2차 접근 반등 선매수</div>
+                <p className="text-[10px] text-slate-500">원래 반등 조건은 유지하며, 아래 필터는 2차 예산 40%의 선매수에만 적용됩니다. -4.2% 잔여 60% 매수는 막지 않습니다.</p>
+                {[
+                  { key: 'rsi', title: 'RSI 회복 확인', detail: 'RSI가 35 이상일 때만 반등 선매수', enabled: experimentDca2RsiRecoveryEnabled },
+                  { key: 'volume', title: '거래량 확인', detail: '거래량이 20분 평균의 1.05배 이상일 때만 선매수', enabled: experimentDca2VolumeConfirmationEnabled }
+                ].map((experiment) => (
+                  <div key={experiment.key} className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-50 border border-slate-100">
+                    <div><div className="text-[11px] font-bold text-slate-800">{experiment.title}</div><div className="text-[9.5px] text-slate-500 mt-0.5">{experiment.detail}</div></div>
+                    <button disabled={isBotActive} onClick={() => handleParamsChange(experiment.key === 'rsi' ? { experimentDca2RsiRecoveryEnabled: !experiment.enabled } : { experimentDca2VolumeConfirmationEnabled: !experiment.enabled })} className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${experiment.enabled ? 'bg-violet-600' : 'bg-slate-300'}`}>
+                      <span className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${experiment.enabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">
+                <div className="text-xs font-extrabold text-slate-900">BULL 상승 불타기</div>
+                <p className="text-[10px] text-slate-500">기존의 수익률·BULL 국면·최대 2단계 조건에 선택적으로 추가되는 진입 품질 필터입니다.</p>
+                {[
+                  { key: 'rsi', title: 'RSI 과열 방지', detail: 'RSI 55~68 구간에서만 불타기', enabled: experimentPyramidRsiGuardEnabled },
+                  { key: 'volume', title: '거래량 확인', detail: '거래량이 20분 평균의 1.15배 이상일 때만 불타기', enabled: experimentPyramidVolumeConfirmationEnabled }
+                ].map((experiment) => (
+                  <div key={experiment.key} className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-50 border border-slate-100">
+                    <div><div className="text-[11px] font-bold text-slate-800">{experiment.title}</div><div className="text-[9.5px] text-slate-500 mt-0.5">{experiment.detail}</div></div>
+                    <button disabled={isBotActive} onClick={() => handleParamsChange(experiment.key === 'rsi' ? { experimentPyramidRsiGuardEnabled: !experiment.enabled } : { experimentPyramidVolumeConfirmationEnabled: !experiment.enabled })} className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${experiment.enabled ? 'bg-violet-600' : 'bg-slate-300'}`}>
+                      <span className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${experiment.enabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <p className="px-1 text-[10px] leading-relaxed text-slate-500">권장 순서: 실험 하나만 ON → 충분한 거래·시장 국면 기록 → 수수료 차감 손익과 최대낙폭 확인 → 유지 또는 OFF. 여러 항목을 한 번에 켜면 어떤 조건의 효과인지 분리할 수 없습니다.</p>
+            </div>
+          )}
+
           {activeTab === 'logs' && (
             <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2 flex flex-col h-[520px]">
               <div className="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -3015,6 +3107,16 @@ export default function App() {
           </button>
 
           <button
+            onClick={() => setActiveTab('lab')}
+            className={`flex flex-col items-center gap-1 px-2 py-1 rounded-xl transition cursor-pointer ${
+              activeTab === 'lab' ? 'text-violet-600 font-bold' : 'text-slate-400 font-medium'
+            }`}
+          >
+            <Brain className={`w-5 h-5 ${activeTab === 'lab' ? 'text-violet-600' : ''}`} />
+            <span className="text-[9.5px]">전략 실험실</span>
+          </button>
+
+          <button
             onClick={() => setActiveTab('logs')}
             className={`flex flex-col items-center gap-1 px-2 py-1 rounded-xl transition cursor-pointer relative ${
               activeTab === 'logs' ? 'text-blue-600 font-bold' : 'text-slate-400 font-medium'
@@ -3166,6 +3268,41 @@ export default function App() {
                 <p className="text-slate-600 font-medium leading-relaxed">
                   {tradeConfirmModal.message}
                 </p>
+
+                {tradeConfirmModal.type === 'BUY' && tradeConfirmModal.manualBuyPercent && (
+                  <div className="rounded-2xl border border-emerald-100 bg-emerald-50/60 p-3">
+                    <div className="mb-2 flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-emerald-900">추가 매수 비중</span>
+                      <span className="text-[10px] text-emerald-700">총자산 기준 · DCA 슬롯 미소비</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {([10, 20, 30] as const).map((percent) => {
+                        const isSelected = tradeConfirmModal.manualBuyPercent === percent;
+                        return (
+                          <button
+                            key={percent}
+                            onClick={() => setTradeConfirmModal((modal) => {
+                              if (!modal) return null;
+                              const estimatedBudget = currentEquity * (percent / 100);
+                              return {
+                                ...modal,
+                                manualBuyPercent: percent,
+                                details: modal.details.map((item) => item.label === '예상 주문 금액'
+                                  ? { ...item, value: `${formatPrice(estimatedBudget)} (총자산의 ${percent}%)` }
+                                  : item)
+                              };
+                            })}
+                            className={`rounded-xl border py-2 text-xs font-extrabold transition ${isSelected
+                              ? 'border-emerald-600 bg-emerald-600 text-white shadow-sm'
+                              : 'border-emerald-200 bg-white text-emerald-700 hover:border-emerald-400'}`}
+                          >
+                            {percent}%
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {/* Details Card */}
                 <div className="bg-slate-50 rounded-2xl p-3.5 border border-slate-100 space-y-2.5">

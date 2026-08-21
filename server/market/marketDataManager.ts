@@ -47,7 +47,8 @@ export class MarketDataManager {
     exchange: ExchangeType = 'UPBIT',
     symbol: string = 'KRW-ETH',
     onTick?: (price: number, timestamp: number) => void,
-    onStateChange?: (state: MarketDataState) => void
+    onStateChange?: (state: MarketDataState) => void,
+    autoStart: boolean = true
   ) {
     this.exchange = exchange;
     this.symbol = symbol;
@@ -55,8 +56,10 @@ export class MarketDataManager {
     this.onTickCallback = onTick;
     this.onStateChangeCallback = onStateChange;
 
-    this.startWatchdog();
-    this.startStream();
+    if (autoStart) {
+      this.startWatchdog();
+      this.startStream();
+    }
   }
 
   public setSymbol(exchange: ExchangeType, symbol: string) {

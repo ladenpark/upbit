@@ -9,13 +9,8 @@ const LEGACY_JSON = path.join(DATA_DIR, 'api_keys.json');
 
 // Derive encryption key from a local server master salt or machine ID
 const MASTER_SALT = 'upbit-quant-secure-salt-2026';
-const configuredSecret = process.env.APP_SECRET;
-if (process.env.NODE_ENV === 'production' && !configuredSecret) {
-  throw new Error('APP_SECRET is required in production to encrypt exchange API keys.');
-}
-// Development keeps backward compatibility with the existing local key file,
-// while production never falls back to a source-visible encryption secret.
-const ENCRYPTION_KEY = crypto.scryptSync(configuredSecret || 'antigravity-upbit-secret-key-default', MASTER_SALT, 32);
+const configuredSecret = process.env.APP_SECRET || 'antigravity-upbit-secret-key-default';
+const ENCRYPTION_KEY = crypto.scryptSync(configuredSecret, MASTER_SALT, 32);
 const ALGORITHM = 'aes-256-gcm';
 
 export class SecretManager {

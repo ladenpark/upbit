@@ -167,6 +167,47 @@ export class PositionManager {
   }
 
   /**
+   * Manual add-ons deliberately do not consume an automated DCA slot. They
+   * create a new weighted average and rebuild price-dependent protective
+   * levels from the latest market inputs, while preserving DCA/pyramid usage.
+   */
+  public onManualAdditionalBuyFilled(
+    fillPrice: number,
+    fillVolume: number,
+    baseline: number,
+    atr: number,
+    atrMultiplier: number,
+    stopLossMultiplier: number
+  ) {
+    const currentQty = this.position.amount;
+    const currentEntry = this.position.entryPrice || fillPrice;
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
+    const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
+    const lowerBand = baseline - (atr * atrMultiplier);
+    const dynamicStopLossPrice = lowerBand - (atr * stopLossMultiplier);
+    const floorStopLossPrice = newWeightedAvgPrice * 0.94;
+
+    this.position.state = 'ENTRY_FILLED';
+    this.position.amount = newTotalQty;
+    this.position.entryPrice = newWeightedAvgPrice;
+    this.position.positionEntryAtr = atr;
+    this.position.initialBaseline = baseline;
+    this.position.initialBand = lowerBand;
+    this.position.initialStopPrice = Number((Math.max(dynamicStopLossPrice, floorStopLossPrice)).toFixed(2));
+    this.position.totalCostKrw += fillPrice * fillVolume;
+    this.position.partialCutCount = 0;
+    this.position.trailingActive = false;
+    this.position.trailingPeakPrice = null;
+    if (this.position.profitLockPrice !== null && this.position.profitLockPrice !== undefined) {
+      this.position.profitLockPrice = Number((newWeightedAvgPrice * 1.001).toFixed(2));
+    }
+    this.position.lastUpdatedAt = Date.now();
+
+    this.saveStateToFile();
+    console.log(`[PositionManager] Manual Add Filled: Added=${fillVolume}, New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()} (DCA slots preserved)`);
+  }
+
+  /**
    * Called when a DCA safety order fills.
    */
   public onDcaFilled(slotNumber: number, fillPrice: number, fillVolume: number) {
@@ -381,10 +422,25 @@ export class PositionManager {
 
     if (this.position.amount <= 0) {
       this.position.entryPrice = null;
+      this.position.positionEntryAtr = null;
+      this.position.initialStopPrice = null;
+      this.position.initialBaseline = null;
+      this.position.initialBand = null;
+      this.position.totalCostKrw = 0;
+      this.position.unrealizedPnl = 0;
+      this.position.unrealizedPnlPercent = 0;
+      this.position.openedAt = null;
       this.position.state = 'FLAT';
       this.position.pyramidingCount = 0;
       this.position.boxPyramidCount = 0;
+      this.position.partialCutCount = 0;
       this.position.trailingExitCount = 0;
+      this.position.profitLockPrice = null;
+      this.position.dcaSlots = Array.from({ length: this.params.maxSafetyOrders }, (_, i) => ({
+        slotNumber: i + 1,
+        status: 'AVAILABLE' as const
+      }));
+      this.setCooldown(30, 'TRAILING_STOP_EXIT');
     }
 
     this.saveStateToFile();
@@ -426,6 +482,12 @@ export class PositionManager {
     this.position.entryPrice = null;
     this.position.positionEntryAtr = null;
     this.position.initialStopPrice = null;
+    this.position.initialBaseline = null;
+    this.position.initialBand = null;
+    this.position.totalCostKrw = 0;
+    this.position.unrealizedPnl = 0;
+    this.position.unrealizedPnlPercent = 0;
+    this.position.openedAt = null;
     this.position.realizedPnl += pnl;
     this.position.state = 'FLAT';
     this.position.trailingActive = false;
@@ -434,6 +496,11 @@ export class PositionManager {
     this.position.profitLockPrice = null;
     this.position.pyramidingCount = 0;
     this.position.boxPyramidCount = 0;
+    this.position.partialCutCount = 0;
+    this.position.dcaSlots = Array.from({ length: this.params.maxSafetyOrders }, (_, i) => ({
+      slotNumber: i + 1,
+      status: 'AVAILABLE' as const
+    }));
     this.position.lastUpdatedAt = Date.now();
 
     // Differentiated Smart Cooldown:

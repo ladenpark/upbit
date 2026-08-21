@@ -5,6 +5,7 @@ module.exports = {
       script: './node_modules/.bin/tsx',
       args: 'server/index.ts',
       cwd: '/home/pik0915/myproject/upbit',
+      exec_mode: 'fork',
       instances: 1,
       autorestart: true,
       watch: false,

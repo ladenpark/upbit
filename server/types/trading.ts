@@ -7,6 +7,7 @@ export type ExchangeType = 'UPBIT';
 export type SignalType = 
   | 'ENTRY_BUY'
   | 'BREAKOUT_BUY'
+  | 'MANUAL_ADD_BUY'
   | 'DCA_BUY'
   | 'PYRAMID_BUY'
   | 'BOX_PYRAMID_BUY'
@@ -313,6 +314,11 @@ export interface BotParams {
   dryRunMode?: boolean;
   // Daily Maximum Loss Limit (일일 최대 손실 한도, 기본 5%)
   dailyMaxLossPercent?: number;
+  // Strategy Lab — all experiments default to OFF and are only configurable while paused.
+  experimentDca2RsiRecoveryEnabled: boolean;
+  experimentDca2VolumeConfirmationEnabled: boolean;
+  experimentPyramidRsiGuardEnabled: boolean;
+  experimentPyramidVolumeConfirmationEnabled: boolean;
 }
 
 export interface ApiKeys {

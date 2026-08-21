@@ -6,10 +6,17 @@ import { MockUpbit } from '../exchanges/mockUpbit';
 import { BotParams } from '../types/trading';
 
 async function runBacktest() {
+  const originalConsole = {
+    log: console.log.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console)
+  };
   console.log(`[Backtest] Starting local backtest framework...`);
   console.log(`[Backtest] Working directory: ${process.cwd()}`);
 
-  const historyFile = path.join(process.cwd(), '../history_eth.json');
+  const currentHistoryFile = path.join(process.cwd(), 'data', 'history_eth.json');
+  const legacyHistoryFile = path.join(process.cwd(), '../history_eth.json');
+  const historyFile = fs.existsSync(currentHistoryFile) ? currentHistoryFile : legacyHistoryFile;
   if (!fs.existsSync(historyFile)) {
     console.error(`[Backtest] Error: ${historyFile} not found. Please run downloadHistory.ts first.`);
     process.exit(1);
@@ -31,6 +38,23 @@ async function runBacktest() {
   console.log(`[Backtest] Simulating for the last ${days} days (${candles.length} candles).`);
 
   // 2. ATREngine 인스턴스화
+  const requestedExperiments = new Set(
+    (process.env.BACKTEST_EXPERIMENTS || '')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean)
+  );
+  const experimentParamMap = {
+    dca2Rsi: 'experimentDca2RsiRecoveryEnabled',
+    dca2Volume: 'experimentDca2VolumeConfirmationEnabled',
+    pyramidRsi: 'experimentPyramidRsiGuardEnabled',
+    pyramidVolume: 'experimentPyramidVolumeConfirmationEnabled'
+  } as const;
+  const unknownExperiments = [...requestedExperiments].filter((name) => !(name in experimentParamMap));
+  if (unknownExperiments.length > 0) {
+    throw new Error(`Unknown BACKTEST_EXPERIMENTS value: ${unknownExperiments.join(', ')}`);
+  }
+
   const params: any = {
     isBotActive: true,
     autoPilotEnabled: true,
@@ -52,14 +76,29 @@ async function runBacktest() {
     trendDropSpeedThreshold: 1.8,
     pyramidingStepPercent: 1.5,
     maxPyramidingOrders: 2,
-    dryRunMode: false
+    dryRunMode: false,
+    experimentDca2RsiRecoveryEnabled: requestedExperiments.has('dca2Rsi'),
+    experimentDca2VolumeConfirmationEnabled: requestedExperiments.has('dca2Volume'),
+    experimentPyramidRsiGuardEnabled: requestedExperiments.has('pyramidRsi'),
+    experimentPyramidVolumeConfirmationEnabled: requestedExperiments.has('pyramidVolume')
   };
+  console.log(`[Backtest] Strategy Lab: ${requestedExperiments.size ? [...requestedExperiments].join(', ') : 'baseline (all OFF)'}`);
 
   // 엔진 생성 시점에 초기 ATR 계산이 될 수 있도록 과거 200개 캔들 세팅
   const startIndex = allCandles.length - candles.length;
   MockUpbit.recentCandles = allCandles.slice(Math.max(0, startIndex - 200), startIndex);
 
-  const engine = new ATREngine(() => {});
+  // ATREngine is shared with live trading and normally logs every rejected
+  // signal. Suppress per-tick noise during a simulation; the final report is
+  // restored below. Set BACKTEST_VERBOSE=1 when investigating a single run.
+  const isVerbose = process.env.BACKTEST_VERBOSE === '1';
+  if (!isVerbose) {
+    console.log = () => {};
+    console.warn = () => {};
+    console.error = () => {};
+  }
+
+  const engine = new ATREngine(() => {}, { backtest: true });
   engine.updateParams(params);
 
   // 3. 의존성 주입(Dependency Injection) - MockUpbit 덮어씌우기
@@ -86,15 +125,16 @@ async function runBacktest() {
   // 초기 예수금 동기화
   engine.actualKrwBalance = MockUpbit.mockKrwBalance;
 
-  // 디버깅을 위해 RiskGovernor의 evaluateSignal을 프록시하여 거절 사유 출력
-  const originalEvaluate = (engine as any).riskGovernor.evaluateSignal;
-  (engine as any).riskGovernor.evaluateSignal = function(...args: any[]) {
-    const result = originalEvaluate.apply(this, args);
-    if (!result.approved) {
-      console.log(`[Backtest Debug] Signal ${args[0].type} rejected: ${result.rejectionReason || result.reason}`);
-    }
-    return result;
-  };
+  // Rejection-level logging is opt-in; emitting it for every simulated tick
+  // obscures the report and makes multi-scenario comparisons impractical.
+  if (process.env.BACKTEST_DEBUG_REJECTIONS === '1') {
+    const originalEvaluate = (engine as any).riskGovernor.evaluateSignal;
+    (engine as any).riskGovernor.evaluateSignal = function(...args: any[]) {
+      const result = originalEvaluate.apply(this, args);
+      if (!result.approved) console.log(`[Backtest Debug] Signal ${args[0].type} rejected: ${result.rejectionReason || result.reason}`);
+      return result;
+    };
+  }
 
   console.log(`[Backtest] Commencing simulation loop...`);
   
@@ -148,6 +188,12 @@ async function runBacktest() {
         maxDrawdown = drawdown;
       }
     }
+  }
+
+  if (!isVerbose) {
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
   }
 
   console.log(`\n[Backtest] Simulation complete.`);

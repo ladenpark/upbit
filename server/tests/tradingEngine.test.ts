@@ -13,6 +13,7 @@ import { GlobalRiskGovernor } from '../risk/globalRiskGovernor';
 import { PositionManager } from '../position/positionManager';
 import { OrderManager } from '../orders/orderManager';
 import { SecretManager } from '../security/secretManager';
+import { ResearchRecorder } from '../research/researchRecorder';
 import { PositionSnapshot, BotParams, Signal, OrderRecord } from '../types/trading';
 
 let passed = 0;
@@ -71,7 +72,11 @@ async function runAllTests() {
     trendDropSpeedThreshold: 0.6,
     trendDropWindowSeconds: 5,
     cooldownSecondsAfterCut: 60,
-    autoPilotEnabled: true
+    autoPilotEnabled: true,
+    experimentDca2RsiRecoveryEnabled: false,
+    experimentDca2VolumeConfirmationEnabled: false,
+    experimentPyramidRsiGuardEnabled: false,
+    experimentPyramidVolumeConfirmationEnabled: false
   };
 
   const riskGovernor = new GlobalRiskGovernor(defaultParams);
@@ -823,6 +828,26 @@ async function runAllTests() {
   assert(snapAfterCut2.state === 'DEFENSIVE_1', '[Partial Cut] Incremental fill preserves defensive state');
 
   // ──────────────────────────────────────────────────────
+  // TEST GROUP 13-b: Manual Add Isolation & Full-Exit Reset
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 13-b: Manual Add Isolation & Full-Exit Reset');
+
+  const manualAddPosManager = new PositionManager(defaultParams);
+  manualAddPosManager.onInitialEntryFilled(2700000, 1.0, 2650000, 35000, 3.0, 2.0);
+  manualAddPosManager.onManualAdditionalBuyFilled(2600000, 0.2, 2640000, 30000, 3.0, 2.0);
+  const manualAddSnapshot = manualAddPosManager.getSnapshot();
+  assert(manualAddSnapshot.amount === 1.2, '[Manual Add] Added volume is reflected in the open position');
+  assert(manualAddSnapshot.entryPrice === 2683333.33, '[Manual Add] Weighted average is recalculated from the confirmed fill price');
+  assert(manualAddSnapshot.dcaSlots.every((slot) => slot.status === 'AVAILABLE'), '[Manual Add] Automated DCA slots remain untouched');
+  assert(manualAddSnapshot.initialStopPrice !== null && manualAddSnapshot.initialStopPrice <= manualAddSnapshot.entryPrice! * 0.94 + 1, '[Manual Add] Static stop is rebuilt from the new average');
+
+  manualAddPosManager.onPositionClosed(50000, 'MANUAL_FULL_EXIT');
+  const fullExitSnapshot = manualAddPosManager.getSnapshot();
+  assert(fullExitSnapshot.state === 'FLAT' && fullExitSnapshot.amount === 0 && fullExitSnapshot.entryPrice === null, '[Full Exit] Position quantity and entry state are cleared');
+  assert(fullExitSnapshot.dcaSlots.every((slot) => slot.status === 'AVAILABLE') && fullExitSnapshot.partialCutCount === 0, '[Full Exit] DCA slots and partial-cut state are reset');
+  assert(fullExitSnapshot.initialBaseline === null && fullExitSnapshot.initialBand === null && fullExitSnapshot.initialStopPrice === null, '[Full Exit] Price-dependent protective levels are reset');
+
+  // ──────────────────────────────────────────────────────
   // TEST GROUP 14: Breakout 1st Entry (BULL Market Momentum Entry)
   // ──────────────────────────────────────────────────────
   console.log('\n▶ TEST GROUP 14: Breakout 1st Entry in Bullish Momentum');
@@ -973,7 +998,8 @@ async function runAllTests() {
   // [Scenario 4] Dust Guard test: remaining value < 10,000 KRW forces full liquidation
   const dustPos: PositionSnapshot = {
     ...posSnapAfterExit2,
-    amount: 0.003 // 0.003 ETH @ 2,500,000 = 7,500 KRW (< 10,000 KRW dust guard threshold)
+    amount: 0.003, // 0.003 ETH @ 2,500,000 = 7,500 KRW (< 10,000 KRW dust guard threshold)
+    cooldownUntil: 0 // Isolate the dust guard from the full-exit cooldown behavior.
   };
   const dustRiskEval = riskGovernor.evaluateSignal(
     trailingSignal1,
@@ -1331,6 +1357,71 @@ async function runAllTests() {
   assert(fullSignals.length === 1 && fullSignals[0].type === 'BREAKOUT_BUY', '[Scenario 6] Strategy Core emits a BULL breakout when RSI and volume gates pass');
   assert(typeof fullSignals[0]?.indicatorSnapshot.dynamicOrderRatio === 'number', '[Scenario 6] Breakout signal contains numeric dynamicOrderRatio');
   assert(fullSignals[0]?.indicatorSnapshot.dynamicOrderRatio === 20, '[Scenario 6] BULL breakout signal carries dynamicOrderRatio = 20%');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 18: Strategy Lab opt-in filters
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 18: Strategy Lab Opt-in Filters');
+  const labDcaPosition: PositionSnapshot = {
+    ...testPosition,
+    entryPrice: 100,
+    amount: 1,
+    totalCostKrw: 100,
+    initialStopPrice: 90,
+    partialCutCount: 2,
+    dcaSlots: [
+      { slotNumber: 1, status: 'FILLED' },
+      { slotNumber: 2, status: 'AVAILABLE' },
+      { slotNumber: 3, status: 'AVAILABLE' }
+    ]
+  };
+  const recoveryHistory = [96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96.1, 96.2, 96.3, 96.4, 96.5, 96.6, 96.7, 96.7, 96.7, 96.7];
+  const dcaWithoutLabFilter = strategyCore.generateSignals(96.7, 100, 1, defaultParams, labDcaPosition, 0, recoveryHistory, { trend: 'BULL', htfSlope: 0.2 }, 30, 1.2);
+  assert(dcaWithoutLabFilter.some((signal) => signal.id.startsWith('SIG_DCA_2_RECOVERY')), '[Lab] DCA 2 recovery prebuy remains available when all lab filters are OFF');
+  const dcaWithRsiFilter = strategyCore.generateSignals(96.7, 100, 1, { ...defaultParams, experimentDca2RsiRecoveryEnabled: true }, labDcaPosition, 0, recoveryHistory, { trend: 'BULL', htfSlope: 0.2 }, 30, 1.2);
+  assert(!dcaWithRsiFilter.some((signal) => signal.id.startsWith('SIG_DCA_2_RECOVERY')), '[Lab] DCA 2 RSI experiment blocks prebuy when RSI is below 35');
+  const dcaWithVolumeFilter = strategyCore.generateSignals(96.7, 100, 1, { ...defaultParams, experimentDca2VolumeConfirmationEnabled: true }, labDcaPosition, 0, recoveryHistory, { trend: 'BULL', htfSlope: 0.2 }, 50, 1.0);
+  assert(!dcaWithVolumeFilter.some((signal) => signal.id.startsWith('SIG_DCA_2_RECOVERY')), '[Lab] DCA 2 volume experiment blocks prebuy when volume is below 1.05x');
+
+  const labPyramidPosition: PositionSnapshot = {
+    ...testPosition,
+    entryPrice: 2700000,
+    amount: 1,
+    totalCostKrw: 2700000,
+    initialStopPrice: 2500000,
+    partialCutCount: 2,
+    dcaSlots: [{ slotNumber: 1, status: 'FILLED' }, { slotNumber: 2, status: 'FILLED' }, { slotNumber: 3, status: 'FILLED' }],
+    pyramidingCount: 0,
+    trailingActive: false,
+    trailingExitCount: 0
+  };
+  const pyramidWithVolumeFilter = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidVolumeConfirmationEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.0);
+  assert(!pyramidWithVolumeFilter.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid volume experiment blocks add when volume is below 1.15x');
+  const pyramidWithConfirmedVolume = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidVolumeConfirmationEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.2);
+  assert(pyramidWithConfirmedVolume.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid volume experiment permits add when volume is confirmed');
+  const pyramidWithRsiFilter = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidRsiGuardEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 70, 1.2);
+  assert(!pyramidWithRsiFilter.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid RSI experiment blocks an overbought add above RSI 68');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 19: Research Recorder Isolation
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 19: Research Recorder Isolation');
+  const researchRecorder = new ResearchRecorder();
+  researchRecorder.recordTick('KRW-ETH', 3000000, 1700000000000);
+  researchRecorder.recordTick('KRW-ETH', 3000000, 1700000000100); // duplicate ticker noise
+  researchRecorder.recordTick('KRW-ETH', 3001000, 1700000000200);
+  researchRecorder.recordCompletedCandles('KRW-ETH', [{
+    market: 'KRW-ETH', candle_date_time_utc: '2023-11-14T00:00:00', opening_price: 3000000,
+    high_price: 3010000, low_price: 2990000, trade_price: 3001000, timestamp: 1700000000000,
+    candle_acc_trade_volume: 12.34
+  }]);
+  researchRecorder.recordShadowDifference(1700000000000, 'KRW-ETH', 3001000, { rsi: 40, volumeMultiplier: 1.2 }, {
+    baseline: { type: 'DCA_BUY', dcaExecution: 'RECOVERY_PREBUY' },
+    dca2Rsi: { type: null }
+  });
+  const researchStats = researchRecorder.getStats();
+  assert(researchStats.ticksRecorded === 2, '[Research] Duplicate ticker noise is not written repeatedly');
+  assert(researchStats.candlesRecorded === 1 && researchStats.shadowDifferences === 1, '[Research] Completed candle and shadow difference are recorded independently');
 
   // ──────────────────────────────────────────────────────
   // RESULTS

@@ -5,7 +5,9 @@ import {
   BotLifecycleState,
   MarketDataState,
   ApiKeys,
-  NextOrderItem
+  NextOrderItem,
+  Signal,
+  PositionSnapshot
 } from '../types/trading';
 import { SecretManager } from '../security/secretManager';
 import { MarketDataManager } from '../market/marketDataManager';
@@ -16,6 +18,7 @@ import { OrderManager } from '../orders/orderManager';
 import { UpbitClient } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
 import { roundDownToTick } from '../utils/priceUtils';
+import { ResearchRecorder, ResearchDecision } from '../research/researchRecorder';
 
 export class ATREngine {
   // Sub-modules
@@ -27,6 +30,7 @@ export class ATREngine {
   public orderManager: OrderManager;
   private upbitClient: UpbitClient;
   private apiGateway: ApiGateway;
+  private researchRecorder?: ResearchRecorder;
 
   // Bot Lifecycle State
   public botState: BotLifecycleState = 'PAUSED';
@@ -59,7 +63,11 @@ export class ATREngine {
     autoPilotEnabled: true,
     breakoutEntryEnabled: true,
     dryRunMode: false,
-    dailyMaxLossPercent: 5
+    dailyMaxLossPercent: 5,
+    experimentDca2RsiRecoveryEnabled: false,
+    experimentDca2VolumeConfirmationEnabled: false,
+    experimentPyramidRsiGuardEnabled: false,
+    experimentPyramidVolumeConfirmationEnabled: false
   };
 
   // Higher Timeframe (15m) Trend State for Whipsaw Filtering
@@ -91,11 +99,14 @@ export class ATREngine {
   private atrRefreshTimer: NodeJS.Timeout | null = null;
   private balanceSyncTimeout: NodeJS.Timeout | null = null;
 
-  constructor(broadcastCallback?: (payload: any) => void) {
+  constructor(broadcastCallback?: (payload: any) => void, options: { backtest?: boolean } = {}) {
     this.broadcastCallback = broadcastCallback;
     this.secretManager = SecretManager.getInstance();
     this.upbitClient = new UpbitClient();
     this.apiGateway = ApiGateway.getInstance();
+    if (!options.backtest && process.env.NODE_ENV !== 'test') {
+      this.researchRecorder = new ResearchRecorder();
+    }
 
     this.strategyCore = new ATRStrategyCore();
     this.riskGovernor = new GlobalRiskGovernor(this.params);
@@ -165,9 +176,6 @@ export class ATREngine {
 
     this.initDefaultHistory();
 
-    // Fetch initial dynamic ATR from candles
-    this.refreshAtrFromExchange();
-
     // Initialize Market Data Manager with tick dispatcher
     this.marketManager = new MarketDataManager(
       this.params.exchange,
@@ -176,21 +184,24 @@ export class ATREngine {
       (marketState) => {
         console.log(`[ATREngine] Market Feed state changed ➡️ ${marketState}`);
         this.notifyClients();
-      }
+      },
+      !options.backtest
     );
 
-    // Initial account balance load & reconciliation
-    this.reconcileOnStartup();
-
-    // Start periodic background balance sync (every 10s)
-    this.balanceRefreshTimer = setInterval(() => {
-      this.fetchRealAccountBalance();
-    }, 10000);
-
-    // Start periodic background ATR recalculation (every 30s)
-    this.atrRefreshTimer = setInterval(() => {
+    if (!options.backtest) {
+      // Fetch initial dynamic ATR from candles
       this.refreshAtrFromExchange();
-    }, 30000);
+      // Initial account balance load & reconciliation
+      this.reconcileOnStartup();
+      // Start periodic background balance sync (every 10s)
+      this.balanceRefreshTimer = setInterval(() => {
+        this.fetchRealAccountBalance();
+      }, 10000);
+      // Start periodic background ATR recalculation (every 30s)
+      this.atrRefreshTimer = setInterval(() => {
+        this.refreshAtrFromExchange();
+      }, 30000);
+    }
   }
 
   public async reconcileOnStartup() {
@@ -261,10 +272,62 @@ export class ATREngine {
   }
 
   /**
+   * Evaluates the current state against baseline and one-filter-at-a-time
+   * variants. This is intentionally signal-only: it never creates a shadow
+   * position, order, reservation, or exchange request.
+   */
+  private captureShadowDecisions(
+    timestamp: number,
+    price: number,
+    position: PositionSnapshot,
+    dropSpeed: number,
+    historyPrices: number[],
+    activeSignals: Signal[]
+  ) {
+    if (!this.researchRecorder) return;
+
+    const summarize = (signals: Signal[]): ResearchDecision => {
+      const top = [...signals].sort((a, b) => a.priority - b.priority)[0];
+      return top ? { type: top.type, dcaExecution: top.dcaExecution } : { type: null };
+    };
+    const evaluate = (params: BotParams) => summarize(this.strategyCore.generateSignals(
+      price, this.baselineValue, this.atrValue, params, position, dropSpeed,
+      historyPrices, this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa
+    ));
+    const baselineParams: BotParams = {
+      ...this.params,
+      experimentDca2RsiRecoveryEnabled: false,
+      experimentDca2VolumeConfirmationEnabled: false,
+      experimentPyramidRsiGuardEnabled: false,
+      experimentPyramidVolumeConfirmationEnabled: false
+    };
+    const decisions: Record<string, ResearchDecision> = {
+      active: summarize(activeSignals),
+      baseline: evaluate(baselineParams),
+      dca2Rsi: evaluate({ ...baselineParams, experimentDca2RsiRecoveryEnabled: true }),
+      dca2Volume: evaluate({ ...baselineParams, experimentDca2VolumeConfirmationEnabled: true }),
+      pyramidRsi: evaluate({ ...baselineParams, experimentPyramidRsiGuardEnabled: true }),
+      pyramidVolume: evaluate({ ...baselineParams, experimentPyramidVolumeConfirmationEnabled: true })
+    };
+    const uniqueDecisions = new Set(Object.values(decisions).map((decision) => `${decision.type || 'NONE'}:${decision.dcaExecution || ''}`));
+    if (uniqueDecisions.size <= 1) return;
+
+    this.researchRecorder.recordShadowDifference(timestamp, this.params.symbol, price, {
+      rsi: this.rsiValue,
+      volumeMultiplier: this.volumeMultiplier,
+      baseline: this.baselineValue,
+      atr: this.atrValue,
+      marketRegime: this.marketRegime,
+      dropSpeed
+    }, decisions);
+  }
+
+  /**
    * Main Market Tick Dispatcher & Deterministic Decision Loop
    */
   public async handleMarketTick(price: number, timestamp: number) {
     this.currentPrice = price;
+    this.researchRecorder?.recordTick(this.params.symbol, price, timestamp);
 
     // Build price history array for adaptive indicators (computed early for band consistency)
     const historyPrices = this.priceHistory.map((p) => p.price);
@@ -362,6 +425,7 @@ export class ATREngine {
       this.volumeMultiplier,
       this.volumeMa
     );
+    this.captureShadowDecisions(timestamp, price, position, dropSpeed, historyPrices, candidateSignals);
 
     if (candidateSignals.length > 0) {
       console.log(`[ATREngine] 🎯 Signals Generated (${candidateSignals.length}):`, candidateSignals.map((s) => `[${s.type}] ${s.reason}`));
@@ -508,6 +572,23 @@ export class ATREngine {
         amount: effectiveVolume,
         exchange: this.params.exchange,
         reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
+      });
+    } else if (signalType === 'MANUAL_ADD_BUY') {
+      this.positionManager.onManualAdditionalBuyFilled(
+        fillPrice,
+        effectiveVolume,
+        this.baselineValue,
+        this.atrValue,
+        this.params.atrMultiplier,
+        this.params.stopLossMultiplier
+      );
+      this.totalTrades += 1;
+      this.addLog({
+        type: 'BUY',
+        price: fillPrice,
+        amount: effectiveVolume,
+        exchange: this.params.exchange,
+        reason: `${record.reason} [수동 추가 체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()} · DCA 슬롯 보존]`
       });
     } else if (signalType === 'DCA_BUY') {
       if (isIncremental) {
@@ -677,7 +758,7 @@ export class ATREngine {
     // Check if this specific fill was a losing sell
     if (
       signalType !== 'ENTRY_BUY' && signalType !== 'BREAKOUT_BUY' &&
-      signalType !== 'DCA_BUY' && signalType !== 'PYRAMID_BUY' &&
+      signalType !== 'DCA_BUY' && signalType !== 'MANUAL_ADD_BUY' && signalType !== 'PYRAMID_BUY' &&
       signalType !== 'BOX_PYRAMID_BUY' && signalType !== 'REENTRY_BUY'
     ) {
       const entry = position.entryPrice || fillPrice;
@@ -716,6 +797,7 @@ export class ATREngine {
       // 1. Fetch 1-minute candles for immediate ATR & Baseline calculation
       const candles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/1');
       if (candles && candles.length >= 14) {
+        this.researchRecorder?.recordCompletedCandles(this.params.symbol, candles.slice(0, -1));
         let trSum = 0;
         for (let i = 1; i < candles.length; i++) {
           const prevClose = candles[i - 1].trade_price;
@@ -785,7 +867,7 @@ export class ATREngine {
   /**
    * Manual Buy / Sell Dispatcher
    */
-  public async executeManualTrade(side: 'BUY' | 'SELL') {
+  public async executeManualTrade(side: 'BUY' | 'SELL', manualBuyPercent?: number) {
     if (side !== 'BUY' && side !== 'SELL') {
       throw new Error('Unsupported manual order side.');
     }
@@ -809,13 +891,14 @@ export class ATREngine {
 
     if (side === 'BUY') {
       const isAdditional = position.amount > 0 && position.state !== 'FLAT';
-      let targetBudget = exposure.totalCapitalKrw * ((this.params.orderRatio || 25) / 100);
-
-      if (isAdditional) {
-        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');
-        const scale = Math.pow(this.params.safetyOrderVolumeScale, nextSlot ? nextSlot.slotNumber : 1);
-        targetBudget *= scale;
+      if (isAdditional && (position.trailingActive || (position.trailingExitCount || 0) >= 1)) {
+        throw new Error('Manual add blocked: trailing take-profit/distribution is active.');
       }
+      if (manualBuyPercent !== undefined && ![10, 20, 30].includes(manualBuyPercent)) {
+        throw new Error('Manual buy percentage must be one of 10, 20, or 30.');
+      }
+      const selectedPercent = isAdditional ? (manualBuyPercent ?? 10) : (this.params.orderRatio || 25);
+      const targetBudget = exposure.totalCapitalKrw * (selectedPercent / 100);
 
       const budget = Math.floor(Math.min(
         targetBudget,
@@ -832,14 +915,14 @@ export class ATREngine {
         return;
       }
 
-      const signalType = isAdditional ? 'DCA_BUY' : 'ENTRY_BUY';
+      const signalType = isAdditional ? 'MANUAL_ADD_BUY' : 'ENTRY_BUY';
       const req = {
         clientOrderId: `ORD_MANUAL_${signalType}_${Date.now()}`,
         signalId: `SIG_MANUAL_${Date.now()}`,
         symbol: this.params.symbol,
         side: 'BUY' as const,
         requestedAmountKrw: budget,
-        reason: `[수동 매수] 사용자 직접 매수 (${isAdditional ? '추가 매수' : '1차 진입'}, ₩${budget.toLocaleString()})`,
+        reason: `[수동 매수] 사용자 직접 매수 (${isAdditional ? `추가 매수 ${selectedPercent}% · DCA 슬롯 보존` : '1차 진입'}, ₩${budget.toLocaleString()})`,
         createdAt: Date.now()
       };
 
@@ -1307,6 +1390,7 @@ export class ATREngine {
       rsi: this.rsiValue,
       volumeMultiplier: this.volumeMultiplier,
       volumeMa: this.volumeMa,
+      research: this.researchRecorder?.getStats() || { enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, startedAt: 0 },
       currentPrice: this.currentPrice,
       atrValue: this.atrValue,
       baselineValue: this.baselineValue,
