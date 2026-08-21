@@ -70,6 +70,7 @@ export class PositionManager {
       trailingActive: false,
       trailingPeakPrice: null,
       trailingExitCount: 0,
+      profitLockPrice: null,
       cooldownUntil: 0
     };
   }
@@ -138,6 +139,7 @@ export class PositionManager {
     this.position.trailingActive = false;
     this.position.trailingPeakPrice = null;
     this.position.trailingExitCount = 0;
+    this.position.profitLockPrice = null;
 
     this.saveStateToFile();
     console.log(`[PositionManager] Initial Entry Filled: Price=${fillPrice}, Qty=${fillVolume}, Static Absolute Stop Loss locked at ₩${Math.round(staticStopLossPrice).toLocaleString()}`);
@@ -156,6 +158,9 @@ export class PositionManager {
     this.position.entryPrice = newWeightedAvgPrice;
     this.position.totalCostKrw += fillPrice * additionalVolume;
     this.position.lastUpdatedAt = Date.now();
+    if (this.position.pyramidingCount === 1) {
+      this.position.profitLockPrice = Number((newWeightedAvgPrice * 1.001).toFixed(2));
+    }
 
     this.saveStateToFile();
     console.log(`[PositionManager] Additional Entry Filled: Added=${additionalVolume}, New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()}`);
@@ -182,12 +187,43 @@ export class PositionManager {
     if (slot) {
       slot.status = 'FILLED';
       slot.filledPrice = fillPrice;
-      slot.filledVolume = fillVolume;
+      slot.filledVolume = Number(((slot.filledVolume || 0) + fillVolume).toFixed(8));
       slot.filledAt = Date.now();
     }
 
     this.saveStateToFile();
     console.log(`[PositionManager] DCA #${slotNumber} Filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()} (Recycling gates reset to new avg)`);
+  }
+
+  /**
+   * DCA 2차 접근 구간에서 반등을 확인한 뒤 예산 일부만 먼저 체결한다.
+   * 슬롯을 소진하지 않아, -4.2% 재하락 시 같은 2차 슬롯의 잔여 예산을 쓸 수 있다.
+   */
+  public onDcaRecoveryPrebuyFilled(slotNumber: number, fillPrice: number, fillVolume: number, plannedTargetPrice?: number) {
+    const currentQty = this.position.amount;
+    const currentEntry = this.position.entryPrice || fillPrice;
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
+    const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
+
+    this.position.state = 'DCA_MODE';
+    this.position.amount = newTotalQty;
+    this.position.entryPrice = newWeightedAvgPrice;
+    this.position.totalCostKrw += fillPrice * fillVolume;
+    this.position.partialCutCount = 0;
+    this.position.initialStopPrice = Number((newWeightedAvgPrice * 0.94).toFixed(2));
+    this.position.lastUpdatedAt = Date.now();
+
+    const slot = this.position.dcaSlots.find((s) => s.slotNumber === slotNumber);
+    if (slot) {
+      slot.status = 'PARTIALLY_FILLED';
+      slot.filledPrice = fillPrice;
+      slot.filledVolume = Number(((slot.filledVolume || 0) + fillVolume).toFixed(8));
+      slot.filledAt = Date.now();
+      slot.plannedTargetPrice = plannedTargetPrice;
+    }
+
+    this.saveStateToFile();
+    console.log(`[PositionManager] DCA #${slotNumber} recovery pre-buy filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()} (slot remains open)`);
   }
 
   /**
@@ -205,7 +241,7 @@ export class PositionManager {
     this.position.totalCostKrw += fillPrice * additionalVolume;
     this.position.lastUpdatedAt = Date.now();
 
-    const lastFilledSlot = [...this.position.dcaSlots].reverse().find((s) => s.status === 'FILLED');
+    const lastFilledSlot = [...this.position.dcaSlots].reverse().find((s) => s.status === 'FILLED' || s.status === 'PARTIALLY_FILLED');
     if (lastFilledSlot) {
       lastFilledSlot.filledVolume = Number(((lastFilledSlot.filledVolume || 0) + additionalVolume).toFixed(8));
     }
@@ -229,6 +265,13 @@ export class PositionManager {
     this.position.totalCostKrw += fillPrice * fillVolume;
     this.position.lastUpdatedAt = Date.now();
 
+    // 첫 상승 불타기가 체결되면 전체 평단의 왕복 수수료를 넘는 가격을
+    // 수익 보호선으로 고정한다. 이후 상승분을 잃고 손실 포지션으로
+    // 되돌아가는 역피라미딩을 막는다.
+    if (this.position.pyramidingCount === 1) {
+      this.position.profitLockPrice = Number((newWeightedAvgPrice * 1.001).toFixed(2));
+    }
+
     this.saveStateToFile();
     console.log(`[PositionManager] Pyramiding #${this.position.pyramidingCount} Filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()}`);
   }
@@ -247,6 +290,10 @@ export class PositionManager {
     this.position.entryPrice = newWeightedAvgPrice;
     this.position.totalCostKrw += fillPrice * additionalVolume;
     this.position.lastUpdatedAt = Date.now();
+
+    if (this.position.pyramidingCount === 1) {
+      this.position.profitLockPrice = Number((newWeightedAvgPrice * 1.001).toFixed(2));
+    }
 
     this.saveStateToFile();
     console.log(`[PositionManager] Additional Pyramid Volume Filled: Added=${additionalVolume}, New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()}`);
@@ -384,6 +431,7 @@ export class PositionManager {
     this.position.trailingActive = false;
     this.position.trailingPeakPrice = null;
     this.position.trailingExitCount = 0;
+    this.position.profitLockPrice = null;
     this.position.pyramidingCount = 0;
     this.position.boxPyramidCount = 0;
     this.position.lastUpdatedAt = Date.now();

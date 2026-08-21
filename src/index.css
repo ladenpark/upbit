@@ -1,1 +1,17 @@
 @import "tailwindcss";
+
+@layer base {
+  :root {
+    font-family: Inter, Pretendard, "Noto Sans KR", system-ui, sans-serif;
+    color: #0f172a;
+    background: #f1f5f9;
+  }
+
+  button, select, input {
+    font: inherit;
+  }
+
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
+}

@@ -36,6 +36,12 @@ export interface Signal {
   symbol: string;
   price: number;
   reason: string;
+  /** DCA 2차 접근 반등 매수처럼, 해당 DCA 슬롯 예산의 일부만 쓸 때의 비율 */
+  dcaBudgetFraction?: number;
+  /** 부분 집행 DCA 슬롯의 수명주기를 구분한다. */
+  dcaExecution?: 'RECOVERY_PREBUY' | 'COMPLETE_REMAINDER';
+  /** 상승 추세 불타기의 단계별 예산 비율(1차 0.50 Unit, 2차 0.35 Unit) */
+  pyramidBudgetFraction?: number;
   indicatorSnapshot: {
     baseline: number;
     atr: number;
@@ -160,10 +166,12 @@ export interface PositionSnapshot {
   // DCA Slots Lifecycle
   dcaSlots: {
     slotNumber: number;
-    status: 'AVAILABLE' | 'RESERVED' | 'ORDER_PENDING' | 'FILLED' | 'DISABLED';
+    status: 'AVAILABLE' | 'RESERVED' | 'ORDER_PENDING' | 'PARTIALLY_FILLED' | 'FILLED' | 'DISABLED';
     filledPrice?: number;
     filledVolume?: number;
     filledAt?: number;
+    /** DCA 2차 접근 반등 선매수 후에도 유지할 원래의 -4.2% 잔여 집행 가격 */
+    plannedTargetPrice?: number;
   }[];
   pyramidingCount: number;
   maxPyramidingOrders: number;
@@ -173,6 +181,8 @@ export interface PositionSnapshot {
   trailingActive: boolean;
   trailingPeakPrice: number | null;
   trailingExitCount?: number;
+  /** 불타기 1차 후 전체 평단의 수수료 포함 본전 이상을 지키는 보호 가격 */
+  profitLockPrice?: number | null;
   // Cooldown
   cooldownUntil: number;
   cooldownReason?: string;
@@ -223,6 +233,7 @@ export interface NextOrderItem {
   unitPercent: number;
   scaleMultiplier: number;
   targetPriceLabel: string;
+  targetPrice?: number;
   themeColor: 'indigo' | 'emerald' | 'amber' | 'blue' | 'cyan' | 'purple' | 'rose' | 'teal';
 }
 

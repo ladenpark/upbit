@@ -45,7 +45,6 @@ import {
   Compass,
   Power,
   HelpCircle,
-  ChevronRight,
   Gauge
 } from 'lucide-react';
 
@@ -59,6 +58,15 @@ interface TradeLog {
   pnl?: number;
   pnlPercent?: number;
   exchange?: string;
+  timestamp?: number;
+}
+
+interface DailyNetPerformance {
+  date: string;
+  realizedPnl: number;
+  fees: number;
+  netPnl: number;
+  sellCount: number;
 }
 
 interface PricePoint {
@@ -102,6 +110,7 @@ export default function App() {
   const [isTrailingActive, setIsTrailingActive] = useState<boolean>(false);
   const [trailingPeakPrice, setTrailingPeakPrice] = useState<number | null>(null);
   const [trailingExitCount, setTrailingExitCount] = useState<number>(0);
+  const [profitLockPrice, setProfitLockPrice] = useState<number | null>(null);
 
   // Pyramiding & Partial Loss-Cut State
   const [pyramidingEnabled, setPyramidingEnabled] = useState<boolean>(true);
@@ -175,11 +184,14 @@ export default function App() {
       unitPercent: number;
       scaleMultiplier: number;
       targetPriceLabel: string;
+      targetPrice?: number;
       themeColor: any;
     }>;
   } | null>(null);
   const [nextOrderPageIndex, setNextOrderPageIndex] = useState<number>(0);
   const [touchStartX, setTouchStartX] = useState<number | null>(null);
+  const [dailyNetPerformance, setDailyNetPerformance] = useState<DailyNetPerformance[]>([]);
+  const [isDailyPerformanceOpen, setIsDailyPerformanceOpen] = useState(false);
 
   // Live Strategy Radar State & Adaptive Metrics
   const [adaptiveIndicators, setAdaptiveIndicators] = useState<{
@@ -314,6 +326,8 @@ export default function App() {
               if (s.position.trailingActive !== undefined) setIsTrailingActive(s.position.trailingActive);
               if (s.position.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.position.trailingPeakPrice);
               if (s.position.trailingExitCount !== undefined) setTrailingExitCount(s.position.trailingExitCount);
+              if (s.position.profitLockPrice !== undefined) setProfitLockPrice(s.position.profitLockPrice);
+              if (s.position.cooldownUntil !== undefined) setCooldownUntil(s.position.cooldownUntil);
             }
             if (s.safetyOrderCount !== undefined) setSafetyOrderCount(s.safetyOrderCount);
             if (s.pyramidingCount !== undefined) setPyramidingCount(s.pyramidingCount);
@@ -325,6 +339,7 @@ export default function App() {
             if (s.trailingExitCount !== undefined) setTrailingExitCount(s.trailingExitCount);
             if (s.totalRealizedPnl !== undefined) setTotalRealizedPnl(s.totalRealizedPnl);
             if (s.totalFeesPaid !== undefined) setTotalFeesPaid(s.totalFeesPaid);
+            if (s.dailyNetPerformance !== undefined) setDailyNetPerformance(s.dailyNetPerformance);
             if (s.totalTrades !== undefined) setTotalTrades(s.totalTrades);
             if (s.winTrades !== undefined) setWinTrades(s.winTrades);
             if (s.currentPrice !== undefined) setCurrentPrice(s.currentPrice);
@@ -844,6 +859,50 @@ export default function App() {
   const botBadge = getBotStateBadge();
   const posBadge = getPositionStateBadge();
   const mktBadge = getMarketStateBadge();
+  // The backend's order page is derived from the persisted DCA slots. Prefer it
+  // over the UI counter so the radar cannot show a stale DCA stage after a fill.
+  const nextDcaPage = nextOrderInfo?.pages?.find((page) => page.category === 'DCA');
+  const nextDcaMatch = nextDcaPage?.type.match(/DCA #(\d+)차/);
+  const authoritativeNextDcaNumber = nextDcaMatch ? Number(nextDcaMatch[1]) : Math.min(safetyOrderCount + 1, 3);
+  const authoritativeNextDcaLabel = nextDcaPage?.targetPriceLabel;
+  // Compatibility fallback for a server that predates dailyNetPerformance.
+  // Sell logs include gross PnL, fill price, volume and PnL %, allowing both
+  // sides' 0.05% fee to be estimated until the FIFO server summary arrives.
+  const fallbackDailyPerformance = (() => {
+    const days = new Map<string, DailyNetPerformance>();
+    for (const log of logs) {
+      if (log.pnl === undefined || !log.amount || !log.timestamp) continue;
+      const pnlRate = (log.pnlPercent || 0) / 100;
+      const estimatedEntryPrice = pnlRate > -0.999 ? log.price / (1 + pnlRate) : log.price;
+      const estimatedFees = (estimatedEntryPrice + log.price) * log.amount * 0.0005;
+      const date = new Date(log.timestamp).toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+      const day = days.get(date) || { date, realizedPnl: 0, fees: 0, netPnl: 0, sellCount: 0 };
+      day.realizedPnl += log.pnl;
+      day.fees += estimatedFees;
+      day.netPnl += log.pnl - estimatedFees;
+      day.sellCount += 1;
+      days.set(date, day);
+    }
+    return [...days.values()]
+      .map((day) => ({ ...day, realizedPnl: Math.round(day.realizedPnl), fees: Math.round(day.fees), netPnl: Math.round(day.netPnl) }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+  })();
+  const resolvedDailyPerformance = dailyNetPerformance.length > 0 ? dailyNetPerformance : fallbackDailyPerformance;
+  const isEstimatedDailyPerformance = dailyNetPerformance.length === 0 && fallbackDailyPerformance.length > 0;
+  const dailyPerformanceByDate = new Map(resolvedDailyPerformance.map((day) => [day.date, day]));
+  const recentPerformanceDates = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - index);
+    return date.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+  });
+  const recentDailyPerformance = recentPerformanceDates.map((date) => dailyPerformanceByDate.get(date) || {
+    date, realizedPnl: 0, fees: 0, netPnl: 0, sellCount: 0
+  });
+  const olderDailyPerformance = resolvedDailyPerformance.filter((day) => !recentPerformanceDates.includes(day.date));
+  const displayedTotalRealizedPnl = resolvedDailyPerformance.length > 0
+    ? resolvedDailyPerformance.reduce((sum, day) => sum + day.netPnl, 0)
+    : totalRealizedPnl;
 
   return (
     <div className="h-[100dvh] sm:min-h-screen bg-slate-100 flex flex-col items-center justify-center sm:p-4 text-slate-900 font-['Plus_Jakarta_Sans',sans-serif] overflow-hidden sm:overflow-auto">
@@ -925,15 +984,15 @@ export default function App() {
             {/* Quick Bot Main Power Toggle Button */}
             <button
               onClick={handleToggleBot}
-              className={`px-2.5 py-1 rounded-xl text-[10px] font-black flex items-center gap-1 shadow-2xs transition cursor-pointer active:scale-95 ${
+              aria-label={isBotActive ? '자동 매매 일시정지' : '자동 매매 시작'}
+              className={`grid h-8 w-8 place-items-center rounded-xl shadow-2xs transition cursor-pointer active:scale-95 ${
                 isBotActive
                   ? 'bg-emerald-500 text-white hover:bg-emerald-600 ring-2 ring-emerald-300'
                   : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
               }`}
               title={isBotActive ? '자동 매매 가동 중 (클릭 시 일시정지)' : '자동 매매 정지 중 (클릭 시 가동 시작)'}
             >
-              <Power className="w-3 h-3" />
-              <span>{isBotActive ? '가동 ON' : '봇 시작'}</span>
+              <Power className="w-4 h-4" />
             </button>
 
             {/* Symbol Selector (Upbit) */}
@@ -985,7 +1044,7 @@ export default function App() {
           {activeTab === 'chart' && (
             <>
               {/* PWA Install Banner */}
-              {!isStandalone && (
+              {false && !isStandalone && (
                 <div className="bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 px-3.5 py-2.5 rounded-2xl text-white shadow-sm flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
                     <div className="w-8 h-8 rounded-xl bg-white/20 backdrop-blur-sm flex items-center justify-center shrink-0">
@@ -1035,7 +1094,7 @@ export default function App() {
               )}
 
               {/* AI Auto-Pilot Regime Status Card */}
-              <div className={`p-3 rounded-2xl border transition-all ${
+              <div className={`px-3.5 py-3 rounded-2xl border transition-all ${
                 marketRegime === 'BULL'
                   ? 'bg-gradient-to-r from-emerald-950 to-slate-900 text-white border-emerald-500/40 shadow-xs'
                   : marketRegime === 'BEAR'
@@ -1052,18 +1111,18 @@ export default function App() {
                     <div>
                       <div className="flex items-center gap-1.5">
                         <span className="text-xs font-extrabold">
-                          {marketRegime === 'BULL' && '🟢 대세 상승 국면 (BULL)'}
-                          {marketRegime === 'BEAR' && '🔴 대세 하락 국면 (BEAR)'}
-                          {marketRegime === 'SIDEWAYS' && '🟡 박스권 횡보 국면 (SIDEWAYS)'}
+                          {marketRegime === 'BULL' && '상승 국면'}
+                          {marketRegime === 'BEAR' && '하락 국면'}
+                          {marketRegime === 'SIDEWAYS' && '횡보 국면'}
                         </span>
                         <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-white/20 font-bold uppercase">
                           Auto-Pilot {autoPilotEnabled ? 'ON' : 'OFF'}
                         </span>
                       </div>
                       <div className="text-[10px] text-slate-300 mt-0.5">
-                        {marketRegime === 'BULL' && '코인 60% 비중 확대 + 상승 불타기 및 최고가 익절 가동'}
-                        {marketRegime === 'BEAR' && '현금 80% 안전 세이브 + 극단적 바닥 매수 모드 가동'}
-                        {marketRegime === 'SIDEWAYS' && '코인 35% : 현금 65% + 박스권 단타 회전 매매 가동'}
+                        {marketRegime === 'BULL' && '돌파·추세 추적 중심'}
+                        {marketRegime === 'BEAR' && '진입 규모를 낮추고 방어 우선'}
+                        {marketRegime === 'SIDEWAYS' && '짧은 진입과 익절 중심'}
                       </div>
                     </div>
                   </div>
@@ -1082,25 +1141,71 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Asset & Position Cards */}
-              <div className="grid grid-cols-2 gap-2">
-                <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs flex flex-col justify-between">
-                  <div>
-                    <div className="text-[10px] font-semibold text-slate-400">총 자산 (Equity)</div>
-                    <div className="text-sm font-extrabold mono text-slate-900 mt-1">
-                      {formatPrice(currentEquity)}
+              {/* Position action summary: explain why the bot is waiting without duplicating the radar. */}
+              {(() => {
+                const hasPosition = positionAmount > 0;
+                const dcaSteps = [2, 4.2, 5.5];
+                const nextDcaStep = dcaSteps[Math.min(authoritativeNextDcaNumber - 1, dcaSteps.length - 1)];
+                const nextDcaPrice = (entryPrice || currentPrice) * (1 - nextDcaStep / 100);
+                const isCoolingDown = remainingCooldown > 0;
+                const isDefensive = positionLifecycleState.startsWith('DEFENSIVE');
+                const headline = !hasPosition
+                  ? '신규 진입 조건 확인 중'
+                  : isCoolingDown
+                  ? `방어 쿨다운 ${remainingCooldown}초`
+                  : awaitingReentry || positionLifecycleState === 'REENTRY_ALLOWED'
+                  ? '재진입 조건 확인 중'
+                  : isDefensive
+                  ? '방어 상태 · 다음 대응 대기'
+                  : '포지션 운용 중';
+
+                return (
+                  <div className="rounded-2xl border border-slate-200 bg-white px-3.5 py-3 shadow-2xs">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">현재 전략 상태</p>
+                        <p className="mt-0.5 truncate text-sm font-bold text-slate-900">{headline}</p>
+                      </div>
+                      <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-bold ${
+                        isCoolingDown ? 'bg-amber-100 text-amber-800' : isDefensive ? 'bg-rose-100 text-rose-700' : 'bg-indigo-100 text-indigo-700'
+                      }`}>
+                        {positionLifecycleState}
+                      </span>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-2 border-t border-slate-100 pt-2 text-[10px]">
+                      <div>
+                        <p className="text-slate-400">다음 행동</p>
+                        <p className="mt-0.5 font-semibold text-slate-700">
+                          {hasPosition ? (authoritativeNextDcaNumber <= dcaSteps.length ? `DCA ${authoritativeNextDcaNumber}차` : '손절선·익절선 감시') : '첫 진입 감시'}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-slate-400">기준 가격</p>
+                        <p className="mt-0.5 font-semibold mono text-slate-700">
+                          {hasPosition && authoritativeNextDcaNumber <= dcaSteps.length ? (authoritativeNextDcaLabel || formatPrice(nextDcaPrice)) : '조건 레이더 참조'}
+                        </p>
+                      </div>
                     </div>
                   </div>
-                  <div className={`text-[10px] font-bold mt-1.5 pt-1.5 border-t border-slate-100 ${totalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-                    실현손익: {totalRealizedPnl >= 0 ? '+' : ''}{formatPrice(totalRealizedPnl)} ({totalTrades}회 매매)
+                );
+              })()}
+
+              {/* Asset & Position Cards */}
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-white px-3.5 py-3 rounded-2xl border border-slate-200 shadow-2xs">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">총 자산</div>
+                  <div className="text-[15px] font-extrabold mono text-slate-900 mt-1">
+                      {formatPrice(currentEquity)}
+                  </div>
+                  <div className={`mt-2 text-[10px] font-semibold ${displayedTotalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    실현 {displayedTotalRealizedPnl >= 0 ? '+' : ''}{formatPrice(displayedTotalRealizedPnl)}
                   </div>
                 </div>
 
-                {/* Current Position Card (Prominent Entry Price & 1-Decimal Qty) */}
-                <div className="bg-white p-3 rounded-2xl border border-indigo-200/80 shadow-2xs flex flex-col justify-between">
+                <div className="bg-white px-3.5 py-3 rounded-2xl border border-indigo-200/80 shadow-2xs">
                   <div>
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-extrabold text-indigo-950 uppercase tracking-wide">내 포지션</span>
+                      <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">내 포지션</span>
                       {awaitingReentry ? (
                         <span className="text-[9px] font-black text-cyan-700 bg-cyan-100 px-1.5 py-0.5 rounded-md animate-pulse flex items-center gap-0.5">
                           🎯 바닥 재매수 대기
@@ -1133,29 +1238,26 @@ export default function App() {
                     </div>
 
                     {positionAmount > 0 ? (
-                      <div className="mt-1">
-                        <div className="flex items-baseline gap-1">
-                          <span className="text-[10px] font-bold text-slate-400">평단</span>
-                          <span className="text-sm font-black mono text-indigo-700 tracking-tight">
+                      <div className="mt-1.5">
+                        <div className="text-[15px] font-extrabold mono text-indigo-700 tracking-tight">
                             {formatPrice(entryPrice || currentPrice)}
-                          </span>
                         </div>
-                        <div className="text-[10px] text-slate-500 font-mono font-medium mt-0.5">
-                          보유: <strong className="text-slate-800 font-extrabold">{positionAmount.toFixed(1)} ETH</strong> (약 ₩{Math.round(positionAmount * currentPrice).toLocaleString()})
+                        <div className="text-[10px] text-slate-500 font-medium mt-1">
+                          {positionAmount.toFixed(4)} {selectedCoin.replace('KRW-', '')}
                         </div>
                       </div>
                     ) : (
                       <div className="mt-1">
-                        <div className="text-xs font-extrabold text-slate-600">무포지션 (FLAT)</div>
-                        <div className="text-[10px] text-slate-400 mt-0.5">1차 저점/돌파 진입 대기 중</div>
+                        <div className="text-[15px] font-extrabold text-slate-700">무포지션</div>
+                        <div className="text-[10px] text-slate-400 mt-1">진입 조건 대기</div>
                       </div>
                     )}
                   </div>
 
-                  <div className={`text-[10.5px] font-extrabold mt-1.5 pt-1.5 border-t border-slate-100 flex items-center justify-between ${
+                  <div className={`text-[10px] font-semibold mt-2 pt-2 border-t border-slate-100 flex items-center justify-between ${
                     unrealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'
                   }`}>
-                    <span className="text-[9.5px] text-slate-400 font-medium">평가손익</span>
+                    <span className="text-slate-400 font-medium">평가</span>
                     <span className="mono">
                       {positionAmount > 0 ? (
                         `${unrealizedPnl >= 0 ? '+' : ''}${formatPrice(unrealizedPnl)} (${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}%)`
@@ -1169,6 +1271,31 @@ export default function App() {
 
               {/* Swipeable Next Order Unit & Target Budget Card */}
               {(() => {
+                const next = nextOrderInfo?.pages?.[0] || nextOrderInfo || {
+                  type: positionAmount > 0 ? '다음 추가 매수' : '첫 진입 대기',
+                  budgetKrw: currentEquity * ((orderRatio || 20) / 100),
+                  unitPercent: orderRatio || 20,
+                  targetPriceLabel: positionAmount > 0 ? '다음 DCA 또는 추세 조건 충족 시' : '저점 또는 돌파 조건 충족 시'
+                };
+                const isExit = String(next.type).includes('익절') || String(next.type).includes('매도');
+                return (
+                  <button onClick={() => setActiveTab('radar')} className="w-full rounded-2xl border border-slate-200 bg-white px-3.5 py-3 text-left shadow-2xs transition hover:border-indigo-200 active:scale-[0.99]">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">NEXT ACTION</p>
+                        <p className="mt-0.5 truncate text-sm font-bold text-slate-900">{next.type}</p>
+                        <p className="mt-1 truncate text-[11px] text-slate-500">{next.targetPriceLabel}</p>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        <p className={`text-sm font-extrabold mono ${isExit ? 'text-emerald-600' : 'text-indigo-600'}`}>{formatPrice(next.budgetKrw || 0)}</p>
+                        <p className="mt-1 text-[10px] text-slate-400">조건 레이더 보기 →</p>
+                      </div>
+                    </div>
+                  </button>
+                );
+              })()}
+
+              {false && (() => {
                 const pages = nextOrderInfo?.pages && nextOrderInfo.pages.length > 0
                   ? nextOrderInfo.pages
                   : [
@@ -1322,51 +1449,24 @@ export default function App() {
                 );
               })()}
 
-              {/* Quick Jump to Live Strategy Conditions Radar Tab */}
-              <button
-                onClick={() => setActiveTab('radar')}
-                className="w-full p-2.5 rounded-2xl bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 border border-slate-700/80 text-white flex items-center justify-between shadow-xs hover:border-cyan-400/60 active:scale-98 transition cursor-pointer group"
-              >
-                <div className="flex items-center gap-2">
-                  <div className="p-1 rounded-lg bg-cyan-500/20 text-cyan-300 border border-cyan-400/30">
-                    <Crosshair className="w-4 h-4 animate-spin" style={{ animationDuration: '8s' }} />
-                  </div>
-                  <div className="text-left">
-                    <div className="text-[11px] font-extrabold text-slate-100 flex items-center gap-1.5">
-                      <span>실시간 매매 조건 레이더</span>
-                      <span className="px-1.5 py-0.2 rounded-md bg-cyan-500/20 text-cyan-300 text-[8.5px] font-bold border border-cyan-500/30">
-                        LIVE
-                      </span>
-                    </div>
-                    <div className="text-[9.5px] text-slate-400">
-                      진입/익절/손절 9대 규칙 실시간 목표가 & 충족 상태 확인
-                    </div>
-                  </div>
-                </div>
-                <div className="flex items-center gap-1 text-[10px] font-bold text-cyan-400 group-hover:translate-x-0.5 transition-transform">
-                  <span>보기</span>
-                  <ChevronRight className="w-3.5 h-3.5" />
-                </div>
-              </button>
-
               {/* Real-time Canvas Chart */}
-              <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">
+              <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5">
                     <BarChart2 className="w-3.5 h-3.5 text-blue-600" />
-                    <span className="text-xs font-bold text-slate-800">ATR 밴드 실시간 시세</span>
+                    <span className="text-xs font-bold text-slate-800">실시간 시세</span>
                   </div>
                   <div className="flex items-center gap-1.5 text-[9px] font-semibold flex-wrap justify-end">
-                    <span className="text-emerald-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>익절선</span>
-                    <span className="text-indigo-600 flex items-center gap-0.5"><span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>매수선</span>
-                    <span className="px-1.5 py-0.5 rounded-md bg-rose-50 border border-rose-200/80 text-rose-600 font-extrabold flex items-center gap-1 shadow-2xs">
+                    <span className="text-emerald-600">상단</span>
+                    <span className="text-indigo-600">기준선</span>
+                    <span className="px-1.5 py-0.5 rounded-md bg-rose-50 border border-rose-200/80 text-rose-600 font-extrabold">
                       <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
                       손절: {formatPrice(calculatedStopLoss)} ({stopLossPercent >= 0 ? '+' : ''}{stopLossPercent.toFixed(1)}%)
                     </span>
                   </div>
                 </div>
 
-                <div className="relative w-full h-[220px] bg-slate-50/80 rounded-xl border border-slate-200 overflow-hidden">
+                <div className="relative w-full h-[240px] bg-slate-50/80 rounded-xl border border-slate-200 overflow-hidden">
                   <canvas ref={canvasRef} className="w-full h-full block" />
                   <div className="absolute top-1.5 left-2 text-[9px] text-slate-400 mono flex items-center gap-1">
                     <Radio className="w-3 h-3 text-emerald-500 animate-pulse" />
@@ -1382,7 +1482,7 @@ export default function App() {
                   <button
                     onClick={requestManualBuyConfirm}
                     disabled={balance < 5000}
-                    className="py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition cursor-pointer"
+                    className="py-2.5 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-[0.98] transition cursor-pointer"
                   >
                     <ArrowUpRight className="w-3.5 h-3.5" />
                     <span>{positionAmount > 0 ? '수동 추가 매수' : '수동 매수 (BUY)'}</span>
@@ -1390,7 +1490,7 @@ export default function App() {
                   <button
                     onClick={requestManualSellConfirm}
                     disabled={positionAmount === 0}
-                    className="py-2 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-98 transition cursor-pointer"
+                    className="py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white font-bold text-xs flex items-center justify-center gap-1 shadow-2xs active:scale-[0.98] transition cursor-pointer"
                   >
                     <ArrowDownRight className="w-3.5 h-3.5" />
                     <span>전량 청산 (SELL)</span>
@@ -1398,8 +1498,8 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Bot Control Card */}
-              <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-2xs flex items-center justify-between">
+              {/* The primary bot control lives in the persistent header. */}
+              {false && <div className="bg-white p-3.5 rounded-2xl border border-slate-200 shadow-2xs flex items-center justify-between">
                 <div>
                   <div className="text-xs font-extrabold text-slate-900">ATR 자동 트레이딩 봇</div>
                   <div className="text-[10px] text-slate-500 mt-0.5">
@@ -1417,7 +1517,7 @@ export default function App() {
                   {isBotActive ? <Square className="w-3.5 h-3.5 fill-white" /> : <Play className="w-3.5 h-3.5 fill-white" />}
                   <span>{isBotActive ? '봇 정지' : '봇 가동 (ON)'}</span>
                 </button>
-              </div>
+              </div>}
 
               {/* Mini Log Feed */}
               <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">
@@ -1463,6 +1563,113 @@ export default function App() {
           {activeTab === 'radar' && (
             <div className="space-y-3 animate-in fade-in duration-150">
               {(() => {
+                const dynamicAtr = adaptiveIndicators?.dynamicAtr || (marketRegime === 'BULL' ? 1.8 : marketRegime === 'BEAR' ? 3.5 : 2.4);
+                const effectiveAtr = Math.max(atrValue, Math.max(5000, Math.round(currentPrice * 0.0025)));
+                const upperBand = baselineValue + effectiveAtr * (autoPilotEnabled ? dynamicAtr : atrMultiplier);
+                const lowerBand = baselineValue - effectiveAtr * (autoPilotEnabled ? dynamicAtr : atrMultiplier);
+                const hasPosition = positionAmount > 0;
+                const entry = entryPrice || currentPrice;
+                const scalpTarget = entry * (1 + (adaptiveIndicators?.dynamicScalpTakeProfitPercent || 0.5) / 100);
+                const trailingArm = Math.max(upperBand, entry * 1.01);
+                const effectiveTrailingCallback = pyramidingCount >= 2
+                  ? Math.min(adaptiveIndicators?.dynamicTrailingCallback || trailingCallbackPercent, 0.6)
+                  : (adaptiveIndicators?.dynamicTrailingCallback || trailingCallbackPercent);
+                const trailingExit = Math.max((trailingPeakPrice || currentPrice) * (1 - effectiveTrailingCallback / 100), entry * 1.002);
+                // In SIDEWAYS mode the scalp target is a full exit.  When it
+                // comes before the trailing arming price, trailing cannot
+                // execute for this position unless the scalp condition is
+                // bypassed by a regime/state change.
+                const scalpPrecedesTrailing = hasPosition && marketRegime === 'SIDEWAYS' && !isTrailingActive && scalpTarget <= trailingArm;
+                const dcaSteps = [2.0, 4.2, 5.5];
+                const nextDca = nextDcaPage?.targetPrice || entry * (1 - (dcaSteps[Math.min(authoritativeNextDcaNumber - 1, 2)] || 5.5) / 100);
+                const dca2ApproachPrice = entry * 0.965;
+                const dca2ApproachFloor = entry * 0.9585;
+                const recentRadarPrices = priceHistory.slice(-20).map((point) => point.price);
+                const dca2RecoveryLow = Math.min(currentPrice, ...(recentRadarPrices.length ? recentRadarPrices : [currentPrice]));
+                const dca2RecoveryBounce = dca2RecoveryLow > 0 ? ((currentPrice - dca2RecoveryLow) / dca2RecoveryLow) * 100 : 0;
+                const dca2RecoveryLowDrop = entry > 0 ? ((entry - dca2RecoveryLow) / entry) * 100 : 0;
+                const isDca2ApproachWindow = authoritativeNextDcaNumber === 2 && dca2RecoveryLowDrop >= 3.5 && dca2RecoveryLowDrop <= 4.15 && unrealizedPnlPercent <= -2.5;
+                const isDca2RecoveryReady = isDca2ApproachWindow && dca2RecoveryBounce >= 0.7 && (adaptiveIndicators?.slope || 0) >= 0.05;
+                const isDca2Remainder = authoritativeNextDcaNumber === 2 && nextDcaPage?.type.includes('잔여 매수');
+                const isBreakoutReady = !hasPosition && currentPrice > baselineValue && (marketRegime === 'BULL' || (adaptiveIndicators?.slope || 0) >= 0.1) && rsiValue <= 68 && volumeMultiplier >= 1.15;
+                const isEmergency = hasPosition && currentPrice < lowerBand && dropSpeed <= -Math.abs(trendDropSpeedThreshold);
+                const status = (active: boolean, enabled = true) => active ? '발동' : enabled ? '대기' : '꺼짐';
+                const tone = (active: boolean, enabled = true) => active ? 'bg-emerald-500 text-white border-emerald-500' : enabled ? 'bg-white text-slate-500 border-slate-200' : 'bg-slate-50 text-slate-400 border-slate-100';
+                const buyRows = hasPosition ? [
+                  authoritativeNextDcaNumber === 2
+                    ? {
+                        label: isDca2Remainder ? 'DCA 2차 잔여 60%' : 'DCA 2차 접근 반등',
+                        detail: isDca2Remainder
+                          ? `${formatPrice(nextDca)} 이하에서 잔여 60%`
+                          : `${formatPrice(dca2ApproachPrice)}~${formatPrice(dca2ApproachFloor)} 터치 후 저점 +0.7% · 기울기 +0.05% 시 40%`,
+                        active: dcaEnabled && (isDca2Remainder ? currentPrice <= nextDca : isDca2RecoveryReady),
+                        enabled: dcaEnabled,
+                        icon: '↓'
+                      }
+                    : { label: `DCA ${authoritativeNextDcaNumber}차`, detail: authoritativeNextDcaLabel || `${formatPrice(nextDca)} 이하`, active: dcaEnabled && currentPrice <= nextDca, enabled: dcaEnabled, icon: '↓' },
+                  { label: pyramidingCount >= 2 ? '상승 불타기 완료' : `상승 불타기 ${pyramidingCount + 1}차`, detail: marketRegime === 'BULL' ? `평단 +${(pyramidingStepPercent * (pyramidingCount + 1)).toFixed(1)}% · ${pyramidingCount === 0 ? '0.50' : '0.35'} Unit` : '상승 국면에서만', active: false, enabled: pyramidingEnabled && marketRegime === 'BULL' && pyramidingCount < 2, icon: '↑' },
+                  { label: '재진입', detail: awaitingReentry ? '급락 안정 확인 중' : '방어 매도 후 활성화', active: awaitingReentry, enabled: true, icon: '↺' }
+                ] : [
+                  { label: '저점 매수', detail: `${formatPrice(lowerBand)} 이하`, active: currentPrice <= lowerBand, enabled: true, icon: '↓' },
+                  { label: '돌파 매수', detail: `RSI ${rsiValue.toFixed(0)} · 거래량 ${volumeMultiplier.toFixed(2)}x`, active: isBreakoutReady, enabled: true, icon: '↑' },
+                  { label: '반등 확인', detail: `기준선 ${formatPrice(baselineValue)} 아래`, active: false, enabled: autoPilotEnabled, icon: '↗' }
+                ];
+                const sellRows = [
+                  { label: '단기 익절', detail: hasPosition ? `${formatPrice(scalpTarget)} · 전량 매도` : '포지션 진입 후 활성화', active: hasPosition && marketRegime === 'SIDEWAYS' && currentPrice >= scalpTarget, enabled: hasPosition, icon: '◎' },
+                  { label: '트레일링 익절', detail: isTrailingActive ? `${formatPrice(trailingExit)} 이탈 · 콜백 ${effectiveTrailingCallback.toFixed(1)}%` : scalpPrecedesTrailing ? `단기 익절(${formatPrice(scalpTarget)}) 우선 실행` : `${formatPrice(trailingArm)} 도달 시 무장`, active: isTrailingActive, enabled: trailingStopEnabled && hasPosition && !scalpPrecedesTrailing, statusOverride: scalpPrecedesTrailing ? '후순위' : undefined, icon: '⌁' },
+                  { label: '불타기 수익 보호', detail: profitLockPrice ? `${formatPrice(profitLockPrice)} 이탈 시 전량 청산` : '불타기 1차 체결 후 활성화', active: Boolean(profitLockPrice && currentPrice <= profitLockPrice), enabled: Boolean(profitLockPrice), icon: '⌑' },
+                  { label: '급락 방어', detail: `하단 이탈 + ${trendDropSpeedThreshold.toFixed(1)}% 급락`, active: isEmergency, enabled: trendAwareCutEnabled && hasPosition, icon: '!' },
+                  { label: '절대 손절', detail: hasPosition ? `${formatPrice(calculatedStopLoss)} · 전량` : '포지션 진입 후 활성화', active: hasPosition && currentPrice <= calculatedStopLoss, enabled: hasPosition, icon: '×' }
+                ];
+                const visibleRows = activeRadarTab === 'BUY' ? buyRows : activeRadarTab === 'SELL' ? sellRows : [...buyRows.slice(0, 2), ...sellRows.slice(0, 2)];
+
+                return (
+                  <div className="space-y-3">
+                    <section className="rounded-2xl bg-slate-900 px-4 py-3.5 text-white shadow-sm">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-[10px] font-semibold tracking-wide text-slate-400">CONDITION RADAR</p>
+                          <h2 className="mt-0.5 text-sm font-bold">지금 봐야 할 조건만</h2>
+                          <p className="mt-1 text-[11px] text-slate-300">{hasPosition ? `평가 ${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}% · ${marketRegime}` : `무포지션 · ${marketRegime}`}</p>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-right text-[10px] text-slate-300">
+                          <span>RSI <b className="text-white">{rsiValue.toFixed(0)}</b></span>
+                          <span>Vol <b className="text-white">{volumeMultiplier.toFixed(2)}x</b></span>
+                          <span className="col-span-2">밴드 {formatPrice(lowerBand)} — {formatPrice(upperBand)}</span>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex rounded-xl bg-white/10 p-1 text-[11px] font-semibold">
+                        {([['ALL', '핵심'], ['BUY', '매수'], ['SELL', '매도']] as const).map(([key, label]) => (
+                          <button key={key} onClick={() => setActiveRadarTab(key)} className={`flex-1 rounded-lg py-1.5 transition ${activeRadarTab === key ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-300'}`}>{label}</button>
+                        ))}
+                      </div>
+                    </section>
+
+                    <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xs">
+                      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+                        <span className="text-xs font-bold text-slate-900">{activeRadarTab === 'SELL' ? '청산 · 방어 조건' : activeRadarTab === 'BUY' ? '진입 · 추가매수 조건' : '핵심 조건'}</span>
+                        <span className="text-[10px] text-slate-400">현재가 {formatPrice(currentPrice)}</span>
+                      </div>
+                      <div className="divide-y divide-slate-100">
+                        {visibleRows.map((row) => (
+                          <div key={row.label} className="flex items-center gap-3 px-4 py-3">
+                            <span className={`grid h-7 w-7 place-items-center rounded-full text-xs font-bold ${row.active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{row.icon}</span>
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-semibold text-slate-800">{row.label}</div>
+                              <div className="mt-0.5 truncate text-[11px] text-slate-500">{row.detail}</div>
+                            </div>
+                            <span className={`rounded-full border px-2 py-1 text-[10px] font-bold ${tone(row.active, row.enabled)}`}>{('statusOverride' in row ? row.statusOverride : undefined) || status(row.active, row.enabled)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+
+                    <p className="px-1 text-center text-[10px] leading-4 text-slate-400">조건은 거래소 체결·위험관리 승인 후에만 주문으로 전환됩니다.</p>
+                  </div>
+                );
+              })()}
+
+              {false && (() => {
                 const dynamicAtrMult = adaptiveIndicators?.dynamicAtr || (marketRegime === 'BULL' ? 1.8 : marketRegime === 'BEAR' ? 3.5 : 2.4);
                 const dynamicScalpMult = adaptiveIndicators?.dynamicScalpBandMultiplier || (marketRegime === 'BULL' ? 1.0 : marketRegime === 'BEAR' ? 1.4 : 1.0);
                 const dynamicScalpTp = adaptiveIndicators?.dynamicScalpTakeProfitPercent || (adaptiveIndicators?.volatilityRatio && adaptiveIndicators.volatilityRatio > 2.0 ? 0.70 : 0.40);
@@ -2128,7 +2335,7 @@ export default function App() {
                     </span>
                   </div>
                   <p className="text-[10.5px] text-slate-300 leading-snug">
-                    시장 추세 기울기와 변동성을 연속 계산하여 <strong>ATR({atrMultiplier.toFixed(1)}x)</strong>, <strong>진입비중({orderRatio}%)</strong>, <strong>DCA간격(-{safetyOrderStepPercent.toFixed(1)}%)</strong>을 실시간 <strong>미세조정</strong> 중입니다.
+                    최근 가격 데이터가 충분하면 국면별 고정 자동값을 사용합니다. 상승/횡보/하락 순으로 <strong>ATR 1.8× / 2.4× / 3.5×</strong>, <strong>진입 비중 20% / 18% / 10%</strong>가 적용됩니다. 아래 수동값은 오토파일럿을 끈 경우에만 주문에 반영됩니다.
                   </p>
                 </div>
               )}
@@ -2161,7 +2368,7 @@ export default function App() {
                 {/* ATR Multiplier Slider */}
                 <div className="space-y-1.5">
                   <div className="flex justify-between text-xs font-bold">
-                    <span className="text-slate-700">ATR 밴드 배수</span>
+                    <span className="text-slate-700">ATR 밴드 배수 <span className="font-medium text-slate-400">(수동 모드)</span></span>
                     <span className="text-blue-600 mono">{atrMultiplier.toFixed(1)}x</span>
                   </div>
                   <input
@@ -2171,7 +2378,8 @@ export default function App() {
                     step="0.1"
                     value={atrMultiplier}
                     onChange={(e) => handleParamsChange({ atrMultiplier: parseFloat(e.target.value) })}
-                    className="w-full accent-blue-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
+                    disabled={autoPilotEnabled}
+                    className="w-full accent-blue-600 cursor-pointer disabled:cursor-not-allowed h-2 bg-slate-200 rounded-lg appearance-none"
                   />
                   <div className="flex justify-between text-[10px] text-slate-400">
                     <span>1.0x (타이트)</span>
@@ -2183,7 +2391,7 @@ export default function App() {
                 {/* Order Ratio Slider */}
                 <div className="space-y-1.5">
                   <div className="flex justify-between text-xs font-bold">
-                    <span className="text-slate-700">1회 진입 비중</span>
+                    <span className="text-slate-700">1회 진입 비중 <span className="font-medium text-slate-400">(수동 모드)</span></span>
                     <span className="text-blue-600 mono">{orderRatio}%</span>
                   </div>
                   <input
@@ -2193,7 +2401,8 @@ export default function App() {
                     step="5"
                     value={orderRatio}
                     onChange={(e) => handleParamsChange({ orderRatio: parseInt(e.target.value) })}
-                    className="w-full accent-blue-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
+                    disabled={autoPilotEnabled}
+                    className="w-full accent-blue-600 cursor-pointer disabled:cursor-not-allowed h-2 bg-slate-200 rounded-lg appearance-none"
                   />
                   <div className="flex justify-between text-[10px] text-slate-400">
                     <span>5% (분할)</span>
@@ -2262,7 +2471,8 @@ export default function App() {
                       step="0.1"
                       value={trailingCallbackPercent}
                       onChange={(e) => handleParamsChange({ trailingCallbackPercent: parseFloat(e.target.value) })}
-                      className="w-full accent-emerald-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
+                      disabled={autoPilotEnabled}
+                      className="w-full accent-emerald-600 cursor-pointer disabled:cursor-not-allowed h-2 bg-slate-200 rounded-lg appearance-none"
                     />
                     <div className="flex justify-between text-[10px] text-slate-400">
                       <span>0.3% (빠른익절)</span>
@@ -2270,7 +2480,7 @@ export default function App() {
                       <span>2.5% (여유)</span>
                     </div>
                     <p className="text-[10px] text-slate-500 bg-emerald-50/60 p-2 rounded-xl border border-emerald-100">
-                      💡 상단 밴드 돌파 후 계속 오르면 끝까지 들고 가다가, <strong>최고점에서 -{trailingCallbackPercent}% 꺾일 때</strong> 최고가 근처에서 전량 익절합니다.
+                      💡 평단 대비 최소 +1.0%와 상단 밴드를 모두 넘으면 추적을 시작합니다. 첫 꺾임 매도는 <strong>50%</strong>, 다음 꺾임 때 잔량을 전량 매도합니다. 오토파일럿 ON에서는 콜백이 변동성에 따라 <strong>0.8% 또는 1.2%</strong>로 자동 적용됩니다.
                     </p>
                   </div>
                 )}
@@ -2310,7 +2520,7 @@ export default function App() {
                       <input
                         type="range"
                         min="1"
-                        max="5"
+                        max="2"
                         step="1"
                         value={maxSafetyOrders}
                         onChange={(e) => handleParamsChange({ maxSafetyOrders: parseInt(e.target.value) })}
@@ -2318,34 +2528,13 @@ export default function App() {
                       />
                       <div className="flex justify-between text-[10px] text-slate-400">
                         <span>1회 (소극적)</span>
-                        <span>3회 (표준)</span>
-                        <span>5회 (공격적)</span>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <div className="flex justify-between text-xs font-bold">
-                        <span className="text-slate-700">물타기 하락 간격 (Step %)</span>
-                        <span className="text-indigo-600 mono">-{safetyOrderStepPercent.toFixed(1)}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1.0"
-                        max="5.0"
-                        step="0.5"
-                        value={safetyOrderStepPercent}
-                        onChange={(e) => handleParamsChange({ safetyOrderStepPercent: parseFloat(e.target.value) })}
-                        className="w-full accent-indigo-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
-                      />
-                      <div className="flex justify-between text-[10px] text-slate-400">
-                        <span>-1.0% (촘촘하게)</span>
-                        <span>-2.0% (추천)</span>
-                        <span>-5.0% (넓게)</span>
+                        <span>2회</span>
+                        <span>3회 (최대)</span>
                       </div>
                     </div>
 
                     <p className="text-[10px] text-slate-500 bg-indigo-50/60 p-2 rounded-xl border border-indigo-100">
-                      💡 1차 매수 후 <strong>-{safetyOrderStepPercent}% 하락할 때마다</strong> 최대 {maxSafetyOrders}회까지 평단가를 낮춰 반등 시 쉽게 탈출합니다.
+                      💡 DCA 기준은 고정입니다: <strong>1차 -2.0% · 2차 접근 반등 -3.5%~-4.15% · 2차 본 기준 -4.2% · 3차 -5.5%</strong>. 2차는 접근 구간을 터치한 뒤 최근 저점 대비 <strong>+0.7% 반등</strong>, 단기 기울기 <strong>+0.05% 이상</strong>, 그리고 현재가가 평단 대비 <strong>-2.5% 이하</strong>일 때 2차 예산의 <strong>40%</strong>를 먼저 매수합니다. 이후 -4.2% 도달 시 남은 <strong>60%</strong>만 집행합니다. 각 단계의 총 주문 금액은 기본 주문의 1.5× · 2.0× · 1.5×입니다.
                     </p>
                   </div>
                 )}
@@ -2394,7 +2583,7 @@ export default function App() {
                       <div className="flex justify-between text-[10px] text-slate-400">
                         <span>1회 (신중)</span>
                         <span>2회 (표준)</span>
-                        <span>3회 (공격적)</span>
+                        <span>2회 (한도)</span>
                       </div>
                     </div>
 
@@ -2420,7 +2609,7 @@ export default function App() {
                     </div>
 
                     <p className="text-[10px] text-slate-500 bg-amber-50/60 p-2 rounded-xl border border-amber-100">
-                      💡 1차 매수 후 <strong>+{pyramidingStepPercent}% 이상 오르면</strong> 추가 매수(불타기)하여 물량을 늘리고 트레일링 익절로 초대형 수익을 노립니다.
+                      💡 상승장(BULL)에서만 작동합니다. 기본 진입은 오토파일럿 기준 <strong>20%</strong>이며, 불타기는 평단 <strong>+{pyramidingStepPercent.toFixed(1)}%에서 0.50 Unit</strong>, <strong>+{(pyramidingStepPercent * 2).toFixed(1)}%에서 0.35 Unit</strong>까지만 허용됩니다. 1차 체결 뒤에는 전체 평단 +0.1% 보호선이 생기고, 2차 체결 뒤에는 추가 매수가 차단되며 트레일링 콜백은 최대 <strong>0.6%</strong>로 조여집니다. 횡보장 오토파일럿은 별도 고정 규칙으로 평단 +0.25%에서 최대 2회, 각 0.5 Unit씩 추가 매수합니다.
                     </p>
                   </div>
                 )}
@@ -2452,50 +2641,8 @@ export default function App() {
 
                 {partialLossCutEnabled && (
                   <div className="space-y-3 pt-1">
-                    <div className="space-y-1.5">
-                      <div className="flex justify-between text-xs font-bold">
-                        <span className="text-slate-700">부분 손절 비중</span>
-                        <span className="text-purple-600 mono">{partialLossCutPercent}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="20"
-                        max="60"
-                        step="5"
-                        value={partialLossCutPercent}
-                        onChange={(e) => handleParamsChange({ partialLossCutPercent: parseInt(e.target.value) })}
-                        className="w-full accent-purple-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
-                      />
-                      <div className="flex justify-between text-[10px] text-slate-400">
-                        <span>20% (소량회수)</span>
-                        <span>40% (추천)</span>
-                        <span>60% (절반이상)</span>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <div className="flex justify-between text-xs font-bold">
-                        <span className="text-slate-700">발동 하락률 기준</span>
-                        <span className="text-purple-600 mono">-{partialLossCutThreshold.toFixed(1)}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="2.0"
-                        max="6.0"
-                        step="0.5"
-                        value={partialLossCutThreshold}
-                        onChange={(e) => handleParamsChange({ partialLossCutThreshold: parseFloat(e.target.value) })}
-                        className="w-full accent-purple-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
-                      />
-                      <div className="flex justify-between text-[10px] text-slate-400">
-                        <span>-2.0% (빠른순환)</span>
-                        <span>-3.5% (권장)</span>
-                        <span>-6.0% (깊은하락)</span>
-                      </div>
-                    </div>
-
                     <p className="text-[10px] text-slate-500 bg-purple-50/60 p-2 rounded-xl border border-purple-100">
-                      💡 물타기 소진 후 <strong>-{partialLossCutThreshold}% 하락 시</strong> 물량의 {partialLossCutPercent}%만 분할 매도하여 현금을 회수하고, <strong>더 낮은 바닥에서 다시 물타기를 재개</strong>합니다.
+                      💡 고정 방어 규칙입니다. 평단 대비 <strong>-1.0%에서 30%</strong>, 이후 <strong>-3.2%에서 남은 물량의 50%</strong>를 매도합니다. DCA 소진 여부와 무관하며, 부분손절 뒤 60초 쿨다운을 둡니다.
                     </p>
                   </div>
                 )}
@@ -2529,27 +2676,27 @@ export default function App() {
                   <div className="space-y-3 pt-1">
                     <div className="space-y-1.5">
                       <div className="flex justify-between text-xs font-bold">
-                        <span className="text-slate-700">급락 감지 민감도 (하락 속도)</span>
-                        <span className="text-cyan-600 mono">-{trendDropSpeedThreshold.toFixed(1)}% / 틱</span>
+                        <span className="text-slate-700">급락 감지 민감도 <span className="font-medium text-slate-400">(3초 창)</span></span>
+                        <span className="text-cyan-600 mono">-{trendDropSpeedThreshold.toFixed(1)}% / 3초</span>
                       </div>
                       <input
                         type="range"
-                        min="0.3"
-                        max="1.5"
+                        min="0.1"
+                        max="3.0"
                         step="0.1"
                         value={trendDropSpeedThreshold}
                         onChange={(e) => handleParamsChange({ trendDropSpeedThreshold: parseFloat(e.target.value) })}
                         className="w-full accent-cyan-600 cursor-pointer h-2 bg-slate-200 rounded-lg appearance-none"
                       />
                       <div className="flex justify-between text-[10px] text-slate-400">
-                        <span>0.3% (매우 민감)</span>
-                        <span>0.6% (표준 추천)</span>
-                        <span>1.5% (둔감)</span>
+                        <span>0.1% (매우 민감)</span>
+                        <span>1.8% (기본)</span>
+                        <span>3.0% (둔감)</span>
                       </div>
                     </div>
 
                     <p className="text-[10px] text-slate-500 bg-cyan-50/60 p-2 rounded-xl border border-cyan-100">
-                      💡 하단 밴드 이탈 및 <strong>급락 가속도(-{trendDropSpeedThreshold}%)</strong> 포착 시, 현금이 남아있어도 물량의 40%를 <strong>선제적 조기 손절</strong>하여 현금을 지키고, <strong>급락이 멈추고 바닥 지지가 확인될 때 세이브된 현금으로 재매수</strong>합니다.
+                      💡 최근 3초 변동률이 <strong>-{trendDropSpeedThreshold.toFixed(1)}%</strong> 이하이고 하단 밴드를 이탈하면 보유 물량의 40%를 매도합니다. 이후 재매수는 별도 바닥 지지 조건이 충족될 때만 가능합니다.
                     </p>
                   </div>
                 )}
@@ -2644,8 +2791,8 @@ export default function App() {
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-slate-100">
                     <span className="text-slate-500">누적 실현 순손익 (수수료 차감 후)</span>
-                    <span className={`font-bold mono ${totalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-                      {totalRealizedPnl >= 0 ? '+' : ''}{formatPrice(totalRealizedPnl)}
+                    <span className={`font-bold mono ${displayedTotalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                      {displayedTotalRealizedPnl >= 0 ? '+' : ''}{formatPrice(displayedTotalRealizedPnl)}
                     </span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-slate-100">
@@ -2660,6 +2807,46 @@ export default function App() {
                     <span className="text-slate-500">승률 (Win Rate)</span>
                     <span className="font-bold mono text-emerald-600">{winRate}%</span>
                   </div>
+                </div>
+
+                <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50/70">
+                  <button
+                    onClick={() => setIsDailyPerformanceOpen((open) => !open)}
+                    className="flex w-full items-center justify-between px-3 py-2.5 text-left"
+                    aria-expanded={isDailyPerformanceOpen}
+                  >
+                    <span>
+                      <span className="block text-xs font-bold text-slate-800">일별 순손익</span>
+                      <span className="mt-0.5 block text-[10px] text-slate-400">
+                        {isEstimatedDailyPerformance ? '체결 로그 기반 수수료 추정치' : '실현손익에서 매수·매도 수수료를 차감'}
+                      </span>
+                    </span>
+                    <span className="text-[11px] font-semibold text-blue-600">{isDailyPerformanceOpen ? '접기 ↑' : '최근 7일 보기 ↓'}</span>
+                  </button>
+
+                  {isDailyPerformanceOpen && (
+                    <div className="border-t border-slate-200 bg-white px-3 py-2">
+                      <div className="mb-1 flex items-center justify-between text-[10px] text-slate-400">
+                        <span>최근 7일 · 아래로 스크롤하면 이전 기록</span>
+                        <span>순손익</span>
+                      </div>
+                      <div className="max-h-64 divide-y divide-slate-100 overflow-y-auto overscroll-contain pr-1">
+                        {[...recentDailyPerformance, ...olderDailyPerformance].map((day) => (
+                          <div key={day.date} className="flex items-center justify-between gap-3 py-2 text-[11px]">
+                            <div>
+                              <p className="font-medium text-slate-700">{day.date}</p>
+                              <p className="mt-0.5 text-[10px] text-slate-400">
+                                실현 {day.realizedPnl >= 0 ? '+' : ''}{formatPrice(day.realizedPnl)} · 수수료 -{formatPrice(day.fees)} · 매도 {day.sellCount}건
+                              </p>
+                            </div>
+                            <span className={`shrink-0 font-bold mono ${day.netPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                              {day.netPnl >= 0 ? '+' : ''}{formatPrice(day.netPnl)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 

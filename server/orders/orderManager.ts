@@ -16,7 +16,8 @@ export class OrderManager {
   private upbitClient: UpbitClient;
   private apiGateway: ApiGateway;
   private riskGovernor?: GlobalRiskGovernor;
-  private onOrderUpdated?: (record: OrderRecord, prevFilledVolume: number) => void;
+  /** Watcher consumers receive only the newly filled amount, never cumulative volume. */
+  private onOrderUpdated?: (record: OrderRecord, incrementalFilledVolume: number) => void;
   private lastApiKeys?: ApiKeys;
   private orders: Map<string, OrderRecord> = new Map();
   private processedSignalIds: Set<string> = new Set();
@@ -25,7 +26,7 @@ export class OrderManager {
 
   constructor(
     riskGovernor?: GlobalRiskGovernor,
-    onOrderUpdated?: (record: OrderRecord, prevFilledVolume: number) => void
+    onOrderUpdated?: (record: OrderRecord, incrementalFilledVolume: number) => void
   ) {
     this.upbitClient = new UpbitClient();
     this.apiGateway = ApiGateway.getInstance();
@@ -40,7 +41,7 @@ export class OrderManager {
     this.riskGovernor = governor;
   }
 
-  public setOnOrderUpdated(cb: (record: OrderRecord, prevFilledVolume: number) => void) {
+  public setOnOrderUpdated(cb: (record: OrderRecord, incrementalFilledVolume: number) => void) {
     this.onOrderUpdated = cb;
   }
 
@@ -427,7 +428,7 @@ export class OrderManager {
       this.watchingOrderIds.delete(record.id);
       if (newlyFilledVolume > 0) {
         if (source === 'WATCHER') {
-          this.onOrderUpdated?.(incrementalRecord, 0);
+          this.onOrderUpdated?.(incrementalRecord, newlyFilledVolume);
         } else {
           onFilled(incrementalRecord);
         }
@@ -436,7 +437,7 @@ export class OrderManager {
       this.watchingOrderIds.add(record.id);
       if (newlyFilledVolume > 0) {
         if (source === 'WATCHER') {
-          this.onOrderUpdated?.(incrementalRecord, 0);
+          this.onOrderUpdated?.(incrementalRecord, newlyFilledVolume);
         } else {
           onFilled(incrementalRecord);
         }
@@ -446,7 +447,7 @@ export class OrderManager {
       // reservation.  A CANCELLED order is terminal, not a full fill.
       if (newlyFilledVolume > 0) {
         if (source === 'WATCHER') {
-          this.onOrderUpdated?.(incrementalRecord, 0);
+          this.onOrderUpdated?.(incrementalRecord, newlyFilledVolume);
         } else {
           onFilled(incrementalRecord);
         }

@@ -39,7 +39,7 @@ function validateConfig(payload: unknown): Partial<BotParams> {
     atrMultiplier: [0.1, 20], orderRatio: [0, 100], stopLossMultiplier: [0.1, 20],
     maxExposurePercent: [1, 100], maxSafetyOrders: [0, 10], safetyOrderStepPercent: [0.1, 50],
     safetyOrderVolumeScale: [0.1, 10], trailingCallbackPercent: [0.1, 20],
-    maxPyramidingOrders: [0, 10], pyramidingStepPercent: [0.1, 50], partialLossCutPercent: [1, 100],
+    maxPyramidingOrders: [0, 2], pyramidingStepPercent: [0.1, 50], partialLossCutPercent: [1, 100],
     partialLossCutThreshold: [0.1, 100], trendDropSpeedThreshold: [0.1, 100],
     trendDropWindowSeconds: [1, 60], cooldownSecondsAfterCut: [0, 86400], dailyMaxLossPercent: [0.1, 100]
   };

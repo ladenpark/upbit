@@ -535,17 +535,17 @@ async function runAllTests() {
 
   let watcherEventCount = 0;
   let watcherReceivedVolume = 0;
-  let watcherReceivedPrev = 0;
+  let watcherReceivedIncrement = 0;
 
   const testPosManager = new PositionManager(defaultParams);
   const scenarioGovernor = new GlobalRiskGovernor(defaultParams);
   const testOrderManager = new OrderManager(
     scenarioGovernor,
-    (updatedRecord, prevVolume) => {
+    (updatedRecord, incrementalVolume) => {
       watcherEventCount++;
       watcherReceivedVolume = updatedRecord.filledVolume;
-      watcherReceivedPrev = prevVolume;
-      const added = updatedRecord.filledVolume - prevVolume;
+      watcherReceivedIncrement = incrementalVolume;
+      const added = incrementalVolume;
       if (updatedRecord.signalType === 'ENTRY_BUY') {
         const snap = testPosManager.getSnapshot();
         if (snap.amount > 0 && snap.state !== 'FLAT') {
@@ -712,7 +712,7 @@ async function runAllTests() {
 
   assert(scenarioBFilledCalls === 1, '[Scenario B - Step 2] submit-flow onFilled was NOT called again');
   assert(watcherEventCount === 1, '[Scenario B - Step 2] Watcher onOrderUpdated called exactly 1 time');
-  assert(watcherReceivedVolume === 1.0 && watcherReceivedPrev === 0.4, '[Scenario B - Step 2] Watcher received total 1.0 ETH (prev: 0.4 ETH, added: 0.6 ETH)');
+  assert(watcherReceivedVolume === 0.6 && watcherReceivedIncrement === 0.6, '[Scenario B - Step 2] Watcher received only the incremental 0.6 ETH fill');
   assert(testPosManager.getSnapshot().amount === 1.0, '[Scenario B - Step 2] PositionManager updated with exact added 0.6 ETH -> total 1.0 ETH (No duplicate inflation)');
   assert(testOrderManager.getWatchingOrderIdsCount() === 0, '[Scenario B - Step 2] Order removed from watcher queue upon FILLED');
 
@@ -769,7 +769,7 @@ async function runAllTests() {
   );
 
   assert(watcherEventCount === 1, '[Scenario C] Startup reconcile triggered onOrderUpdated exactly 1 time');
-  assert(watcherReceivedVolume === 1.0 && watcherReceivedPrev === 0, '[Scenario C] Startup reconcile received 1.0 ETH added');
+  assert(watcherReceivedVolume === 1.0 && watcherReceivedIncrement === 1.0, '[Scenario C] Startup reconcile received 1.0 ETH added');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 13: Non-Entry Signal Incremental Fill Protection (DCA, Pyramid, Cut)
@@ -949,7 +949,7 @@ async function runAllTests() {
   assert(posSnapAfterExit1.trailingActive === false, '[Scenario 2] trailingActive is disarmed to false after partial exit');
   assert(posSnapAfterExit1.trailingPeakPrice === null, '[Scenario 2] trailingPeakPrice is reset to null to require fresh higher high');
 
-  // [Scenario 3] 2nd Trailing partial exit on remaining 0.5 ETH -> sells 0.25 ETH, 0.25 ETH remains
+  // [Scenario 3] The second trailing exit liquidates all remaining quantity.
   const riskEval2 = riskGovernor.evaluateSignal(
     trailingSignal1,
     'RUNNING',
@@ -961,13 +961,13 @@ async function runAllTests() {
     0
   );
   assert(riskEval2.approved === true, '[Scenario 3] 2nd TRAILING_STOP_EXIT is approved');
-  assert(riskEval2.calculatedVolume === 0.25, '[Scenario 3] Exactly 50% volume (0.25 ETH) calculated for 0.5 ETH position');
+  assert(riskEval2.calculatedVolume === 0.5, '[Scenario 3] Second trailing exit sells the full remaining 0.5 ETH');
 
-  const pnl2 = (3100000 - 2800000) * 0.25; // +75,000 KRW
-  partialTrailingPosManager.onTrailingPartialFilled(0.25, 3100000, pnl2);
+  const pnl2 = (3100000 - 2800000) * 0.5; // +150,000 KRW
+  partialTrailingPosManager.onTrailingPartialFilled(0.5, 3100000, pnl2);
   const posSnapAfterExit2 = partialTrailingPosManager.getSnapshot();
-  assert(posSnapAfterExit2.amount === 0.25, '[Scenario 3] Position amount is exactly 0.25 ETH remaining after 2nd partial exit');
-  assert(posSnapAfterExit2.realizedPnl === 175000, '[Scenario 3] Realized PnL is now ₩175,000');
+  assert(posSnapAfterExit2.amount === 0, '[Scenario 3] Position is fully closed after the 2nd trailing exit');
+  assert(posSnapAfterExit2.realizedPnl === 250000, '[Scenario 3] Realized PnL is now ₩250,000');
   assert(posSnapAfterExit2.trailingActive === false && posSnapAfterExit2.trailingPeakPrice === null, '[Scenario 3] Trailing state remains cleanly disarmed');
 
   // [Scenario 4] Dust Guard test: remaining value < 10,000 KRW forces full liquidation
@@ -989,7 +989,6 @@ async function runAllTests() {
   assert(dustRiskEval.calculatedVolume === 0.003, '[Scenario 4] Dust guard forced 100% full liquidation (0.003 ETH instead of 0.0015 ETH)');
 
   // When 0.003 is sold, position becomes FLAT
-  partialTrailingPosManager.onTrailingPartialFilled(0.25, 3200000, 100000); // close remaining 0.25
   const finalSnap = partialTrailingPosManager.getSnapshot();
   assert(finalSnap.amount === 0, '[Scenario 4] Position amount becomes 0');
   assert(finalSnap.state === 'FLAT', '[Scenario 4] Position state transitions to FLAT');
@@ -1004,7 +1003,7 @@ async function runAllTests() {
   assert(emgFullEval.approved === true && emgFullEval.calculatedVolume === 1.0, '[Scenario 5] EMERGENCY_FULL_EXIT remains 100% full exit (1.0 ETH)');
 
   const partLossEval = riskGovernor.evaluateSignal({ ...trailingSignal1, type: 'PARTIAL_LOSS_CUT', priority: 4 }, 'RUNNING', 'LIVE', 5000000, fullPosSnap, 2500000, [], 0);
-  assert(partLossEval.approved === true && partLossEval.calculatedVolume === 0.4, '[Scenario 5] PARTIAL_LOSS_CUT remains 40% partial exit (0.4 ETH)');
+  assert(partLossEval.approved === true && partLossEval.calculatedVolume === 0.3, '[Scenario 5] First PARTIAL_LOSS_CUT sells 30% (0.3 ETH)');
 
   const emgTrendEval = riskGovernor.evaluateSignal({ ...trailingSignal1, type: 'EMERGENCY_TREND_CUT', priority: 2 }, 'RUNNING', 'LIVE', 5000000, fullPosSnap, 2500000, [], 0);
   assert(emgTrendEval.approved === true && emgTrendEval.calculatedVolume === 0.4, '[Scenario 5] EMERGENCY_TREND_CUT remains 40% emergency cut (0.4 ETH)');
@@ -1032,7 +1031,7 @@ async function runAllTests() {
   const pyramidStrategyCore = new ATRStrategyCore();
   const baseBullHistory = Array.from({ length: 20 }, (_, i) => 2600000 + i * 10000); // strong upward slope
 
-  // [Scenario 7] BULL market with trailingActive=true -> PYRAMID_BUY is generated when pnl >= 1.5%
+  // [Scenario 7] Once trailing is armed, additional pyramiding is blocked.
   const armedBullPosition: PositionSnapshot = {
     ...posSnap1,
     entryPrice: 2700000,
@@ -1065,8 +1064,7 @@ async function runAllTests() {
   );
 
   const pyramidSignal = signalsBull.find((s) => s.type === 'PYRAMID_BUY');
-  assert(pyramidSignal !== undefined, '[Scenario 7] PYRAMID_BUY generated in BULL market even when trailingActive=true');
-  assert(pyramidSignal?.priority === 6, '[Scenario 7] PYRAMID_BUY signal priority is 6');
+  assert(pyramidSignal === undefined, '[Scenario 7] PYRAMID_BUY is blocked while trailingActive=true');
 
   // [Scenario 8] SIDEWAYS or BEAR market -> PYRAMID_BUY is strictly blocked
   const sidewaysHistory = Array.from({ length: 20 }, () => 2700000); // flat slope
@@ -1225,14 +1223,14 @@ async function runAllTests() {
   assert(autoPilotOffEval.approved === true, '[Scenario 3] AutoPilot OFF ENTRY_BUY is approved');
   assert(autoPilotOffEval.calculatedBudgetKrw === 2500000, `[Scenario 3] AutoPilot OFF strictly preserves user static orderRatio (25% = ₩2,500,000) ignoring dynamicRatio (was: ₩${autoPilotOffEval.calculatedBudgetKrw?.toLocaleString()})`);
 
-  // [Scenario 4] DCA_BUY: dynamicOrderRatio (SIDEWAYS 18%) multiplied by safetyOrderVolumeScale (1.2^slot)
+  // [Scenario 4] DCA_BUY: dynamicOrderRatio (SIDEWAYS 18%) multiplied by the fixed slot-2 scale (2.0 Unit)
   const sidewaysDcaPos: PositionSnapshot = {
     ...testPosition,
     amount: 1.0, // 1.0 ETH @ 2,700,000 = 2,700,000 KRW
     entryPrice: 2800000,
     dcaSlots: [
       { slotNumber: 1, status: 'FILLED' },
-      { slotNumber: 2, status: 'AVAILABLE' }, // Slot 2 -> scale = 1.2^2 = 1.44
+      { slotNumber: 2, status: 'AVAILABLE' }, // Slot 2 -> fixed 2.0 Unit
       { slotNumber: 3, status: 'AVAILABLE' }
     ]
   };
@@ -1261,9 +1259,9 @@ async function runAllTests() {
     0
   );
 
-  // Expected DCA budget: TotalCapital (10,000,000) * 0.18 * (1.2^2 = 1.44) = 2,592,000 KRW
+  // Expected DCA budget: TotalCapital (10,000,000) * 0.18 * 2.0 = 3,600,000 KRW
   assert(dcaRiskEvalTest17.approved === true, '[Scenario 4] DCA_BUY approved with dynamic ratio & slot scaling');
-  assert(dcaRiskEvalTest17.calculatedBudgetKrw === 2592000, `[Scenario 4] DCA_BUY budget correctly scaled: ₩10M * 18% * 1.44 = ₩2,592,000 (was: ₩${dcaRiskEvalTest17.calculatedBudgetKrw?.toLocaleString()})`);
+  assert(dcaRiskEvalTest17.calculatedBudgetKrw === 3600000, `[Scenario 4] DCA_BUY budget correctly scaled: ₩10M * 18% * 2.0 = ₩3,600,000 (was: ₩${dcaRiskEvalTest17.calculatedBudgetKrw?.toLocaleString()})`);
 
   // [Scenario 5] Strict Clamp: targetBudget clamped to 98% KRW balance and remainingAllowableExposure
   // Test 98% cash balance clamp on 99% dynamic ratio (Flat position, 1M capital):
@@ -1316,7 +1314,8 @@ async function runAllTests() {
   assert(maxExpClampedEval.approved === true, '[Scenario 5] Near max exposure order approved within allowable remaining');
   assert(maxExpClampedEval.calculatedBudgetKrw === 400000, `[Scenario 5] Clamped to remaining allowable exposure: ₩400,000 (was: ₩${maxExpClampedEval.calculatedBudgetKrw?.toLocaleString()})`);
 
-  // [Scenario 6] Full compilation and end-to-end signal generator output contains dynamicOrderRatio
+  // [Scenario 6] A BULL breakout meeting the RSI and volume gates emits a
+  // complete signal containing the regime-aware order ratio.
   const fullSignals = pyramidStrategyCore.generateSignals(
     2750000,
     2650000,
@@ -1325,11 +1324,13 @@ async function runAllTests() {
     cleanFlatPos,
     0.01,
     baseBullHistory,
-    { trend: 'BULL', htfSlope: 0.5 }
+    { trend: 'BULL', htfSlope: 0.5 },
+    55,
+    1.2
   );
-  assert(fullSignals.length > 0, '[Scenario 6] Strategy Core generates signals successfully');
-  assert(typeof fullSignals[0].indicatorSnapshot.dynamicOrderRatio === 'number', '[Scenario 6] Signal contains numeric dynamicOrderRatio');
-  assert(fullSignals[0].indicatorSnapshot.dynamicOrderRatio === 20, '[Scenario 6] BULL signal carries dynamicOrderRatio = 20%');
+  assert(fullSignals.length === 1 && fullSignals[0].type === 'BREAKOUT_BUY', '[Scenario 6] Strategy Core emits a BULL breakout when RSI and volume gates pass');
+  assert(typeof fullSignals[0]?.indicatorSnapshot.dynamicOrderRatio === 'number', '[Scenario 6] Breakout signal contains numeric dynamicOrderRatio');
+  assert(fullSignals[0]?.indicatorSnapshot.dynamicOrderRatio === 20, '[Scenario 6] BULL breakout signal carries dynamicOrderRatio = 20%');
 
   // ──────────────────────────────────────────────────────
   // RESULTS

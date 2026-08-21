@@ -179,6 +179,22 @@ export class ATRStrategyCore {
     // --- Rule 1: Absolute Stop Loss (Priority 1) ---
     // Uses position's static initialStopPrice snapshot if available (-6.0% absolute floor)
     const stopLossPrice = position.initialStopPrice || (entryPrice * 0.94);
+    const profitLockPrice = position.profitLockPrice || 0;
+    if (hasPosition && profitLockPrice > 0 && currentPrice <= profitLockPrice) {
+      signals.push({
+        id: `SIG_PROFIT_LOCK_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'PYRAMID_PROFIT_LOCK',
+        type: 'ABSOLUTE_STOP_EXIT',
+        priority: 1,
+        symbol: params.symbol,
+        price: currentPrice,
+        reason: `[불타기 수익 보호 청산] 1차 불타기 후 보호선(₩${Math.round(profitLockPrice).toLocaleString()}) 이탈 ➡️ 전체 평단 수수료 포함 본전 이상 보호`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
     if (hasPosition && (currentPrice <= stopLossPrice || pnlPercent <= -6.0)) {
       signals.push({
         id: `SIG_STOP_${now}`,
@@ -290,7 +306,10 @@ export class ATRStrategyCore {
 
     // --- Rule 4: Trailing Take Profit (Priority 3) ---
     if (hasPosition && params.trailingStopEnabled) {
-      const effectiveCallback = params.autoPilotEnabled ? adaptive.dynamicTrailingCallback : params.trailingCallbackPercent;
+      const baseCallback = params.autoPilotEnabled ? adaptive.dynamicTrailingCallback : params.trailingCallbackPercent;
+      // 2차 불타기까지 체결된 후에는 상단에서의 추가 매수를 금지하고,
+      // 수익 되돌림을 줄이기 위해 콜백을 0.6%로 더 타이트하게 고정한다.
+      const effectiveCallback = position.pyramidingCount >= 2 ? Math.min(baseCallback, 0.6) : baseCallback;
       
       if (position.trailingActive && position.trailingPeakPrice) {
         const peakPrice = position.trailingPeakPrice;
@@ -345,11 +364,53 @@ export class ATRStrategyCore {
       const dropFromEntry = ((entryPrice - currentPrice) / entryPrice) * 100;
       
       // Find next available DCA slot
-      const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');
+      // A partially-filled slot is intentionally kept open: DCA 2차의 접근 반등
+      // 선매수(40%) 뒤, 본래 -4.2%에서 남은 60%를 같은 슬롯으로 집행한다.
+      const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
       if (nextSlot) {
         // Slot 1: -2.0% (1차 30% 덜어낸 후 저점 추매) | Slot 2: -4.2% (2차 50% 덜어낸 후 저점 추매) | Slot 3: -5.5%
         const slotDropTarget = nextSlot.slotNumber === 1 ? 2.0 : nextSlot.slotNumber === 2 ? 4.2 : 5.5;
-        if (dropFromEntry >= slotDropTarget) {
+        const slotTargetPrice = nextSlot.status === 'PARTIALLY_FILLED' && nextSlot.plannedTargetPrice
+          ? nextSlot.plannedTargetPrice
+          : entryPrice * (1 - slotDropTarget / 100);
+
+        // DCA 2차 접근 반등 선매수: -3.5%~-4.15%에서 최근 20틱 저점 대비
+        // 0.7% 이상 회복하고 단기 추세가 전환될 때에만, 2차 예산의 40%를 집행한다.
+        // 단순히 -3.5%를 통과했다고 매수하지 않으므로 하락 중 추격 매수를 피한다.
+        const recentWindow = priceHistory.slice(-20);
+        const recoveryLow = Math.min(currentPrice, ...(recentWindow.length ? recentWindow : [currentPrice]));
+        const reboundFromLow = recoveryLow > 0 ? ((currentPrice - recoveryLow) / recoveryLow) * 100 : 0;
+        const recoveryLowDrop = entryPrice > 0 ? ((entryPrice - recoveryLow) / entryPrice) * 100 : 0;
+        const isDca2RecoveryWindow =
+          nextSlot.slotNumber === 2 &&
+          nextSlot.status === 'AVAILABLE' &&
+          recoveryLowDrop >= 3.5 &&
+          recoveryLowDrop <= 4.15 &&
+          // 반등이 너무 진행된 뒤의 추격 매수를 막는다. 저점 -3.5%에서
+          // +0.7% 반등한 뒤에도 실행할 수 있도록 현재가 자체는 접근 구간 밖을 허용한다.
+          dropFromEntry >= 2.5;
+        const isRecoveryConfirmed = reboundFromLow >= 0.7 && adaptive.slope >= 0.05;
+
+        if (isDca2RecoveryWindow && isRecoveryConfirmed) {
+          signals.push({
+            id: `SIG_DCA_2_RECOVERY_${now}`,
+            timestamp: now,
+            timeframe: 'tick',
+            source: 'DCA_RECOVERY_ENGINE',
+            type: 'DCA_BUY',
+            priority: 5,
+            symbol: params.symbol,
+            price: currentPrice,
+            dcaBudgetFraction: 0.4,
+            dcaExecution: 'RECOVERY_PREBUY',
+            reason: `[DCA 2차 접근 반등 선매수] -${dropFromEntry.toFixed(2)}% 구간에서 최근 저점 대비 +${reboundFromLow.toFixed(2)}% 반등·단기 추세 전환 확인 ➡️ 2차 예산의 40%만 선매수`,
+            indicatorSnapshot: snapshot
+          });
+          return signals;
+        }
+
+        if (currentPrice <= slotTargetPrice) {
+          const isDca2Remainder = nextSlot.slotNumber === 2 && nextSlot.status === 'PARTIALLY_FILLED';
           signals.push({
             id: `SIG_DCA_${nextSlot.slotNumber}_${now}`,
             timestamp: now,
@@ -359,7 +420,11 @@ export class ATRStrategyCore {
             priority: 5,
             symbol: params.symbol,
             price: currentPrice,
-            reason: `[DCA ${nextSlot.slotNumber}차 리사이클링 추매] 평단 대비 -${dropFromEntry.toFixed(2)}% 저점 도달 ➡️ 세이브된 현금으로 평단가 대폭 인하 매수`,
+            dcaBudgetFraction: isDca2Remainder ? 0.6 : undefined,
+            dcaExecution: isDca2Remainder ? 'COMPLETE_REMAINDER' : undefined,
+            reason: isDca2Remainder
+              ? `[DCA 2차 잔여 매수] 평단 대비 -${dropFromEntry.toFixed(2)}%로 본 기준(-4.2%) 도달 ➡️ 남은 2차 예산 60% 집행`
+              : `[DCA ${nextSlot.slotNumber}차 리사이클링 추매] 평단 대비 -${dropFromEntry.toFixed(2)}% 저점 도달 ➡️ 세이브된 현금으로 평단가 대폭 인하 매수`,
             indicatorSnapshot: snapshot
           });
           return signals;
@@ -380,8 +445,10 @@ export class ATRStrategyCore {
       pnlPercent >= params.pyramidingStepPercent * (position.pyramidingCount + 1) &&
       adaptive.marketRegime === 'BULL'
     ) {
+      const nextStage = position.pyramidingCount + 1;
+      const pyramidBudgetFraction = nextStage === 1 ? 0.50 : 0.35;
       signals.push({
-        id: `SIG_PYRAMID_${position.pyramidingCount + 1}_${now}`,
+        id: `SIG_PYRAMID_${nextStage}_${now}`,
         timestamp: now,
         timeframe: 'tick',
         source: 'PYRAMIDING_ENGINE',
@@ -389,7 +456,8 @@ export class ATRStrategyCore {
         priority: 6,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[상승 불타기 ${position.pyramidingCount + 1}차] 평단 대비 +${pnlPercent.toFixed(2)}% 상승 추가 매수`,
+        pyramidBudgetFraction,
+        reason: `[상승 불타기 ${nextStage}차] 평단 대비 +${pnlPercent.toFixed(2)}% 상승·추세 유지 확인 ➡️ ${nextStage === 1 ? '0.50' : '0.35'} Unit만 추가 매수`,
         indicatorSnapshot: snapshot
       });
       return signals;

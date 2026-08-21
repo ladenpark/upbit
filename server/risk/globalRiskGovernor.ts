@@ -391,11 +391,20 @@ export class GlobalRiskGovernor {
       }
 
       if (signal.type === 'DCA_BUY') {
-        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');
+        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
         const slotNum = nextSlot ? nextSlot.slotNumber : 1;
         const DCA_SCALES = [1.5, 2.0, 1.5];
         const scale = DCA_SCALES[slotNum - 1] || 1.5;
         targetBudget *= scale;
+        // DCA 2차 접근 반등 선매수(40%)와 이후 본 기준가 잔여 매수(60%)는
+        // 합쳐서 기존 DCA 2차 예산을 절대 넘지 않는다.
+        if (typeof signal.dcaBudgetFraction === 'number') {
+          targetBudget *= signal.dcaBudgetFraction;
+        }
+      }
+
+      if (signal.type === 'PYRAMID_BUY' && typeof signal.pyramidBudgetFraction === 'number') {
+        targetBudget *= signal.pyramidBudgetFraction;
       }
 
       // Strict Clamp: Never exceed actual available KRW or Global Max Exposure limit

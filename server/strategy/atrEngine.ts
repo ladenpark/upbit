@@ -102,11 +102,10 @@ export class ATREngine {
     this.positionManager = new PositionManager(this.params);
     this.orderManager = new OrderManager(
       this.riskGovernor,
-      (record, prevFilledVolume) => {
-        const added = record.filledVolume - prevFilledVolume;
-        console.log(`[ATREngine] 🔔 Async Order Fill update received for ${record.clientOrderId} (${record.status}): Total Filled = ${record.filledVolume} (added +${added})`);
-        if (record.signalType && added > 0) {
-          this.handleOrderFilled(record.signalType, record, this.currentPrice, added);
+      (record, incrementalFilledVolume) => {
+        console.log(`[ATREngine] 🔔 Async Order Fill update received for ${record.clientOrderId} (${record.status}): Incremental Fill = ${incrementalFilledVolume}`);
+        if (record.signalType && incrementalFilledVolume > 0) {
+          this.handleOrderFilled(record.signalType, record, this.currentPrice, incrementalFilledVolume);
         }
       }
     );
@@ -515,8 +514,13 @@ export class ATREngine {
         // Incremental DCA fill: add to current DCA slot volume without consuming a new slot
         this.positionManager.addAdditionalDcaFilled(fillPrice, effectiveVolume);
       } else {
-        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE') || { slotNumber: 1 };
-        this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume);
+        const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED') || { slotNumber: 1 };
+        if (record.reason.includes('DCA 2차 접근 반등 선매수')) {
+          const plannedTargetPrice = (position.entryPrice || fillPrice) * 0.958;
+          this.positionManager.onDcaRecoveryPrebuyFilled(nextSlot.slotNumber, fillPrice, effectiveVolume, plannedTargetPrice);
+        } else {
+          this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume);
+        }
       }
       this.totalTrades += 1;
       this.addLog({
@@ -967,11 +971,76 @@ export class ATREngine {
   }
 
   /**
+   * Realized performance belongs to the day a SELL fill closes quantity.
+   * Both the matched BUY fee and the SELL fee are deducted on that day so the
+   * dashboard never presents a gross profit as a net daily result.
+   */
+  private getDailyNetPerformance() {
+    const days = new Map<string, { date: string; realizedPnl: number; fees: number; netPnl: number; sellCount: number }>();
+    const buys: { vol: number; price: number; fee: number }[] = [];
+    const orders = this.orderManager.getAllOrders()
+      .filter((order) => order.filledVolume > 0 && order.avgFillPrice > 0)
+      .sort((a, b) => a.updatedAt - b.updatedAt);
+
+    for (const order of orders) {
+      if (order.side === 'BUY') {
+        buys.push({ vol: order.filledVolume, price: order.avgFillPrice, fee: order.fee || 0 });
+        continue;
+      }
+
+      if (order.side !== 'SELL') continue;
+      let remainingVolume = order.filledVolume;
+      let matchedCost = 0;
+      let matchedBuyFees = 0;
+
+      while (remainingVolume > 0 && buys.length > 0) {
+        const buy = buys[0];
+        const matchedVolume = Math.min(remainingVolume, buy.vol);
+        const feePortion = buy.fee * (matchedVolume / buy.vol);
+        matchedCost += matchedVolume * buy.price;
+        matchedBuyFees += feePortion;
+        buy.vol -= matchedVolume;
+        buy.fee -= feePortion;
+        remainingVolume -= matchedVolume;
+        if (buy.vol <= 1e-12) buys.shift();
+      }
+
+      // Ignore unmatched quantity for PnL rather than manufacturing a profit.
+      const matchedVolume = order.filledVolume - remainingVolume;
+      if (matchedVolume <= 0) continue;
+      const sellFee = (order.fee || 0) * (matchedVolume / order.filledVolume);
+      const grossPnl = (matchedVolume * order.avgFillPrice) - matchedCost;
+      const fees = matchedBuyFees + sellFee;
+      const date = new Date(order.updatedAt).toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+      const day = days.get(date) || { date, realizedPnl: 0, fees: 0, netPnl: 0, sellCount: 0 };
+      day.realizedPnl += grossPnl;
+      day.fees += fees;
+      day.netPnl += grossPnl - fees;
+      day.sellCount += 1;
+      days.set(date, day);
+    }
+
+    return [...days.values()]
+      .map((day) => ({
+        ...day,
+        realizedPnl: Math.round(day.realizedPnl),
+        fees: Math.round(day.fees),
+        netPnl: Math.round(day.netPnl)
+      }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  /**
    * Full Snapshot for WebSocket Client UI Synchronization
    */
   public getFullState() {
     const pos = this.positionManager.getSnapshot();
     const masked = this.secretManager.getMaskedStatus();
+    // Use the same FIFO, fee-deducted realization basis everywhere the UI
+    // shows performance. The mutable running counter is retained internally
+    // for trade handling, but can otherwise drift from fees after live fills.
+    const dailyNetPerformance = this.getDailyNetPerformance();
+    const realizedNetPnl = dailyNetPerformance.reduce((sum, day) => sum + day.netPnl, 0);
     const exposure = this.riskGovernor.calculateExposureLimits(
       this.actualKrwBalance,
       pos.amount,
@@ -1006,22 +1075,30 @@ export class ATREngine {
       const entry = pos.entryPrice || this.currentPrice;
 
       // Page 1: DCA 물타기 (하락 시 대응)
-      const nextDcaSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE');
+      const nextDcaSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
       if (this.params.dcaEnabled && nextDcaSlot) {
         const DCA_SCALES = [1.5, 2.0, 1.5];
         const dcaScale = DCA_SCALES[nextDcaSlot.slotNumber - 1] || 1.5;
-        const dcaBudgetRaw = baseUnitBudget * dcaScale;
+        const isDca2Remainder = nextDcaSlot.slotNumber === 2 && nextDcaSlot.status === 'PARTIALLY_FILLED';
+        const dcaBudgetRaw = baseUnitBudget * dcaScale * (isDca2Remainder ? 0.6 : 1);
         const dcaBudget = Math.floor(Math.min(dcaBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
         const targetDcaDrop = nextDcaSlot.slotNumber === 1 ? 2.0 : nextDcaSlot.slotNumber === 2 ? 4.2 : 5.5;
-        const targetDcaPrice = entry * (1 - targetDcaDrop / 100);
+        const targetDcaPrice = isDca2Remainder && nextDcaSlot.plannedTargetPrice
+          ? nextDcaSlot.plannedTargetPrice
+          : entry * (1 - targetDcaDrop / 100);
         pages.push({
           category: 'DCA',
           categoryLabel: '하락 시 저점 추매',
-          type: `DCA #${nextDcaSlot.slotNumber}차 리사이클링 (${dcaScale}x)`,
+          type: isDca2Remainder ? 'DCA #2차 잔여 매수 (60%)' : `DCA #${nextDcaSlot.slotNumber}차 리사이클링 (${dcaScale}x)`,
           budgetKrw: dcaBudget,
-          unitPercent: Number((effectiveOrderRatio * dcaScale).toFixed(1)),
+          unitPercent: Number((effectiveOrderRatio * dcaScale * (isDca2Remainder ? 0.6 : 1)).toFixed(1)),
           scaleMultiplier: dcaScale,
-          targetPriceLabel: `₩${Math.round(targetDcaPrice).toLocaleString()} (-${targetDcaDrop.toFixed(1)}% 저점 도달 시)`,
+          targetPriceLabel: isDca2Remainder
+            ? `₩${Math.round(targetDcaPrice).toLocaleString()} (-4.2% 도달 시 · 2차 잔여 60%)`
+            : nextDcaSlot.slotNumber === 2
+              ? `접근 반등: -3.5%~-4.15%에서 저점 +0.7% 반등 시 40% · ₩${Math.round(targetDcaPrice).toLocaleString()}(-4.2%)에서 잔여 60%`
+              : `₩${Math.round(targetDcaPrice).toLocaleString()} (-${targetDcaDrop.toFixed(1)}% 저점 도달 시)`,
+          targetPrice: targetDcaPrice,
           themeColor: 'indigo'
         });
       } else {
@@ -1069,16 +1146,17 @@ export class ATREngine {
           });
         }
       } else if (this.params.pyramidingEnabled && pos.pyramidingCount < this.params.maxPyramidingOrders) {
-        const pyrBudget = Math.floor(Math.min(baseUnitBudget, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
         const nextPyrStep = (pos.pyramidingCount + 1);
+        const pyramidScale = nextPyrStep === 1 ? 0.50 : 0.35;
+        const pyrBudget = Math.floor(Math.min(baseUnitBudget * pyramidScale, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
         const targetPyrPrice = entry * (1 + (this.params.pyramidingStepPercent * nextPyrStep) / 100);
         pages.push({
           category: 'PYRAMID',
           categoryLabel: '상승 시 불타기',
-          type: `상승 불타기 #${nextPyrStep}차`,
+          type: `상승 불타기 #${nextPyrStep}차 (${pyramidScale} Unit)`,
           budgetKrw: pyrBudget,
-          unitPercent: effectiveOrderRatio,
-          scaleMultiplier: 1.0,
+          unitPercent: Number((effectiveOrderRatio * pyramidScale).toFixed(1)),
+          scaleMultiplier: pyramidScale,
           targetPriceLabel: `₩${Math.round(targetPyrPrice).toLocaleString()} (+${(this.params.pyramidingStepPercent * nextPyrStep).toFixed(1)}% 상승 시)`,
           themeColor: 'amber'
         });
@@ -1125,8 +1203,11 @@ export class ATREngine {
       const armingTargetPrice = Math.max(upperBandCalc, minProfitArmingPrice);
 
       const minFloorExitPrice = entryPriceVal * 1.002; // +0.2% 이상
+      const effectiveTrailingCallback = pos.pyramidingCount >= 2
+        ? Math.min(adaptive.dynamicTrailingCallback, 0.6)
+        : adaptive.dynamicTrailingCallback;
       const trailingExitPrice = Math.max(
-        (pos.trailingPeakPrice || this.currentPrice) * (1 - adaptive.dynamicTrailingCallback / 100),
+        (pos.trailingPeakPrice || this.currentPrice) * (1 - effectiveTrailingCallback / 100),
         minFloorExitPrice
       );
       const isLastStep = (pos.trailingExitCount || 0) >= 1 || ((pos.amount * 0.5) * this.currentPrice < 500000);
@@ -1134,13 +1215,13 @@ export class ATREngine {
         category: 'TRAILING_TP',
         categoryLabel: isLastStep ? '트레일링 전량 익절' : '트레일링 50% 익절',
         type: pos.trailingActive
-          ? (isLastStep ? `2차 최고점 대비 -${adaptive.dynamicTrailingCallback}% 꺾임 시 전량(100%) 익절` : `1차 최고점 대비 -${adaptive.dynamicTrailingCallback}% 꺾임 시 50% 익절`)
+          ? (isLastStep ? `2차 최고점 대비 -${effectiveTrailingCallback}% 꺾임 시 전량(100%) 익절` : `1차 최고점 대비 -${effectiveTrailingCallback}% 꺾임 시 50% 익절`)
           : `평단 대비 +1.0% (상단 밴드) 도달 시 무장`,
         budgetKrw: Math.round((isLastStep ? pos.amount : pos.amount * 0.5) * this.currentPrice),
         unitPercent: isLastStep ? 100 : 50,
         scaleMultiplier: isLastStep ? 1.0 : 0.5,
         targetPriceLabel: pos.trailingActive
-          ? `₩${Math.round(trailingExitPrice).toLocaleString()} (최고 ₩${Math.round(pos.trailingPeakPrice || this.currentPrice).toLocaleString()} 대비 -${adaptive.dynamicTrailingCallback}% 하락 시)`
+          ? `₩${Math.round(trailingExitPrice).toLocaleString()} (최고 ₩${Math.round(pos.trailingPeakPrice || this.currentPrice).toLocaleString()} 대비 -${effectiveTrailingCallback}% 하락 시)`
           : `₩${Math.round(armingTargetPrice).toLocaleString()} 이상 터치 시 (평단 대비 +1.0% 확보)`,
         themeColor: 'emerald'
       });
@@ -1242,19 +1323,26 @@ export class ATREngine {
         trailingActive: pos.trailingActive,
         trailingPeakPrice: pos.trailingPeakPrice,
         trailingExitCount: pos.trailingExitCount || 0,
+        profitLockPrice: pos.profitLockPrice || null,
         cooldownUntil: pos.cooldownUntil,
         pyramidingCount: pos.pyramidingCount,
         boxPyramidCount: pos.boxPyramidCount
       },
       boxPyramidCount: pos.boxPyramidCount,
       pyramidingCount: pos.pyramidingCount,
+      // Keep the dashboard's action summary in sync with the persisted slots.
+      // This is presentation data only; it does not affect order decisions.
+      safetyOrderCount: pos.dcaSlots.filter((slot) => slot.status === 'FILLED' || slot.status === 'PARTIALLY_FILLED').length,
+      cooldownUntil: pos.cooldownUntil,
+      awaitingReentry: pos.state === 'REENTRY_ALLOWED',
       isTrailingActive: pos.trailingActive,
       trailingPeakPrice: pos.trailingPeakPrice,
       trailingExitCount: pos.trailingExitCount || 0,
       exposureLimits: exposure,
       nextOrderInfo,
-      totalRealizedPnl: this.totalRealizedPnl,
+      totalRealizedPnl: realizedNetPnl,
       totalFeesPaid: this.totalFeesPaid,
+      dailyNetPerformance,
       totalTrades: this.totalTrades,
       winTrades: this.winTrades,
       priceHistory: this.priceHistory,
