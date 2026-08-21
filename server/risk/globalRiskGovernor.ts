@@ -14,7 +14,9 @@ import {
   PROTECTIVE_SELL_SIGNALS
 } from '../types/trading';
 
-const RESERVATION_FILE = path.join(process.cwd(), 'data', 'exposure_reservations.json');
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const RESERVATION_FILE = path.join(DATA_DIR, 'exposure_reservations.json');
+const DAILY_RISK_FILE = path.join(DATA_DIR, 'daily_risk_state.json');
 
 export interface RiskEvaluationResult {
   approved: boolean;
@@ -38,6 +40,7 @@ export class GlobalRiskGovernor {
     this.params = params;
     this.loadReservations();
     this.dailyLossResetDate = this.getTodayKST();
+    this.loadDailyRiskState();
   }
 
   private getTodayKST(): string {
@@ -50,14 +53,7 @@ export class GlobalRiskGovernor {
    * Positive value = loss amount (absolute), negative values are ignored (profits).
    */
   public recordDailyLoss(lossAmountKrw: number, totalCapitalKrw: number): { circuitBroken: boolean } {
-    // Auto-reset at day boundary (KST)
-    const today = this.getTodayKST();
-    if (today !== this.dailyLossResetDate) {
-      this.dailyRealizedLossKrw = 0;
-      this.dailyLossResetDate = today;
-      this.circuitBreakerTriggered = false;
-      console.log(`[GlobalRiskGovernor] 📅 Daily loss counter reset for ${today}`);
-    }
+    this.resetDailyStateIfNeeded();
 
     if (lossAmountKrw <= 0) return { circuitBroken: false };
 
@@ -69,14 +65,28 @@ export class GlobalRiskGovernor {
 
     if (this.dailyRealizedLossKrw >= maxLossKrw) {
       this.circuitBreakerTriggered = true;
+      this.saveDailyRiskState();
       console.error(`[GlobalRiskGovernor] 🚨 CIRCUIT BREAKER TRIGGERED! Daily loss ₩${Math.round(this.dailyRealizedLossKrw).toLocaleString()} exceeds ${maxLossPercent}% limit (₩${Math.round(maxLossKrw).toLocaleString()})`);
       return { circuitBroken: true };
     }
+    this.saveDailyRiskState();
     return { circuitBroken: false };
   }
 
   public getDailyLossStatus(): { dailyLossKrw: number; circuitBroken: boolean } {
+    this.resetDailyStateIfNeeded();
     return { dailyLossKrw: this.dailyRealizedLossKrw, circuitBroken: this.circuitBreakerTriggered };
+  }
+
+  private resetDailyStateIfNeeded() {
+    const today = this.getTodayKST();
+    if (today !== this.dailyLossResetDate) {
+      this.dailyRealizedLossKrw = 0;
+      this.dailyLossResetDate = today;
+      this.circuitBreakerTriggered = false;
+      this.saveDailyRiskState();
+      console.log(`[GlobalRiskGovernor] 📅 Daily loss counter reset for ${today}`);
+    }
   }
 
   public setParams(newParams: BotParams) {
@@ -236,19 +246,22 @@ export class GlobalRiskGovernor {
 
     // 5. Handle SELL Signals
     if (signal.type === 'TRAILING_STOP_EXIT') {
-      const TRAILING_PARTIAL_RATIO = 0.5; // 한 번에 보유 물량의 50%만 익절
-      const DUST_GUARD_KRW = 10000; // 업비트 최소 주문(5,000원)보다 여유 있게 설정한 안전 버퍼
-
       if (position.amount <= 0) {
         return { approved: false, rejectionReason: `[Risk Block] No coin position available for trailing take-profit.` };
       }
 
-      let volume = Number((position.amount * TRAILING_PARTIAL_RATIO).toFixed(6));
-      const remainingValueKrw = (position.amount - volume) * currentPrice;
+      const exitCount = position.trailingExitCount || 0;
+      const isSecondOrLaterExit = exitCount >= 1;
+      const remainingValueIfHalf = (position.amount * 0.5) * currentPrice;
 
-      // 부분 매도 후 남는 물량이 더스트 수준이면, 어차피 다음 사이클에서 또 팔아야 하니 그냥 전량 매도
-      if (remainingValueKrw < DUST_GUARD_KRW) {
-        volume = position.amount;
+      // 2-Step Trailing Model:
+      // 1차: 보유 물량의 50% 분할 익절
+      // 2차 (또는 잔여 평가금 50만 원 미만): 남은 잔여 물량 100% 전량 매도 (Full Exit)하여 FLAT 복귀
+      let volume: number;
+      if (isSecondOrLaterExit || remainingValueIfHalf < 500000) {
+        volume = position.amount; // 100% 전량 매도
+      } else {
+        volume = Math.floor(position.amount * 0.5 * 1e8) / 1e8;
       }
 
       if (volume <= 0) {
@@ -301,8 +314,13 @@ export class GlobalRiskGovernor {
     }
 
     if (signal.type === 'PARTIAL_LOSS_CUT' || signal.type === 'EMERGENCY_TREND_CUT') {
-      const cutRatio = signal.type === 'EMERGENCY_TREND_CUT' ? 0.4 : (this.params.partialLossCutPercent / 100);
-      const volume = Number((position.amount * cutRatio).toFixed(6));
+      let cutRatio = 0.4;
+      if (signal.type === 'PARTIAL_LOSS_CUT') {
+        const cutCount = position.partialCutCount || 0;
+        // 1st cut: 30%, 2nd cut: 50% of remaining
+        cutRatio = cutCount === 0 ? 0.30 : 0.50;
+      }
+      const volume = Math.floor(position.amount * cutRatio * 1e8) / 1e8;
       if (volume <= 0 || position.amount <= 0) {
         return { approved: false, rejectionReason: `[Risk Block] Insufficient position volume for partial cut.` };
       }
@@ -335,6 +353,18 @@ export class GlobalRiskGovernor {
     ) {
       const limits = this.calculateExposureLimits(actualKrwBalance, position.amount, currentPrice, pendingOrdersAmountKrw);
 
+      // Trailing Exit Gate: 한 번이라도 트레일링 익절이 시작된 포지션은 전량 청산(FLAT)까지 불타기 일체 기각
+      if (
+        (signal.type === 'PYRAMID_BUY' || signal.type === 'BOX_PYRAMID_BUY') &&
+        position.trailingExitCount &&
+        position.trailingExitCount >= 1
+      ) {
+        return {
+          approved: false,
+          rejectionReason: `[Risk Block] Pyramiding strictly blocked during trailing exit/distribution phase (trailingExitCount: ${position.trailingExitCount}).`
+        };
+      }
+
       if (limits.remainingAllowableExposureKrw < 5000) {
         return {
           approved: false,
@@ -349,19 +379,22 @@ export class GlobalRiskGovernor {
         : (this.params.orderRatio || 25) / 100;
       let targetBudget = limits.totalCapitalKrw * effectiveOrderRatio;
 
-      // 박스권 스캘핑 진입은 일반 진입의 절반 크기로 제한
       const isScalpEntry = signal.reason.includes('스캘핑 진입');
-      const isBoxPyramidEntry = signal.reason.includes('박스권 불타기 추가매수');
+      const isBoxPyramidEntry = signal.reason.includes('박스권 불타기');
 
       if (isBoxPyramidEntry) {
-        targetBudget *= 0.25; // 박스권 추가매수는 일반 진입의 1/4로 엄격 제한
+        // Scaled Pyramiding: 0.50 Unit씩 적극 불타기
+        targetBudget *= 0.50;
       } else if (isScalpEntry) {
-        targetBudget *= 0.5;
+        // 박스권 스캘핑 1차 진입도 넉넉한 물량 확보 (0.8 Unit)
+        targetBudget *= 0.80;
       }
 
       if (signal.type === 'DCA_BUY') {
         const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');
-        const scale = Math.pow(this.params.safetyOrderVolumeScale, nextSlot ? nextSlot.slotNumber : 1);
+        const slotNum = nextSlot ? nextSlot.slotNumber : 1;
+        const DCA_SCALES = [1.5, 2.0, 1.5];
+        const scale = DCA_SCALES[slotNum - 1] || 1.5;
         targetBudget *= scale;
       }
 
@@ -399,10 +432,10 @@ export class GlobalRiskGovernor {
         const raw = fs.readFileSync(RESERVATION_FILE, 'utf-8');
         const list: ExposureReservation[] = JSON.parse(raw);
         list.forEach((r) => {
-          // If a reservation is older than 5 minutes and still RESERVED, auto-release it
-          if (r.status === 'RESERVED' && (Date.now() - r.createdAt) > 300000) {
-            r.status = 'RELEASED';
-          }
+          // Do not release reservations purely because the process was down
+          // for five minutes.  The matching order must first be reconciled
+          // against the exchange; otherwise an open buy can bypass exposure
+          // limits after restart.
           this.reservations.set(r.clientOrderId, r);
         });
         this.recalculateReservedExposure();
@@ -410,6 +443,37 @@ export class GlobalRiskGovernor {
       }
     } catch (e) {
       console.error('[GlobalRiskGovernor] Failed to load exposure reservations:', e);
+    }
+  }
+
+  private loadDailyRiskState() {
+    try {
+      if (!fs.existsSync(DAILY_RISK_FILE)) return;
+      const parsed = JSON.parse(fs.readFileSync(DAILY_RISK_FILE, 'utf-8')) as {
+        date?: string; dailyRealizedLossKrw?: number; circuitBreakerTriggered?: boolean;
+      };
+      if (parsed.date === this.dailyLossResetDate) {
+        this.dailyRealizedLossKrw = Math.max(0, Number(parsed.dailyRealizedLossKrw) || 0);
+        this.circuitBreakerTriggered = Boolean(parsed.circuitBreakerTriggered);
+      }
+    } catch (e) {
+      console.error('[GlobalRiskGovernor] Failed to load daily risk state:', e);
+    }
+  }
+
+  private saveDailyRiskState() {
+    try {
+      const dir = path.dirname(DAILY_RISK_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmpFile = DAILY_RISK_FILE + '.tmp';
+      fs.writeFileSync(tmpFile, JSON.stringify({
+        date: this.dailyLossResetDate,
+        dailyRealizedLossKrw: this.dailyRealizedLossKrw,
+        circuitBreakerTriggered: this.circuitBreakerTriggered
+      }), 'utf-8');
+      fs.renameSync(tmpFile, DAILY_RISK_FILE);
+    } catch (e) {
+      console.error('[GlobalRiskGovernor] Failed to save daily risk state:', e);
     }
   }
 

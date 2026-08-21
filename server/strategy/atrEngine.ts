@@ -64,13 +64,18 @@ export class ATREngine {
 
   // Higher Timeframe (15m) Trend State for Whipsaw Filtering
   private higherTfTrend: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number } = { trend: 'SIDEWAYS', htfSlope: 0 };
+  private recent1mCloses: number[] = [];
 
   // Live Metrics
   public currentPrice = 2650000.0;
   public atrValue = 35000.0;
   public baselineValue = 2650000.0;
   public marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR' = 'SIDEWAYS';
+  public rsiValue = 50.0;
+  public volumeMultiplier = 1.0;
+  public volumeMa = 0.0;
   public totalRealizedPnl = 0;
+  public totalFeesPaid = 0;
   public totalTrades = 0;
   public winTrades = 0;
 
@@ -107,16 +112,18 @@ export class ATREngine {
     );
 
     // Restore persisted trade logs from disk so UI doesn't reset on restart
-    this.logs = PositionManager.loadTradeLogs().slice(0, 60);
+    this.logs = PositionManager.loadTradeLogs().slice(0, 300);
 
     // Compute exact historical realized PnL and trade counts from order history (FIFO matching)
     const allFilledOrders = this.orderManager.getAllOrders().filter((o) => o.status === 'FILLED' || o.filledVolume > 0);
     let historicalPnl = 0;
+    let totalFees = 0;
     let closedTradesCount = 0;
     let winCount = 0;
     const buyQueue: { vol: number; price: number; fee: number }[] = [];
 
     allFilledOrders.forEach((o) => {
+      totalFees += (o.fee || 0);
       if (o.side === 'BUY') {
         buyQueue.push({ vol: o.filledVolume, price: o.avgFillPrice, fee: o.fee || 0 });
       } else if (o.side === 'SELL' && o.avgFillPrice > 0) {
@@ -140,6 +147,11 @@ export class ATREngine {
             sellVol = 0;
           }
         }
+        // Safety: If buy queue is exhausted, fallback to breakeven cost to prevent phantom profit
+        if (sellVol > 0) {
+          tradeCost += sellVol * sellPrice;
+        }
+
         const pnl = tradeRevenue - tradeCost - sellFee;
         historicalPnl += pnl;
         closedTradesCount += 1;
@@ -148,6 +160,7 @@ export class ATREngine {
     });
 
     this.totalRealizedPnl = Math.round(historicalPnl);
+    this.totalFeesPaid = Math.round(totalFees);
     this.totalTrades = closedTradesCount;
     this.winTrades = winCount;
 
@@ -258,6 +271,31 @@ export class ATREngine {
     const historyPrices = this.priceHistory.map((p) => p.price);
     historyPrices.push(price);
 
+    // Real-time 1m RSI(14) calculation: base 1m candles + latest tick price
+    const rsiCloses = this.recent1mCloses.length >= 14
+      ? [...this.recent1mCloses.slice(-14), price]
+      : historyPrices;
+
+    if (rsiCloses.length >= 15) {
+      const slice = rsiCloses.slice(-15);
+      let gains = 0;
+      let losses = 0;
+      for (let i = 1; i < slice.length; i++) {
+        const diff = slice[i] - slice[i - 1];
+        if (diff > 0) gains += diff;
+        else losses += Math.abs(diff);
+      }
+      const avgGain = gains / 14;
+      const avgLoss = losses / 14;
+      if (avgGain === 0 && avgLoss === 0) this.rsiValue = 50.0;
+      else if (avgLoss === 0) this.rsiValue = 100.0;
+      else if (avgGain === 0) this.rsiValue = 0.0;
+      else {
+        const rs = avgGain / avgLoss;
+        this.rsiValue = Number((100 - (100 / (1 + rs))).toFixed(1));
+      }
+    }
+
     // Evaluate dynamic auto-pilot indicators FIRST so bands are consistent everywhere
     const adaptive = this.strategyCore.evaluateAdaptiveParams(
       price,
@@ -265,7 +303,10 @@ export class ATREngine {
       this.atrValue,
       this.params,
       historyPrices,
-      this.higherTfTrend
+      this.higherTfTrend,
+      this.rsiValue,
+      this.volumeMultiplier,
+      this.volumeMa
     );
 
     if (adaptive.marketRegime !== this.marketRegime) {
@@ -289,7 +330,12 @@ export class ATREngine {
     // ── enableReentry trigger: DEFENSIVE/EMERGENCY_EXIT → REENTRY_ALLOWED ──
     const positionForReentry = this.positionManager.getSnapshot();
     if (
-      (positionForReentry.state === 'DEFENSIVE' || positionForReentry.state === 'EMERGENCY_EXIT') &&
+      (
+        positionForReentry.state === 'DEFENSIVE' ||
+        positionForReentry.state === 'DEFENSIVE_1' ||
+        positionForReentry.state === 'DEFENSIVE_2' ||
+        positionForReentry.state === 'EMERGENCY_EXIT'
+      ) &&
       !this.positionManager.isUnderCooldown() &&
       dropSpeed >= -0.3 &&
       price > lowerBand
@@ -312,7 +358,10 @@ export class ATREngine {
       position,
       dropSpeed,
       historyPrices,
-      this.higherTfTrend
+      this.higherTfTrend,
+      this.rsiValue,
+      this.volumeMultiplier,
+      this.volumeMa
     );
 
     if (candidateSignals.length > 0) {
@@ -437,6 +486,9 @@ export class ATREngine {
       ? overrideVolume!
       : (record.filledVolume > 0 ? record.filledVolume : (record.requestedBudgetOrVolume / fillPrice));
 
+    const feeCharged = record.fee || (fillPrice * effectiveVolume * 0.0005);
+    this.totalFeesPaid += Math.round(feeCharged);
+
     if (signalType === 'ENTRY_BUY' || signalType === 'BREAKOUT_BUY') {
       if (position.amount > 0 && position.state !== 'FLAT') {
         this.positionManager.addAdditionalEntryFilled(fillPrice, effectiveVolume);
@@ -504,12 +556,13 @@ export class ATREngine {
       const entry = position.entryPrice || fillPrice;
       const pnl = (fillPrice - entry) * cutVolume;
       const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
+      const cutStep = (position.partialCutCount || 0) + 1;
 
       if (isIncremental) {
         this.positionManager.addAdditionalPartialCutFilled(cutVolume, fillPrice, pnl);
         this.totalRealizedPnl += pnl;
       } else {
-        this.positionManager.onPartialLossCutFilled(cutVolume, fillPrice, pnl);
+        this.positionManager.onPartialLossCutFilled(cutVolume, fillPrice, pnl, cutStep);
         this.totalRealizedPnl += pnl;
         this.totalTrades += 1;
       }
@@ -672,7 +725,36 @@ export class ATREngine {
           this.atrValue = calculatedAtr;
           const sumClose = candles.reduce((acc, c) => acc + c.trade_price, 0);
           this.baselineValue = Math.round(sumClose / candles.length);
-          console.log(`[ATREngine] 📊 Recalculated Dynamic ATR (1m): ₩${this.atrValue.toLocaleString()} (Baseline: ₩${this.baselineValue.toLocaleString()})`);
+
+          // Calculate RSI(14) from candle closes
+          const closes = candles.map((c) => c.trade_price);
+          this.recent1mCloses = closes;
+          let gains = 0;
+          let losses = 0;
+          for (let i = closes.length - 14; i < closes.length; i++) {
+            const diff = closes[i] - closes[i - 1];
+            if (diff > 0) gains += diff;
+            else losses += Math.abs(diff);
+          }
+          const avgGain = gains / 14;
+          const avgLoss = losses / 14;
+          if (avgGain === 0 && avgLoss === 0) this.rsiValue = 50.0;
+          else if (avgLoss === 0) this.rsiValue = 100.0;
+          else if (avgGain === 0) this.rsiValue = 0.0;
+          else {
+            const rs = avgGain / avgLoss;
+            this.rsiValue = Number((100 - (100 / (1 + rs))).toFixed(1));
+          }
+
+          // Calculate Volume MA & Volume Multiplier
+          const volumes = candles.map((c) => c.candle_acc_trade_volume).filter((v) => v > 0);
+          if (volumes.length >= 5) {
+            this.volumeMa = Number((volumes.reduce((a, b) => a + b, 0) / volumes.length).toFixed(4));
+            const latestVol = volumes[volumes.length - 1] || this.volumeMa;
+            this.volumeMultiplier = this.volumeMa > 0 ? Number((latestVol / this.volumeMa).toFixed(2)) : 1.0;
+          }
+
+          console.log(`[ATREngine] 📊 Recalculated Dynamic Indicators: ATR=₩${this.atrValue.toLocaleString()}, Baseline=₩${this.baselineValue.toLocaleString()}, RSI=${this.rsiValue}, VolMult=${this.volumeMultiplier}x`);
         }
       }
 
@@ -700,6 +782,18 @@ export class ATREngine {
    * Manual Buy / Sell Dispatcher
    */
   public async executeManualTrade(side: 'BUY' | 'SELL') {
+    if (side !== 'BUY' && side !== 'SELL') {
+      throw new Error('Unsupported manual order side.');
+    }
+    if (this.botState === 'HALTED' || this.riskGovernor.getDailyLossStatus().circuitBroken) {
+      throw new Error('Manual order blocked: circuit breaker is active.');
+    }
+    if (this.marketManager.marketState !== 'LIVE') {
+      throw new Error(`Manual order blocked: market feed is ${this.marketManager.marketState}.`);
+    }
+    if (this.orderManager.getPendingOrdersCount() > 0) {
+      throw new Error('Manual order blocked: another order is pending reconciliation.');
+    }
     const position = this.positionManager.getSnapshot();
     const keys = this.secretManager.getKeys();
     const exposure = this.riskGovernor.calculateExposureLimits(
@@ -793,7 +887,10 @@ export class ATREngine {
           const krw = this.realBalances['KRW'] || 0;
           this.actualKrwBalance = krw;
           const coinKey = this.params.symbol.replace('KRW-', '');
-          const realCoinQty = this.realBalances[coinKey] || 0;
+          // A limit sell locks the coin at Upbit.  It is still part of the
+          // position and must not be reconciled to zero while that order is
+          // open.
+          const realCoinQty = (this.realBalances[coinKey] || 0) + (res.lockedBalances?.[coinKey] || 0);
           const authoritativeAvgPrice = res.avgBuyPrices ? res.avgBuyPrices[coinKey] : null;
 
           // Reconcile position state with actual coin quantity and exchange authoritative avg buy price
@@ -857,7 +954,7 @@ export class ATREngine {
       timestamp: Date.now()
     };
     this.logs.unshift(newLog);
-    if (this.logs.length > 60) this.logs.pop();
+    if (this.logs.length > 300) this.logs.pop();
 
     // Persist trade logs (BUY/SELL/STOP_LOSS) to disk
     if (log.type !== 'SYSTEM') {
@@ -891,7 +988,10 @@ export class ATREngine {
       this.atrValue,
       this.params,
       historyPrices,
-      this.higherTfTrend
+      this.higherTfTrend,
+      this.rsiValue,
+      this.volumeMultiplier,
+      this.volumeMa
     );
     const dropSpeed = this.marketManager ? this.marketManager.calculateDropSpeed(this.params.trendDropWindowSeconds || 5) : 0;
 
@@ -908,19 +1008,20 @@ export class ATREngine {
       // Page 1: DCA 물타기 (하락 시 대응)
       const nextDcaSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE');
       if (this.params.dcaEnabled && nextDcaSlot) {
-        const dcaScale = Number(Math.pow(this.params.safetyOrderVolumeScale, nextDcaSlot.slotNumber).toFixed(2));
+        const DCA_SCALES = [1.5, 2.0, 1.5];
+        const dcaScale = DCA_SCALES[nextDcaSlot.slotNumber - 1] || 1.5;
         const dcaBudgetRaw = baseUnitBudget * dcaScale;
         const dcaBudget = Math.floor(Math.min(dcaBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
-        const dcaStep = this.params.autoPilotEnabled ? adaptive.dynamicDcaStep : this.params.safetyOrderStepPercent;
-        const targetDcaPrice = entry * (1 - (dcaStep * nextDcaSlot.slotNumber) / 100);
+        const targetDcaDrop = nextDcaSlot.slotNumber === 1 ? 2.0 : nextDcaSlot.slotNumber === 2 ? 4.2 : 5.5;
+        const targetDcaPrice = entry * (1 - targetDcaDrop / 100);
         pages.push({
           category: 'DCA',
-          categoryLabel: '하락 시 물타기',
-          type: `DCA #${nextDcaSlot.slotNumber}차 물타기`,
+          categoryLabel: '하락 시 저점 추매',
+          type: `DCA #${nextDcaSlot.slotNumber}차 리사이클링 (${dcaScale}x)`,
           budgetKrw: dcaBudget,
-          unitPercent: effectiveOrderRatio,
+          unitPercent: Number((effectiveOrderRatio * dcaScale).toFixed(1)),
           scaleMultiplier: dcaScale,
-          targetPriceLabel: `₩${Math.round(targetDcaPrice).toLocaleString()} (-${(dcaStep * nextDcaSlot.slotNumber).toFixed(1)}% 하락 시)`,
+          targetPriceLabel: `₩${Math.round(targetDcaPrice).toLocaleString()} (-${targetDcaDrop.toFixed(1)}% 저점 도달 시)`,
           themeColor: 'indigo'
         });
       } else {
@@ -931,13 +1032,43 @@ export class ATREngine {
           budgetKrw: 0,
           unitPercent: effectiveOrderRatio,
           scaleMultiplier: 0,
-          targetPriceLabel: '최대 물타기 완료 (손절선 감시)',
+          targetPriceLabel: '최대 물타기 완료 (마지노선 감시)',
           themeColor: 'indigo'
         });
       }
 
-      // Page 2: 불타기 (상승 시 대응)
-      if (this.params.pyramidingEnabled && pos.pyramidingCount < this.params.maxPyramidingOrders) {
+      // Page 2: 불타기 (상승 시 대응: BULL vs SIDEWAYS 구분)
+      if (adaptive.marketRegime === 'SIDEWAYS') {
+        const BOX_RATIOS = [0.50, 0.50];
+        if (this.params.pyramidingEnabled && pos.boxPyramidCount < 2) {
+          const nextBoxStep = pos.boxPyramidCount + 1;
+          const boxScale = BOX_RATIOS[pos.boxPyramidCount] || 0.50;
+          const boxBudgetRaw = baseUnitBudget * boxScale;
+          const boxBudget = Math.floor(Math.min(boxBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
+          const targetBoxPrice = entry * (1 + 0.0025);
+          pages.push({
+            category: 'PYRAMID',
+            categoryLabel: '박스권 불타기',
+            type: `박스 불타기 #${nextBoxStep}차 (${boxScale} Unit)`,
+            budgetKrw: boxBudget,
+            unitPercent: Number((effectiveOrderRatio * boxScale).toFixed(1)),
+            scaleMultiplier: boxScale,
+            targetPriceLabel: `₩${Math.round(targetBoxPrice).toLocaleString()} (+0.25% 도달 시)`,
+            themeColor: 'purple'
+          });
+        } else {
+          pages.push({
+            category: 'COMPLETED',
+            categoryLabel: '불타기 완료',
+            type: '박스 불타기 한도(2회) 소진',
+            budgetKrw: 0,
+            unitPercent: effectiveOrderRatio,
+            scaleMultiplier: 0,
+            targetPriceLabel: '목표 수익 도달 시 전량 익절 대기',
+            themeColor: 'purple'
+          });
+        }
+      } else if (this.params.pyramidingEnabled && pos.pyramidingCount < this.params.maxPyramidingOrders) {
         const pyrBudget = Math.floor(Math.min(baseUnitBudget, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
         const nextPyrStep = (pos.pyramidingCount + 1);
         const targetPyrPrice = entry * (1 + (this.params.pyramidingStepPercent * nextPyrStep) / 100);
@@ -964,17 +1095,22 @@ export class ATREngine {
         });
       }
 
-      // Page 3: 박스권 짤짤이 익절 (Rule 3-b)
+      // Page 3: 박스권 짤짤이 익절 (Rule 3-b) - Stepped target based on boxPyramidCount
       if (adaptive.marketRegime === 'SIDEWAYS') {
-        const scalpTpTargetPrice = entry * (1 + adaptive.dynamicScalpTakeProfitPercent / 100);
+        let steppedScalpTpPercent = adaptive.dynamicScalpTakeProfitPercent;
+        if (pos.boxPyramidCount === 1) steppedScalpTpPercent = Math.max(steppedScalpTpPercent, 0.60);
+        else if (pos.boxPyramidCount === 2) steppedScalpTpPercent = Math.max(steppedScalpTpPercent, 0.70);
+        else if (pos.boxPyramidCount >= 3) steppedScalpTpPercent = Math.max(steppedScalpTpPercent, 0.85);
+
+        const scalpTpTargetPrice = entry * (1 + steppedScalpTpPercent / 100);
         pages.push({
           category: 'SCALP_TP',
           categoryLabel: '박스권 짤짤이 익절',
-          type: `스캘핑 전량 익절 (+${adaptive.dynamicScalpTakeProfitPercent.toFixed(1)}%)`,
+          type: `스캘핑 전량 익절 (+${steppedScalpTpPercent.toFixed(2)}%)`,
           budgetKrw: Math.round(pos.amount * this.currentPrice),
           unitPercent: 100,
           scaleMultiplier: 1.0,
-          targetPriceLabel: `₩${Math.round(scalpTpTargetPrice).toLocaleString()} (+${adaptive.dynamicScalpTakeProfitPercent.toFixed(1)}% 도달 시)`,
+          targetPriceLabel: `₩${Math.round(scalpTpTargetPrice).toLocaleString()} (+${steppedScalpTpPercent.toFixed(2)}% 도달 시)`,
           themeColor: 'teal'
         });
       }
@@ -985,18 +1121,27 @@ export class ATREngine {
       const effectiveMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
       const upperBandCalc = this.baselineValue + (effectiveAtr * effectiveMultiplier);
       const entryPriceVal = pos.entryPrice || 0;
-      const armingTargetPrice = Math.max(upperBandCalc, entryPriceVal);
+      const minProfitArmingPrice = entryPriceVal * 1.010; // +1.0% 이상
+      const armingTargetPrice = Math.max(upperBandCalc, minProfitArmingPrice);
 
+      const minFloorExitPrice = entryPriceVal * 1.002; // +0.2% 이상
+      const trailingExitPrice = Math.max(
+        (pos.trailingPeakPrice || this.currentPrice) * (1 - adaptive.dynamicTrailingCallback / 100),
+        minFloorExitPrice
+      );
+      const isLastStep = (pos.trailingExitCount || 0) >= 1 || ((pos.amount * 0.5) * this.currentPrice < 500000);
       pages.push({
         category: 'TRAILING_TP',
-        categoryLabel: '트레일링 50% 익절',
-        type: pos.trailingActive ? `최고점 대비 -${adaptive.dynamicTrailingCallback}% 하락 시 익절` : `상단 밴드 터치 시 무장 (수익 구간)`,
-        budgetKrw: Math.round((pos.amount * 0.5) * this.currentPrice),
-        unitPercent: 50,
-        scaleMultiplier: 0.5,
+        categoryLabel: isLastStep ? '트레일링 전량 익절' : '트레일링 50% 익절',
+        type: pos.trailingActive
+          ? (isLastStep ? `2차 최고점 대비 -${adaptive.dynamicTrailingCallback}% 꺾임 시 전량(100%) 익절` : `1차 최고점 대비 -${adaptive.dynamicTrailingCallback}% 꺾임 시 50% 익절`)
+          : `평단 대비 +1.0% (상단 밴드) 도달 시 무장`,
+        budgetKrw: Math.round((isLastStep ? pos.amount : pos.amount * 0.5) * this.currentPrice),
+        unitPercent: isLastStep ? 100 : 50,
+        scaleMultiplier: isLastStep ? 1.0 : 0.5,
         targetPriceLabel: pos.trailingActive
-          ? `최고가 ₩${Math.round(pos.trailingPeakPrice || this.currentPrice).toLocaleString()} 추적 중`
-          : `₩${Math.round(armingTargetPrice).toLocaleString()} 이상 터치 시 (평단가 보존)`,
+          ? `₩${Math.round(trailingExitPrice).toLocaleString()} (최고 ₩${Math.round(pos.trailingPeakPrice || this.currentPrice).toLocaleString()} 대비 -${adaptive.dynamicTrailingCallback}% 하락 시)`
+          : `₩${Math.round(armingTargetPrice).toLocaleString()} 이상 터치 시 (평단 대비 +1.0% 확보)`,
         themeColor: 'emerald'
       });
     } else {
@@ -1078,6 +1223,9 @@ export class ATREngine {
       marketRegime: this.marketRegime,
       adaptive,
       dropSpeed,
+      rsi: this.rsiValue,
+      volumeMultiplier: this.volumeMultiplier,
+      volumeMa: this.volumeMa,
       currentPrice: this.currentPrice,
       atrValue: this.atrValue,
       baselineValue: this.baselineValue,
@@ -1093,11 +1241,20 @@ export class ATREngine {
         unrealizedPnlPercent: (pos.amount > 0 && pos.entryPrice) ? ((this.currentPrice - pos.entryPrice) / pos.entryPrice) * 100 : 0,
         trailingActive: pos.trailingActive,
         trailingPeakPrice: pos.trailingPeakPrice,
-        cooldownUntil: pos.cooldownUntil
+        trailingExitCount: pos.trailingExitCount || 0,
+        cooldownUntil: pos.cooldownUntil,
+        pyramidingCount: pos.pyramidingCount,
+        boxPyramidCount: pos.boxPyramidCount
       },
+      boxPyramidCount: pos.boxPyramidCount,
+      pyramidingCount: pos.pyramidingCount,
+      isTrailingActive: pos.trailingActive,
+      trailingPeakPrice: pos.trailingPeakPrice,
+      trailingExitCount: pos.trailingExitCount || 0,
       exposureLimits: exposure,
       nextOrderInfo,
       totalRealizedPnl: this.totalRealizedPnl,
+      totalFeesPaid: this.totalFeesPaid,
       totalTrades: this.totalTrades,
       winTrades: this.winTrades,
       priceHistory: this.priceHistory,

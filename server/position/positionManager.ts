@@ -2,9 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import { PositionSnapshot, PositionState, BotParams, OrderFill } from '../types/trading';
 
-const TRADE_LOGS_FILE = path.join(process.cwd(), 'data', 'trade_logs.json');
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const TRADE_LOGS_FILE = path.join(DATA_DIR, 'trade_logs.json');
 
-const POSITION_FILE = path.join(process.cwd(), 'data', 'position_state.json');
+const POSITION_FILE = path.join(DATA_DIR, 'position_state.json');
 
 export class PositionManager {
   private position: PositionSnapshot;
@@ -65,8 +66,10 @@ export class PositionManager {
       pyramidingCount: 0,
       maxPyramidingOrders: this.params.maxPyramidingOrders,
       boxPyramidCount: 0,
+      partialCutCount: 0,
       trailingActive: false,
       trailingPeakPrice: null,
+      trailingExitCount: 0,
       cooldownUntil: 0
     };
   }
@@ -104,11 +107,17 @@ export class PositionManager {
     stopLossMultiplier: number
   ) {
     const lowerBand = baseline - (atr * atrMultiplier);
-    const staticStopLossPrice = lowerBand - (atr * stopLossMultiplier);
+    const dynamicStopLossPrice = lowerBand - (atr * stopLossMultiplier);
+    // Absolute Stop-Loss Floor: 마지노선 손절선 -6.0% (중간 단계는 -1.0% 30% 덜어내기, -2.0% DCA 1차, -3.2% 50% 덜어내기, -4.5% DCA 2차로 방어)
+    const MIN_STOP_LOSS_DROP_PERCENT = 6.0;
+    const floorStopLossPrice = fillPrice * (1 - MIN_STOP_LOSS_DROP_PERCENT / 100);
+    // The absolute floor is a maximum permitted loss, so never select a
+    // stop below it when ATR expands.
+    const staticStopLossPrice = Math.max(dynamicStopLossPrice, floorStopLossPrice);
 
     this.position.id = `POS_${Date.now()}`;
     this.position.state = 'ENTRY_FILLED';
-    this.position.amount = Number(fillVolume.toFixed(6));
+    this.position.amount = Number(fillVolume.toFixed(8));
     this.position.entryPrice = fillPrice;
     this.position.positionEntryAtr = atr;
     this.position.initialBaseline = baseline;
@@ -118,18 +127,20 @@ export class PositionManager {
     this.position.openedAt = Date.now();
     this.position.lastUpdatedAt = Date.now();
 
-    // Reset DCA slots & Pyramiding
+    // Reset DCA slots, Pyramiding & Partial Cuts
     this.position.dcaSlots = Array.from({ length: this.params.maxSafetyOrders }, (_, i) => ({
       slotNumber: i + 1,
       status: 'AVAILABLE'
     }));
     this.position.pyramidingCount = 0;
     this.position.boxPyramidCount = 0;
+    this.position.partialCutCount = 0;
     this.position.trailingActive = false;
     this.position.trailingPeakPrice = null;
+    this.position.trailingExitCount = 0;
 
     this.saveStateToFile();
-    console.log(`[PositionManager] Initial Entry Filled: Price=${fillPrice}, Qty=${fillVolume}, Static Stop Loss locked at ₩${Math.round(staticStopLossPrice).toLocaleString()}`);
+    console.log(`[PositionManager] Initial Entry Filled: Price=${fillPrice}, Qty=${fillVolume}, Static Absolute Stop Loss locked at ₩${Math.round(staticStopLossPrice).toLocaleString()}`);
   }
 
   /**
@@ -138,7 +149,7 @@ export class PositionManager {
   public addAdditionalEntryFilled(fillPrice: number, additionalVolume: number) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
-    const newTotalQty = Number((currentQty + additionalVolume).toFixed(6));
+    const newTotalQty = Number((currentQty + additionalVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + additionalVolume * fillPrice) / newTotalQty).toFixed(2));
 
     this.position.amount = newTotalQty;
@@ -156,13 +167,15 @@ export class PositionManager {
   public onDcaFilled(slotNumber: number, fillPrice: number, fillVolume: number) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
-    const newTotalQty = Number((currentQty + fillVolume).toFixed(6));
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
 
     this.position.state = 'DCA_MODE';
     this.position.amount = newTotalQty;
     this.position.entryPrice = newWeightedAvgPrice;
     this.position.totalCostKrw += fillPrice * fillVolume;
+    this.position.partialCutCount = 0; // Reset recycling cut gates on newly lowered weighted avg
+    this.position.initialStopPrice = Number((newWeightedAvgPrice * 0.94).toFixed(2)); // Floor stop loss locked at -6.0% of new average
     this.position.lastUpdatedAt = Date.now();
 
     const slot = this.position.dcaSlots.find((s) => s.slotNumber === slotNumber);
@@ -174,7 +187,7 @@ export class PositionManager {
     }
 
     this.saveStateToFile();
-    console.log(`[PositionManager] DCA #${slotNumber} Filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()}`);
+    console.log(`[PositionManager] DCA #${slotNumber} Filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()} (Recycling gates reset to new avg)`);
   }
 
   /**
@@ -184,7 +197,7 @@ export class PositionManager {
   public addAdditionalDcaFilled(fillPrice: number, additionalVolume: number) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
-    const newTotalQty = Number((currentQty + additionalVolume).toFixed(6));
+    const newTotalQty = Number((currentQty + additionalVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + additionalVolume * fillPrice) / newTotalQty).toFixed(2));
 
     this.position.amount = newTotalQty;
@@ -194,7 +207,7 @@ export class PositionManager {
 
     const lastFilledSlot = [...this.position.dcaSlots].reverse().find((s) => s.status === 'FILLED');
     if (lastFilledSlot) {
-      lastFilledSlot.filledVolume = Number(((lastFilledSlot.filledVolume || 0) + additionalVolume).toFixed(6));
+      lastFilledSlot.filledVolume = Number(((lastFilledSlot.filledVolume || 0) + additionalVolume).toFixed(8));
     }
 
     this.saveStateToFile();
@@ -207,7 +220,7 @@ export class PositionManager {
   public onPyramidFilled(fillPrice: number, fillVolume: number) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
-    const newTotalQty = Number((currentQty + fillVolume).toFixed(6));
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
 
     this.position.pyramidingCount += 1;
@@ -227,7 +240,7 @@ export class PositionManager {
   public addAdditionalPyramidFilled(fillPrice: number, additionalVolume: number) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
-    const newTotalQty = Number((currentQty + additionalVolume).toFixed(6));
+    const newTotalQty = Number((currentQty + additionalVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + additionalVolume * fillPrice) / newTotalQty).toFixed(2));
 
     this.position.amount = newTotalQty;
@@ -246,7 +259,7 @@ export class PositionManager {
   public onBoxPyramidFilled(fillPrice: number, fillVolume: number) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
-    const newTotalQty = Number((currentQty + fillVolume).toFixed(6));
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
 
     this.position.boxPyramidCount += 1;
@@ -261,23 +274,18 @@ export class PositionManager {
 
   /**
    * Called on Partial Loss Cut:
-   * Sells portion, transitions to DEFENSIVE, frees 1 DCA slot for deeper dip, but requires REENTRY_WAIT before buying.
+   * Sells portion (1차 30%, 2차 50%), transitions to DEFENSIVE_1/2, frees cash for DCA dip buy.
    */
-  public onPartialLossCutFilled(cutVolume: number, cutPrice: number, pnl: number) {
-    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(6));
+  public onPartialLossCutFilled(cutVolume: number, cutPrice: number, pnl: number, cutStep: number = 1) {
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
     this.position.realizedPnl += pnl;
-    this.position.state = 'DEFENSIVE';
+    this.position.partialCutCount = cutStep;
+    this.position.state = cutStep === 1 ? 'DEFENSIVE_1' : 'DEFENSIVE_2';
     this.position.lastUpdatedAt = Date.now();
-
-    // Disable nearest filled DCA slot to prevent immediate re-DCA loop!
-    const filledSlot = [...this.position.dcaSlots].reverse().find((s) => s.status === 'FILLED');
-    if (filledSlot) {
-      filledSlot.status = 'DISABLED'; // Must stabilize before slot becomes usable
-    }
-
     this.setCooldown(this.params.cooldownSecondsAfterCut || 60, 'PARTIAL_LOSS_CUT');
+
     this.saveStateToFile();
-    console.log(`[PositionManager] Partial Loss Cut Filled: Cut ${cutVolume} @ ₩${cutPrice.toLocaleString()}, PnL=₩${pnl.toLocaleString()}, State ➡️ DEFENSIVE`);
+    console.log(`[PositionManager] 🛡️ Partial Loss Cut #${cutStep} Filled: Cut ${cutVolume} @ ₩${cutPrice.toLocaleString()}, PnL=₩${pnl.toLocaleString()}, State ➡️ ${this.position.state}`);
   }
 
   /**
@@ -285,7 +293,7 @@ export class PositionManager {
    * Does NOT re-disable another DCA slot or reset cooldown.
    */
   public addAdditionalPartialCutFilled(cutVolume: number, cutPrice: number, pnl: number) {
-    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(6));
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
     this.position.realizedPnl += pnl;
     this.position.lastUpdatedAt = Date.now();
     this.saveStateToFile();
@@ -297,7 +305,7 @@ export class PositionManager {
    * Transitions to EMERGENCY_EXIT and then REENTRY_WAIT.
    */
   public onEmergencyTrendCutFilled(cutVolume: number, cutPrice: number, pnl: number) {
-    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(6));
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
     this.position.realizedPnl += pnl;
     this.position.state = 'EMERGENCY_EXIT';
     this.position.lastUpdatedAt = Date.now();
@@ -315,9 +323,10 @@ export class PositionManager {
    * cross upperBand again) before it can fire again.
    */
   public onTrailingPartialFilled(cutVolume: number, cutPrice: number, pnl: number) {
-    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(6));
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
     this.position.realizedPnl += pnl;
     this.position.lastUpdatedAt = Date.now();
+    this.position.trailingExitCount = (this.position.trailingExitCount || 0) + 1;
 
     // Disarm trailing: require a fresh higher high before the next partial take-profit can fire.
     this.position.trailingActive = false;
@@ -328,10 +337,11 @@ export class PositionManager {
       this.position.state = 'FLAT';
       this.position.pyramidingCount = 0;
       this.position.boxPyramidCount = 0;
+      this.position.trailingExitCount = 0;
     }
 
     this.saveStateToFile();
-    console.log(`[PositionManager] Trailing Partial Take-Profit: Sold ${cutVolume} @ ₩${cutPrice.toLocaleString()}, Remaining Qty=${this.position.amount}, PnL=₩${Math.round(pnl).toLocaleString()}`);
+    console.log(`[PositionManager] Trailing Partial Take-Profit (#${this.position.trailingExitCount}차): Sold ${cutVolume} @ ₩${cutPrice.toLocaleString()}, Remaining Qty=${this.position.amount}, PnL=₩${Math.round(pnl).toLocaleString()}`);
   }
 
   /**
@@ -339,7 +349,7 @@ export class PositionManager {
    * Reduces position amount without fully closing to FLAT until 100% completed.
    */
   public reducePositionOnPartialExit(cutVolume: number, pnl: number) {
-    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(6));
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
     this.position.realizedPnl += pnl;
     this.position.lastUpdatedAt = Date.now();
     this.saveStateToFile();
@@ -350,7 +360,12 @@ export class PositionManager {
    * Signal stabilization after dip: moves state to REENTRY_ALLOWED
    */
   public enableReentry() {
-    if (this.position.state === 'EMERGENCY_EXIT' || this.position.state === 'DEFENSIVE') {
+    if (
+      this.position.state === 'EMERGENCY_EXIT' ||
+      this.position.state === 'DEFENSIVE' ||
+      this.position.state === 'DEFENSIVE_1' ||
+      this.position.state === 'DEFENSIVE_2'
+    ) {
       this.position.state = 'REENTRY_ALLOWED';
       this.saveStateToFile();
     }
@@ -368,27 +383,56 @@ export class PositionManager {
     this.position.state = 'FLAT';
     this.position.trailingActive = false;
     this.position.trailingPeakPrice = null;
+    this.position.trailingExitCount = 0;
     this.position.pyramidingCount = 0;
     this.position.boxPyramidCount = 0;
     this.position.lastUpdatedAt = Date.now();
 
-    this.setCooldown(30, reason);
+    // Differentiated Smart Cooldown:
+    // 익절: 30초 빠른 회전 / 손절(STOP_LOSS/EMERGENCY): 180초(3분) 진정 쿨다운으로 연쇄 휩쏘 방지
+    const isLossCut = reason.includes('STOP_EXIT') || reason.includes('STOP_LOSS') || reason.includes('손절') || pnl < 0;
+    const cooldownSeconds = isLossCut ? 180 : 30;
+    const cooldownReason = isLossCut ? `LOSS_CUT_COOLDOWN_${reason}` : reason;
+
+    this.setCooldown(cooldownSeconds, cooldownReason);
     this.saveStateToFile();
-    console.log(`[PositionManager] Position 100% CLOSED (${reason}). Total Realized PnL: ₩${this.position.realizedPnl.toLocaleString()}`);
+    console.log(`[PositionManager] Position 100% CLOSED (${reason}). Realized PnL: ₩${Math.round(pnl).toLocaleString()}, Cooldown: ${cooldownSeconds}s`);
   }
 
   public updateTrailingState(currentPrice: number, upperBand: number) {
     const entryPrice = this.position.entryPrice || 0;
-    // Arming requires BOTH upper band touch AND price strictly above entry price (Profit Lock-in Gate)
-    if (this.position.amount > 0 && currentPrice >= upperBand && currentPrice > entryPrice) {
+    if (this.position.amount <= 0 || entryPrice <= 0) return;
+
+    // Profit Recovery: 부분 손절 후 가격이 반등하여 본전(+0.2%)을 회복하면 방어 상태 해제 ➡️ 정상 진입 상태로 복귀
+    if (currentPrice >= entryPrice * 1.002 && this.position.partialCutCount && this.position.partialCutCount > 0) {
+      console.log(`[PositionManager] 📈 Position recovered into profit (+${(((currentPrice - entryPrice) / entryPrice) * 100).toFixed(2)}%). Resetting defensive partial cut state.`);
+      this.position.partialCutCount = 0;
+      if (this.position.state === 'DEFENSIVE_1' || this.position.state === 'DEFENSIVE_2' || this.position.state === 'DEFENSIVE') {
+        this.position.state = 'ENTRY_FILLED';
+      }
+      this.saveStateToFile();
+    }
+
+    // Minimum Profit Arming Gate:
+    // 트레일링 콜백이 -0.8%이므로, 매도 시 확실한 플러스 수익(+0.2% 이상)을 보장하기 위해
+    // 평단 대비 최소 +1.0% 이상(또는 상단 밴드) 도달 시에만 트레일링을 무장(Active)
+    const minProfitArmingPrice = entryPrice * 1.010; // 평단가 대비 +1.0%
+    const effectiveArmingPrice = Math.max(upperBand, minProfitArmingPrice);
+
+    if (currentPrice >= effectiveArmingPrice) {
       if (!this.position.trailingActive) {
         this.position.trailingActive = true;
         this.position.trailingPeakPrice = currentPrice;
         this.position.state = 'TAKE_PROFIT';
-        console.log(`[PositionManager] Trailing Take Profit ACTIVATED @ ₩${currentPrice.toLocaleString()} (Entry: ₩${Math.round(entryPrice).toLocaleString()})`);
+        console.log(`[PositionManager] 🎯 Trailing Take Profit ARMED @ ₩${currentPrice.toLocaleString()} (Entry: ₩${Math.round(entryPrice).toLocaleString()}, Profit: +${(((currentPrice - entryPrice) / entryPrice) * 100).toFixed(2)}%)`);
+        this.saveStateToFile();
       } else if (this.position.trailingPeakPrice && currentPrice > this.position.trailingPeakPrice) {
         this.position.trailingPeakPrice = currentPrice;
+        this.saveStateToFile();
       }
+    } else if (this.position.trailingActive && this.position.trailingPeakPrice && currentPrice > this.position.trailingPeakPrice) {
+      this.position.trailingPeakPrice = currentPrice;
+      this.saveStateToFile();
     }
   }
 
@@ -406,7 +450,7 @@ export class PositionManager {
    */
   public reconcileWithExchange(realCoinQuantity: number, authoritativeAvgBuyPrice?: number | null, fallbackPrice?: number) {
     let stateChanged = false;
-    if (Math.abs(this.position.amount - realCoinQuantity) > 0.0001) {
+    if (Math.abs(this.position.amount - realCoinQuantity) > 1e-8) {
       console.warn(`[PositionManager] State Reconciliation: Local Amount (${this.position.amount}) != Exchange Real (${realCoinQuantity})`);
       this.position.amount = realCoinQuantity;
       stateChanged = true;

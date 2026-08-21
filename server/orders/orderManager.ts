@@ -5,8 +5,9 @@ import { UpbitClient, UpbitOrderResponse } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
 import { GlobalRiskGovernor } from '../risk/globalRiskGovernor';
 
-const ORDERS_FILE = path.join(process.cwd(), 'data', 'order_history.json');
-const PROCESSED_SIGNALS_FILE = path.join(process.cwd(), 'data', 'processed_signals.json');
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const ORDERS_FILE = path.join(DATA_DIR, 'order_history.json');
+const PROCESSED_SIGNALS_FILE = path.join(DATA_DIR, 'processed_signals.json');
 
 const FILL_CONFIRM_MAX_RETRIES = 5;
 const FILL_CONFIRM_INTERVAL_MS = 600; // 600ms between polls → max ~3s total
@@ -117,9 +118,9 @@ export class OrderManager {
   private mapUpbitState(upbitState: string, executedVolume: number, remainingVolume: number): OrderStatus {
     if (upbitState === 'done') return 'FILLED';
     if (upbitState === 'cancel') {
-      // In Upbit Market Orders, tiny remainder is cancelled after full fill.
-      // If any volume was executed, the order is FILLED and finalized!
-      if (executedVolume > 0) return 'FILLED';
+      // A cancelled order can have a partial execution.  It must remain a
+      // CANCELLED order so a full-exit handler never zeroes a still-open
+      // exchange position.
       return 'CANCELLED';
     }
     if (upbitState === 'wait' || upbitState === 'watch') {
@@ -390,8 +391,8 @@ export class OrderManager {
     onError: (error: string) => void,
     source: 'SUBMIT_FLOW' | 'WATCHER' = 'SUBMIT_FLOW'
   ) {
-    const prevStatus = record.status;
     const prevFilledVolume = record.filledVolume;
+    const prevFee = record.fee;
 
     record.exchangeOrderId = exchangeOrder.uuid;
     const { executedVolume, avgFillPrice, totalFee } = this.extractUpbitFillData(exchangeOrder);
@@ -406,6 +407,17 @@ export class OrderManager {
     record.error = undefined;
     this.saveOrdersToFile();
 
+    const newlyFilledVolume = Math.max(0, executedVolume - prevFilledVolume);
+    const newlyPaidFee = Math.max(0, totalFee - prevFee);
+    // Consumers must receive *only the newly filled amount*.  Passing the
+    // cumulative exchange volume on every watcher poll corrupts local
+    // positions and PnL after partial fills.
+    const incrementalRecord: OrderRecord = {
+      ...record,
+      filledVolume: newlyFilledVolume,
+      fee: newlyPaidFee
+    };
+
     console.log(`[OrderManager] 📊 Upbit confirmed (${source}): uuid=${exchangeOrder.uuid}, state=${exchangeOrder.state}, executed=${executedVolume}, avgPrice=₩${Math.round(avgFillPrice).toLocaleString()}`);
 
     if (status === 'FILLED') {
@@ -413,21 +425,32 @@ export class OrderManager {
         this.riskGovernor.commitExposure(record.clientOrderId);
       }
       this.watchingOrderIds.delete(record.id);
-      onFilled(record);
-
-      // Async fill notification guard: ONLY when coming from WATCHER/Reconciliation AND there is new fill progress
-      if (source === 'WATCHER' && (prevStatus !== 'FILLED' || executedVolume > prevFilledVolume)) {
-        this.onOrderUpdated?.(record, prevFilledVolume);
+      if (newlyFilledVolume > 0) {
+        if (source === 'WATCHER') {
+          this.onOrderUpdated?.(incrementalRecord, 0);
+        } else {
+          onFilled(incrementalRecord);
+        }
       }
     } else if (status === 'PARTIALLY_FILLED') {
       this.watchingOrderIds.add(record.id);
-      if (executedVolume > 0) {
-        onFilled(record);
-      }
-      if (source === 'WATCHER' && executedVolume > prevFilledVolume) {
-        this.onOrderUpdated?.(record, prevFilledVolume);
+      if (newlyFilledVolume > 0) {
+        if (source === 'WATCHER') {
+          this.onOrderUpdated?.(incrementalRecord, 0);
+        } else {
+          onFilled(incrementalRecord);
+        }
       }
     } else if (status === 'CANCELLED' || status === 'REJECTED') {
+      // Apply any partial execution before releasing the remaining BUY
+      // reservation.  A CANCELLED order is terminal, not a full fill.
+      if (newlyFilledVolume > 0) {
+        if (source === 'WATCHER') {
+          this.onOrderUpdated?.(incrementalRecord, 0);
+        } else {
+          onFilled(incrementalRecord);
+        }
+      }
       if (record.side === 'BUY' && this.riskGovernor) {
         this.riskGovernor.releaseExposure(record.clientOrderId);
       }
@@ -587,12 +610,10 @@ export class OrderManager {
         const list: OrderRecord[] = JSON.parse(raw);
         const now = Date.now();
         list.forEach((ord) => {
-          // If a pending/partially filled order is older than 5 minutes on file restore, mark as CANCELLED (finalized)
-          if ((ord.status === 'PARTIALLY_FILLED' || ord.status === 'OPEN' || ord.status === 'ORDER_SUBMITTING' || ord.status === 'ORDER_SUBMITTED' || ord.status === 'UNKNOWN_PENDING_RECONCILIATION') && (now - ord.createdAt) > 300000) {
-            ord.status = 'CANCELLED';
-            ord.error = 'Finalized on startup restore (stale order cleanup)';
-          }
           this.orders.set(ord.id, ord);
+          if (ord.status === 'PARTIALLY_FILLED' || ord.status === 'OPEN') {
+            this.watchingOrderIds.add(ord.id);
+          }
           if (ord.signalId) {
             this.processedSignalIds.add(ord.signalId);
           }

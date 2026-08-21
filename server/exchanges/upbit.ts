@@ -77,10 +77,14 @@ export class UpbitClient {
   public async fetchCandles(
     market: string = 'KRW-BTC',
     count: number = 30,
-    unit: string = 'minutes/1'
+    unit: string = 'minutes/1',
+    to?: string
   ): Promise<UpbitCandle[]> {
     const formattedMarket = UpbitClient.formatMarket(market);
-    const url = `https://api.upbit.com/v1/candles/${unit}?market=${formattedMarket}&count=${count}`;
+    let url = `https://api.upbit.com/v1/candles/${unit}?market=${formattedMarket}&count=${count}`;
+    if (to) {
+      url += `&to=${encodeURIComponent(to)}`;
+    }
 
     try {
       const res = await fetch(url);
@@ -92,6 +96,7 @@ export class UpbitClient {
       return data.reverse().map((item: any) => ({
         market: item.market,
         candle_date_time_utc: item.candle_date_time_utc,
+        candle_date_time_kst: item.candle_date_time_kst,
         opening_price: item.opening_price,
         high_price: item.high_price,
         low_price: item.low_price,
@@ -310,6 +315,7 @@ export class UpbitClient {
   public async getAccountBalance(accessKey: string, secretKey: string): Promise<{
     success: boolean;
     balances?: Record<string, number>;
+    lockedBalances?: Record<string, number>;
     avgBuyPrices?: Record<string, number>;
     error?: string;
   }> {
@@ -337,13 +343,16 @@ export class UpbitClient {
       }
 
       const balanceMap: Record<string, number> = {};
+      const lockedMap: Record<string, number> = {};
       const avgPriceMap: Record<string, number> = {};
       if (Array.isArray(data)) {
         data.forEach((acc: any) => {
           const balance = parseFloat(acc.balance);
+          const locked = parseFloat(acc.locked || '0');
           const avgPrice = parseFloat(acc.avg_buy_price || '0');
-          if (balance > 0) {
+          if (balance > 0 || locked > 0) {
             balanceMap[acc.currency] = balance;
+            lockedMap[acc.currency] = locked;
             if (avgPrice > 0) {
               avgPriceMap[acc.currency] = avgPrice;
             }
@@ -351,7 +360,7 @@ export class UpbitClient {
         });
       }
 
-      return { success: true, balances: balanceMap, avgBuyPrices: avgPriceMap };
+      return { success: true, balances: balanceMap, lockedBalances: lockedMap, avgBuyPrices: avgPriceMap };
     } catch (err: any) {
       if (err.name === 'AbortError') {
         return { success: false, error: 'Upbit API 응답 시간 초과 (6초). 네트워크 연결을 확인하세요.' };

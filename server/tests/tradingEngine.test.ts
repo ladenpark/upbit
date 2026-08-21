@@ -33,17 +33,19 @@ async function runAllTests() {
   console.log('🧪 Starting Automated Quantitative Trading Test Suite');
   console.log('======================================================');
 
-  // Clean test fixtures for isolated idempotent test suite execution
-  const testDataDir = path.resolve(process.cwd(), 'data');
+  // Clean test fixtures for isolated idempotent test suite execution only when not in live production
+  const testDataDir = process.env.DATA_DIR || path.resolve(process.cwd(), 'data');
   const reservationFile = path.join(testDataDir, 'exposure_reservations.json');
   const orderFile = path.join(testDataDir, 'order_history.json');
   const signalFile = path.join(testDataDir, 'processed_signals.json');
   const posFile = path.join(testDataDir, 'position_state.json');
 
-  if (fs.existsSync(reservationFile)) fs.writeFileSync(reservationFile, '[]', 'utf-8');
-  if (fs.existsSync(orderFile)) fs.writeFileSync(orderFile, '[]', 'utf-8');
-  if (fs.existsSync(signalFile)) fs.writeFileSync(signalFile, '[]', 'utf-8');
-  if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  if (process.env.NODE_ENV === 'test') {
+    if (fs.existsSync(reservationFile)) fs.writeFileSync(reservationFile, '[]', 'utf-8');
+    if (fs.existsSync(orderFile)) fs.writeFileSync(orderFile, '[]', 'utf-8');
+    if (fs.existsSync(signalFile)) fs.writeFileSync(signalFile, '[]', 'utf-8');
+    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  }
 
   const defaultParams: BotParams = {
     atrMultiplier: 3.0,
@@ -212,7 +214,7 @@ async function runAllTests() {
   posManager.onPartialLossCutFilled(0.4, 2700000, -60000);
   const defSnapshot = posManager.getSnapshot();
 
-  assert(defSnapshot.state === 'DEFENSIVE', 'Position transitioned to DEFENSIVE state after Partial Cut');
+  assert(defSnapshot.state === 'DEFENSIVE_1', 'Position transitioned to DEFENSIVE_1 state after first Partial Cut');
   assert(posManager.isUnderCooldown(), 'Cooldown timer is active following Partial Loss Cut');
 
   const dcaSignal = { ...buySignal, type: 'DCA_BUY' as const, reason: 'DCA Test' };
@@ -373,7 +375,7 @@ async function runAllTests() {
   };
   const partialVol = parseFloat(mockPartialOrder.executed_volume);
   assert(partialVol === 0.05, '[partial fill] Partial executed_volume correctly parsed');
-  assert(mockPartialOrder.state === 'cancel' && partialVol > 0, '[partial fill] cancel + executed_volume > 0 = PARTIALLY_FILLED');
+  assert(mockPartialOrder.state === 'cancel' && partialVol > 0, '[partial fill] cancel + executed_volume > 0 is terminal CANCELLED with a partial execution');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 9: Protective SELL During Pending BUY (문제 1 완전 검증)
@@ -811,16 +813,14 @@ async function runAllTests() {
   nonEntryPosManager.onPartialLossCutFilled(0.4, 2600000, -40000);
   const snapAfterCut1 = nonEntryPosManager.getSnapshot();
   assert(snapAfterCut1.amount === 1.6, '[Partial Cut] Position amount reduced to 1.6 ETH');
-  assert(snapAfterCut1.state === 'DEFENSIVE', '[Partial Cut] Position state is DEFENSIVE');
-  const disabledSlots1 = snapAfterCut1.dcaSlots.filter((s) => s.status === 'DISABLED').length;
-  assert(disabledSlots1 === 1, '[Partial Cut] Exactly 1 DCA slot disabled');
+  assert(snapAfterCut1.state === 'DEFENSIVE_1', '[Partial Cut] Position state is DEFENSIVE_1');
+  assert(nonEntryPosManager.isUnderCooldown(), '[Partial Cut] Cooldown is armed before any DCA re-entry');
 
   // Step 2: Watcher detects remaining 0.4 ETH cut -> call addAdditionalPartialCutFilled
   nonEntryPosManager.addAdditionalPartialCutFilled(0.4, 2600000, -40000);
   const snapAfterCut2 = nonEntryPosManager.getSnapshot();
   assert(snapAfterCut2.amount === 1.2, '[Partial Cut] Position amount reduced to exact 1.2 ETH');
-  const disabledSlots2 = snapAfterCut2.dcaSlots.filter((s) => s.status === 'DISABLED').length;
-  assert(disabledSlots2 === 1, '[Partial Cut] DCA disabled slots remain 1 (No duplicate slot disable!)');
+  assert(snapAfterCut2.state === 'DEFENSIVE_1', '[Partial Cut] Incremental fill preserves defensive state');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 14: Breakout 1st Entry (BULL Market Momentum Entry)
@@ -846,7 +846,10 @@ async function runAllTests() {
     { ...defaultParams, breakoutEntryEnabled: true },
     flatPosition,
     0.05,
-    bullPriceHistory
+    bullPriceHistory,
+    undefined,
+    50,
+    1.2
   );
 
   assert(breakoutSignals.length === 1, '[Breakout Entry] Exactly 1 signal generated in Bull trend');

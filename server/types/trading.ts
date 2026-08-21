@@ -46,6 +46,8 @@ export interface Signal {
     slope: number;
     volatilityRatio: number;
     dynamicOrderRatio: number;
+    rsi?: number;
+    volumeMultiplier?: number;
   };
 }
 
@@ -128,6 +130,8 @@ export type PositionState =
   | 'ENTRY_FILLED'
   | 'DCA_MODE'
   | 'DEFENSIVE'
+  | 'DEFENSIVE_1'
+  | 'DEFENSIVE_2'
   | 'EMERGENCY_EXIT'
   | 'COOLDOWN'
   | 'REENTRY_WAIT'
@@ -164,9 +168,11 @@ export interface PositionSnapshot {
   pyramidingCount: number;
   maxPyramidingOrders: number;
   boxPyramidCount: number;
+  partialCutCount?: number;
   // Trailing Take Profit State
   trailingActive: boolean;
   trailingPeakPrice: number | null;
+  trailingExitCount?: number;
   // Cooldown
   cooldownUntil: number;
   cooldownReason?: string;
@@ -204,6 +210,9 @@ export interface AdaptiveIndicators {
   marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
   slope: number;
   volatilityRatio: number;
+  rsi: number;
+  volumeMultiplier: number;
+  volumeMa: number;
 }
 
 export interface NextOrderItem {
@@ -250,6 +259,8 @@ export interface PricePoint {
   baseline: number;
   lowerBand: number;
   stopLoss: number;
+  rsi?: number;
+  volume?: number;
   event?: 'BUY' | 'SELL' | 'STOP_LOSS';
 }
 

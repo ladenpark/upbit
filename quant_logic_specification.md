@@ -79,54 +79,55 @@ Priority 6: BREAKOUT_BUY (Rule 9)       (1차 상승 모멘텀 돌파 매수)
 Priority 6: BREAKOUT_BUY (Rule 9-b)     (박스권 상단 스캘핑 매수 - 예산 50%)
 ```
 
-- **Priority 1: ABSOLUTE_STOP_EXIT (정적 손절선 이탈 -> 100% 전량 청산)**
-  - 발동 조건: `hasPosition` AND `현재가 <= position.initialStopPrice` (진입 시 확정 스냅샷된 손절선)
+- **Priority 1: ABSOLUTE_STOP_EXIT (마지노선 절대 손절 -> 100% 전량 청산)**
+  - 발동 조건: `hasPosition` AND (`현재가 <= position.initialStopPrice` OR `pnlPercent <= -6.0%`)
+  - **최후 마지노선 하한선(-6.0%)**: 중간의 -1.0%(30% 덜어내기), -2.0%(DCA 1차), -3.2%(50% 덜어내기), -4.2%(DCA 2차) 방어선이 모두 뚫리고 통제 불능의 원웨이 폭락장 진입 시에만 최후 원금 보호를 위해 발동.
   - 실행: 보유 코인 100% 전량 지정가 매도.
+  - 체결 후 동작: 포지션 `FLAT` 복귀, **손절 전용 180초(3분) 진정 쿨다운** 적용하여 뇌동매매 연쇄 손절 방지.
 
 - **Priority 2: EMERGENCY_TREND_CUT (플래시 크래시 방어)**
   - 발동 조건: `hasPosition` AND `params.trendAwareCutEnabled` AND `현재가 < lowerBand` AND 최근 3초 내 낙폭 속도(`dropSpeed`)가 -1.8% 이하 급락.
   - 실행: 보유 수량의 40% 선제 손절 후 포지션 상태를 `EMERGENCY_EXIT`으로 전환.
 
-- **Priority 2: PARTIAL_LOSS_CUT (자금순환 부분 손절)**
-  - 발동 조건: `hasPosition` AND `params.partialLossCutEnabled` AND `pnlPercent <= -4.5%` AND 포지션 상태가 `DEFENSIVE`/`EMERGENCY_EXIT`이 아님.
-  - 실행: 보유 수량의 40% 분할 손절 후 포지션 상태를 `DEFENSIVE`로 전환.
+- **Priority 2: PARTIAL_LOSS_CUT (자금순환 2단계 리사이클링 덜어내기)**
+  - **1단계 덜어내기 (Rule 3-a)**: 진입 평단 대비 **`-1.0%`** 하락 시 ➡️ 보유 수량의 **`30% 선제 매도`** (현금 회수 ➡️ DCA 1차 추매 대기).
+  - **2단계 덜어내기 (Rule 3-b)**: 진입 평단 대비 **`-3.2%`** 추가 하락 시 ➡️ 잔여 수량의 **`50% 추가 매도`** (현금 대거 회수 ➡️ DCA 2차 바닥 추매 대기).
+  - **수익 복귀 시 자동 리셋**: 만약 덜어낸 후 시세가 반등하여 본전(+0.2%)을 회복하면, 방어 상태가 즉시 해제되어 불타기(Rule 7) 및 스캘핑/트레일링 익절 모드로 자동 복원.
 
-- **Priority 3: SCALP_TAKE_PROFIT (박스권 짤짤이 전량 익절)**
-  - 발동 조건: `hasPosition` AND `params.autoPilotEnabled` AND `adaptive.marketRegime === 'SIDEWAYS'` AND `!position.trailingActive` AND `pnlPercent >= adaptive.dynamicScalpTakeProfitPercent` (+0.5% ~ +0.8%)
+- **Priority 5: DCA_BUY (자금순환형 저점 1.5x/2.0x 스케일업 추매)**
+  - **DCA #1차**: 평단 대비 **`-2.0%`** 저점 도달 시 ➡️ 위에서 챙겨둔 현금으로 **`1.5 Unit`** 적극 매수 (평단가 급격히 인하!).
+  - **DCA #2차**: 평단 대비 **`-4.2%`** 과매도 바닥 도달 시 ➡️ 챙겨둔 현금으로 **`2.0 Unit`** 바닥 대량 매수 (최종 탈출 평단 세팅 & 평단가 변경 시 덜어내기 카운트 자동 리셋).
+  - **DCA #3차**: 평단 대비 **`-5.5%`** 극단 저점 매수 (`1.5 Unit`).
+
+- **Priority 3: SCALP_TAKE_PROFIT (박스권 짤짤이 전량 익절 - 불타기 연동 계단식 목표)**
+  - 발동 조건: `hasPosition` AND `params.autoPilotEnabled` AND `adaptive.marketRegime === 'SIDEWAYS'` AND `!position.trailingActive` AND `pnlPercent >= steppedScalpTp`
+    - 0회 불타기: **+0.50%** (기본 목표)
+    - 1회 불타기: **+0.65%**
+    - 2회 불타기: **+0.85%**
   - 실행: 보유 코인 **100% 전량 매도**.
-  - 체결 후 동작: 포지션 `FLAT` 복귀, 30초 쿨다운 적용 (봇 정지 `HALTED` 없음). 30초 후 가격 재등락 시 자동 재진입 사이클 가동.
+  - 체결 후 동작: 포지션 `FLAT` 복귀, 정상 익절 30초 쿨다운 적용. 30초 후 가격 재등락 시 자동 재진입 사이클 가동.
 
-- **Priority 3: TRAILING_STOP_EXIT (50% 반복 부분 익절 & 더스트 가드 & Profit Lock Gate)**
-  - **무장(Arm)**: `현재가 >= Baseline + (ATR * Multiplier)` AND **`현재가 > 진입 평단가` (Profit Lock-in Gate)** 도달 시 트레일링 활성화 (`trailingActive = true`), 최고가(`trailingPeakPrice`) 실시간 갱신.
-  - **발동 조건**: `(최고가 - 현재가) / 최고가 >= dynamicTrailingCallback` (되돌림 발생) AND **`현재가 > 진입 평단가` (수익 보장 Gate, pnlPercent >= +0.1%)**.
-  - **원금 보존 보장**: 최고점에서 되돌림이 발생하더라도 현재가가 평단가 이하로 내려가면 트레일링 익절로 매도되지 않음 (손실 매도 방지).
-  - **실행**:
-    - 보유 수량의 **50% 부분 매도**.
-    - 매도 후 남는 잔여 가치가 **10,000원 미만(Dust Guard)**인 경우 **100% 전량 매도로 자동 전환**.
-    - 부분 매도 체결 즉시 `trailingActive = false`, `trailingPeakPrice = null`로 무장 해제 -> 다음 익절을 위해서는 상단 밴드를 다시 뚫는 새로운 신고가 형성 요구.
+- **Priority 3: TRAILING_STOP_EXIT (2단계 전량 익절 & Profit Lock Gate)**
+  - **무장(Arm)**: `현재가 >= Baseline + (ATR * Multiplier)` AND `현재가 >= 진입 평단가 * 1.010` (+1.0% 이상 확실한 수익 구간 진입) 도달 시 트레일링 활성화 (`trailingActive = true`), 최고가(`trailingPeakPrice`) 실시간 갱신. (얕은 고점에서의 성급한 무장 원천 차단)
+  - **발동 조건**: `(최고가 - 현재가) / 최고가 >= dynamicTrailingCallback` (-0.8% 콜백 꺾임 발생) AND `현재가 > 진입 평단가`.
+  - **수익 보장 하한선 (Floor Clamping)**: 트레일링 매도가는 최고점 -0.8% 콜백 가격과 평단가 +0.2% 중 높은 가격(`Math.max(peak * 0.992, entry * 1.002)`)으로 고정되어, 어떠한 경우에도 평단가보다 낮은 손실 매도가 발생하지 않도록 100% 보장.
+  - **2단계 전량 매도 (2-Step Full Exit)**:
+    - **1차 익절**: 보유 수량의 **50% 분할 매도** (확정 수익 실현).
+    - **2차 익절 (또는 잔여 평가금 50만 원 미만)**: 남은 잔여 수량 **100% 전량 매도** ➡️ 즉시 `FLAT` 복귀 + 30초 쿨다운 후 새로운 사이클 시작! (Zeno 쪼개기 현상 원천 차단)
 
-- **Priority 4: REENTRY_BUY (스마트 바닥 재진입)**
-  - 발동 조건: 포지션 상태가 `REENTRY_ALLOWED` (DEFENSIVE/EMERGENCY_EXIT 상태에서 급락 진정 `dropSpeed >= -0.3%` 및 `현재가 > lowerBand` 확인 시 전환).
-  - 실행: 세이브된 현금으로 최저점 재진입.
+- **Priority 6: Pyramiding Buy (대세 상승 불타기 - Rule 7) & Box Pyramid Buy (박스권 2단계 0.50 Unit 스케일업 불타기 - Rule 7-b)**
+  - **Trailing Distribution Gate (청산 국면 불타기 전면 차단)**: 1차 트레일링 익절이 한 번이라도 시작된 포지션(`trailingExitCount >= 1`)에서는 **완전히 FLAT이 될 때까지 모든 불타기(Rule 7, Rule 7-b)를 100% 원천 차단**하여 고점 매도 직후 재매수하는 엇박자 버그를 완벽 방지.
+  - **박스권 2단계 스케일업 불타기 (Rule 7-b)**:
+    - 1차: **0.50 Unit** (평단 대비 +0.25% 도달 시)
+    - 2차: **0.50 Unit** (평단 대비 +0.25% 도달 시)
+  - 특징: 0.5 Unit 단위로 시원하게 추가 매수하여 반등 시 계좌 보유 물량을 1.8~2.5 ETH로 불려 큰 수익 실현.
 
-- **Priority 5: Smart DCA Buy (마틴게일 분할 물타기)**
-  - 발동 조건: `hasPosition` AND `params.dcaEnabled` AND `평단 대비 하락률 >= dynamicDcaStep * SlotNumber` (최대 3회: 1차, 2차, 3차).
-  - 수량 스케일: `1.2 ^ SlotNumber` (1차 1.2배, 2차 1.44배, 3차 1.728배).
-
-- **Priority 6: Pyramiding Buy (대세 상승장 불타기 - Rule 7)**
-  - 발동 조건: `hasPosition` AND `params.pyramidingEnabled` AND `수익률 >= 1.5% * (pyramidingCount + 1)` AND `adaptive.marketRegime === 'BULL'` (최대 2회).
-  - 특징: 대세 상승장(`BULL`) 국면에서만 허용 (`SIDEWAYS`나 `BEAR`에서는 엄격 차단).
-
-- **Priority 6: Box-Range Pyramid Buy (박스권 소액 불타기 - Rule 7-b)**
-  - 발동 조건: `hasPosition` AND `params.pyramidingEnabled` AND `autoPilotEnabled` AND `수익률 >= 0.25%` AND `marketRegime === 'SIDEWAYS'` AND `!trailingActive` (최대 1회).
-  - 특징: 박스권 내 변동성을 활용하여 예산을 일반 진입의 1/4로 엄격히 제한해 진입. 기존 상승장(BULL) 불타기 카운터(`pyramidingCount`)와 완전히 독립적인 별도 카운터(`boxPyramidCount`)로 관리.
-
-- **Priority 6: 1차 진입 5대 규칙 (FLAT 상태)**
-  1. **Rule 8 (ENTRY_BUY - 하단 밴드 과매도 진입)**: `현재가 <= lowerBand`
-  2. **Rule 8-b (ENTRY_BUY - 박스권 하단 스캘핑 진입)**: `autoPilotEnabled` AND `regime !== 'BULL'` AND `현재가 <= Baseline - (ATR * dynamicScalpBandMultiplier)` AND `현재가 > lowerBand` (예산 50% 축소)
-  3. **Rule 8-c (ENTRY_BUY - 박스권 저점 반등 확인 진입)**: `autoPilotEnabled` AND `regime !== 'BULL'` AND 과거 10틱 최저점이 기준선 이하일 때 대비 `+0.15%` 반등 확인 시 진입 (예산 75% 축소, 일반 진입의 1/4)
-  4. **Rule 9 (BREAKOUT_BUY - 상승 모멘텀 돌파 진입)**: `현재가 > Baseline` AND (`marketRegime === 'BULL'` OR `slope >= 0.10`)
-  5. **Rule 9-b (BREAKOUT_BUY - 박스권 상단 스캘핑 진입)**: `autoPilotEnabled` AND `regime === 'SIDEWAYS'` AND `현재가 > Baseline` AND `현재가 <= Baseline + (ATR * dynamicScalpBandMultiplier)` (예산 50% 축소)
+- **Priority 6: 1차 진입 5대 규칙 (3중 퀀트 필터 적용: ATR + RSI + Volume)**
+  1. **Rule 8 (ENTRY_BUY - 하단 밴드 과매도 진입)**: `현재가 <= lowerBand` (RSI 과매도 영역 확인)
+  2. **Rule 8-b (ENTRY_BUY - 박스권 하단 스캘핑 진입)**: `autoPilotEnabled` AND `regime !== 'BULL'` AND `현재가 <= Baseline - (ATR * dynamicScalpBandMultiplier)` AND `현재가 > lowerBand`
+  3. **Rule 8-c (ENTRY_BUY - 박스권 저점 반등 확인 진입)**: `autoPilotEnabled` AND `regime !== 'BULL'` AND 과거 10분 최저점 대비 `+0.15%` 반등 확인 시 진입
+  4. **Rule 9 (BREAKOUT_BUY - 상승 모멘텀 돌파 진입)**: `현재가 > Baseline` AND (`marketRegime === 'BULL'` OR `slope >= 0.10`) AND **`RSI <= 68` (과열 상투 진입 방지)** AND **`Volume >= 1.15x` (거래량 실린 진짜 돌파 검증)**
+  5. **Rule 9-b (BREAKOUT_BUY - 박스권 상단 스캘핑 진입)**: `autoPilotEnabled` AND `regime === 'SIDEWAYS'` AND `현재가 > Baseline` AND `현재가 <= Baseline + (ATR * dynamicScalpBandMultiplier)` AND **`RSI <= 65` (과열 방지)**
 
 ---
 

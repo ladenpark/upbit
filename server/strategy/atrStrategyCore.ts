@@ -18,7 +18,10 @@ export class ATRStrategyCore {
     atrValue: number,
     params: BotParams,
     priceHistory: number[],
-    higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number }
+    higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number },
+    rsi: number = 50.0,
+    volumeMultiplier: number = 1.0,
+    volumeMa: number = 0.0
   ) {
     if (priceHistory.length < 15) {
       return {
@@ -30,7 +33,10 @@ export class ATRStrategyCore {
         dynamicScalpTakeProfitPercent: 0.5,
         marketRegime: 'SIDEWAYS' as const,
         slope: 0,
-        volatilityRatio: 1.5
+        volatilityRatio: 1.5,
+        rsi,
+        volumeMultiplier,
+        volumeMa
       };
     }
 
@@ -43,13 +49,23 @@ export class ATRStrategyCore {
     const priceToBaseline = ((currentPrice - baselineValue) / baselineValue) * 100;
     const volatilityRatio = baselineValue > 0 ? (atrValue / baselineValue) * 100 : 1.5;
 
-    // Multi-Timeframe Confluence Regime Determination (15m + 1m)
+    // Multi-Timeframe Confluence Regime Determination (15m HTF + 1m Price Position + Micro Slope)
     let marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR' = 'SIDEWAYS';
     const htf = higherTfTrend?.trend || 'SIDEWAYS';
 
-    if (slope > 0.10 && priceToBaseline > 0.05 && htf !== 'BEAR') {
+    const isBullConfluence =
+      (htf === 'BULL' && priceToBaseline > 0) ||
+      (priceToBaseline >= 0.20 && htf !== 'BEAR') ||
+      (slope > 0.10 && priceToBaseline > 0.05 && htf !== 'BEAR');
+
+    const isBearConfluence =
+      (htf === 'BEAR' && priceToBaseline < 0) ||
+      (priceToBaseline <= -0.20 && htf !== 'BULL') ||
+      (slope < -0.10 && priceToBaseline < -0.05 && htf !== 'BULL');
+
+    if (isBullConfluence) {
       marketRegime = 'BULL';
-    } else if (slope < -0.10 && priceToBaseline < -0.05 && htf !== 'BULL') {
+    } else if (isBearConfluence) {
       marketRegime = 'BEAR';
     }
 
@@ -106,7 +122,10 @@ export class ATRStrategyCore {
       dynamicScalpTakeProfitPercent,
       marketRegime,
       slope,
-      volatilityRatio
+      volatilityRatio,
+      rsi,
+      volumeMultiplier,
+      volumeMa
     };
   }
 
@@ -121,12 +140,15 @@ export class ATRStrategyCore {
     position: PositionSnapshot,
     dropSpeed: number,
     priceHistory: number[],
-    higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number }
+    higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number },
+    rsi: number = 50.0,
+    volumeMultiplier: number = 1.0,
+    volumeMa: number = 0.0
   ): Signal[] {
     const signals: Signal[] = [];
     const now = Date.now();
 
-    const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, priceHistory, higherTfTrend);
+    const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, priceHistory, higherTfTrend, rsi, volumeMultiplier, volumeMa);
     const effectiveAtrMultiplier = params.autoPilotEnabled ? adaptive.dynamicAtr : params.atrMultiplier;
 
     // Minimum ATR Floor to prevent tick-size quantization trap (minimum 0.25% of price or 5,000 KRW)
@@ -145,7 +167,9 @@ export class ATRStrategyCore {
       marketRegime: adaptive.marketRegime,
       slope: adaptive.slope,
       volatilityRatio: adaptive.volatilityRatio,
-      dynamicOrderRatio: adaptive.dynamicOrderRatio
+      dynamicOrderRatio: adaptive.dynamicOrderRatio,
+      rsi: adaptive.rsi,
+      volumeMultiplier: adaptive.volumeMultiplier
     };
 
     const hasPosition = position.amount > 0 && position.entryPrice !== null;
@@ -153,9 +177,9 @@ export class ATRStrategyCore {
     const pnlPercent = hasPosition ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
 
     // --- Rule 1: Absolute Stop Loss (Priority 1) ---
-    // Uses position's static initialStopPrice snapshot if available
-    const stopLossPrice = position.initialStopPrice || (lowerBand - (atrValue * params.stopLossMultiplier));
-    if (hasPosition && currentPrice <= stopLossPrice) {
+    // Uses position's static initialStopPrice snapshot if available (-6.0% absolute floor)
+    const stopLossPrice = position.initialStopPrice || (entryPrice * 0.94);
+    if (hasPosition && (currentPrice <= stopLossPrice || pnlPercent <= -6.0)) {
       signals.push({
         id: `SIG_STOP_${now}`,
         timestamp: now,
@@ -165,7 +189,7 @@ export class ATRStrategyCore {
         priority: 1,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[절대 손절선 이탈] 진입가 대비 ${pnlPercent.toFixed(2)}% 하락 (스탑가: ₩${Math.round(stopLossPrice).toLocaleString()})`,
+        reason: `[마지노선 절대 손절] 진입가 대비 ${pnlPercent.toFixed(2)}% 이탈 ➡️ 원금보호 100% 전량 청산`,
         indicatorSnapshot: snapshot
       });
       return signals; // Absolute stop overrides everything
@@ -193,36 +217,61 @@ export class ATRStrategyCore {
       return signals;
     }
 
-    // --- Rule 3: Partial Loss Cut (Priority 2) ---
-    if (
-      hasPosition &&
-      params.partialLossCutEnabled &&
-      pnlPercent <= -Math.abs(params.partialLossCutThreshold) &&
-      position.state !== 'DEFENSIVE' &&
-      position.state !== 'EMERGENCY_EXIT'
-    ) {
-      signals.push({
-        id: `SIG_PARTIAL_CUT_${now}`,
-        timestamp: now,
-        timeframe: 'tick',
-        source: 'PARTIAL_LOSS_CUT',
-        type: 'PARTIAL_LOSS_CUT',
-        priority: 2,
-        symbol: params.symbol,
-        price: currentPrice,
-        reason: `[자금순환 부분손절] 손실률 ${pnlPercent.toFixed(2)}% 도달 ➡️ ${params.partialLossCutPercent}% 분할 손절로 바닥 물타기 현금 회수`,
-        indicatorSnapshot: snapshot
-      });
-      return signals;
+    // --- Rule 3: 2-Stage Capital Recycling Partial Loss Cuts (Priority 2) ---
+    const cutCount = position.partialCutCount || 0;
+    if (hasPosition && params.partialLossCutEnabled && position.state !== 'EMERGENCY_EXIT') {
+      // 1st Stage: -1.0% drop -> trim 30% to secure cash for DCA #1
+      if (cutCount === 0 && pnlPercent <= -1.0) {
+        signals.push({
+          id: `SIG_PARTIAL_CUT_1_${now}`,
+          timestamp: now,
+          timeframe: 'tick',
+          source: 'PARTIAL_LOSS_CUT',
+          type: 'PARTIAL_LOSS_CUT',
+          priority: 2,
+          symbol: params.symbol,
+          price: currentPrice,
+          reason: `[자금순환 1차 부분손절] 진입가 대비 ${pnlPercent.toFixed(2)}% 하락 ➡️ 30% 현금 회수 (DCA 1차 리사이클링 대기)`,
+          indicatorSnapshot: snapshot
+        });
+        return signals;
+      }
+      // 2nd Stage: -3.2% drop -> trim 50% of remaining to secure cash for DCA #2
+      else if (cutCount === 1 && pnlPercent <= -3.2) {
+        signals.push({
+          id: `SIG_PARTIAL_CUT_2_${now}`,
+          timestamp: now,
+          timeframe: 'tick',
+          source: 'PARTIAL_LOSS_CUT',
+          type: 'PARTIAL_LOSS_CUT',
+          priority: 2,
+          symbol: params.symbol,
+          price: currentPrice,
+          reason: `[자금순환 2차 부분손절] 진입가 대비 ${pnlPercent.toFixed(2)}% 하락 ➡️ 잔여 수량 50% 현금 회수 (DCA 2차 리사이클링 대기)`,
+          indicatorSnapshot: snapshot
+        });
+        return signals;
+      }
     }
 
     // --- Rule 3-b: Box-Range Scalp Take-Profit (Priority 3, SIDEWAYS only, Full Exit) ---
+    // Scalp TP target dynamically scales up with pyramid count so multi-stage add-ons are fully realized:
+    // 0 adds: 0.50% | 1 add: 0.60% | 2 adds: 0.70% | 3 adds: 0.85%
+    let scalpTpTargetPercent = adaptive.dynamicScalpTakeProfitPercent;
+    if (position.boxPyramidCount === 1) {
+      scalpTpTargetPercent = Math.max(scalpTpTargetPercent, 0.60);
+    } else if (position.boxPyramidCount === 2) {
+      scalpTpTargetPercent = Math.max(scalpTpTargetPercent, 0.70);
+    } else if (position.boxPyramidCount >= 3) {
+      scalpTpTargetPercent = Math.max(scalpTpTargetPercent, 0.85);
+    }
+
     if (
       hasPosition &&
       params.autoPilotEnabled &&
       adaptive.marketRegime === 'SIDEWAYS' &&
       !position.trailingActive &&
-      pnlPercent >= adaptive.dynamicScalpTakeProfitPercent
+      pnlPercent >= scalpTpTargetPercent
     ) {
       signals.push({
         id: `SIG_SCALP_TP_${now}`,
@@ -233,7 +282,7 @@ export class ATRStrategyCore {
         priority: 3,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[박스권 짤짤이 익절] 목표 수익률 +${adaptive.dynamicScalpTakeProfitPercent.toFixed(2)}% 도달 (수익률: +${pnlPercent.toFixed(2)}%) ➡️ 전량 매도`,
+        reason: `[박스권 짤짤이 익절] 목표 수익률 +${scalpTpTargetPercent.toFixed(2)}% 도달 (수익률: +${pnlPercent.toFixed(2)}%) ➡️ 전량 매도`,
         indicatorSnapshot: snapshot
       });
       return signals;
@@ -245,12 +294,18 @@ export class ATRStrategyCore {
       
       if (position.trailingActive && position.trailingPeakPrice) {
         const peakPrice = position.trailingPeakPrice;
+        const entryPrice = position.entryPrice || currentPrice;
+
+        // Minimum Guaranteed Profit Floor: 트레일링 매도가는 평단 대비 최소 +0.2% 이상으로 하한선 고정
+        const rawExitPrice = peakPrice * (1 - effectiveCallback / 100);
+        const minFloorExitPrice = entryPrice * 1.002; // 평단 대비 +0.2% 보장선
+        const targetExitPrice = Math.max(rawExitPrice, minFloorExitPrice);
+
         const pullbackPercent = ((peakPrice - currentPrice) / peakPrice) * 100;
-        
-        // Profit Lock Gate: Trailing exit is strictly executed ONLY when in net profit above entry price
+        const isPullback = currentPrice <= targetExitPrice;
         const isNetProfit = pnlPercent >= 0.1 && (position.entryPrice ? currentPrice > position.entryPrice : true);
 
-        if (pullbackPercent >= effectiveCallback && isNetProfit) {
+        if (isPullback && isNetProfit) {
           signals.push({
             id: `SIG_TRAILING_EXIT_${now}`,
             timestamp: now,
@@ -286,33 +341,41 @@ export class ATRStrategyCore {
     }
 
     // --- Rule 6: Smart DCA Buy (Priority 5) ---
-    if (hasPosition && params.dcaEnabled && position.state !== 'DEFENSIVE' && position.state !== 'EMERGENCY_EXIT') {
-      const effectiveDcaStep = params.autoPilotEnabled ? adaptive.dynamicDcaStep : params.safetyOrderStepPercent;
+    if (hasPosition && params.dcaEnabled && position.state !== 'EMERGENCY_EXIT') {
       const dropFromEntry = ((entryPrice - currentPrice) / entryPrice) * 100;
       
       // Find next available DCA slot
       const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE');
-      if (nextSlot && dropFromEntry >= effectiveDcaStep * nextSlot.slotNumber) {
-        signals.push({
-          id: `SIG_DCA_${nextSlot.slotNumber}_${now}`,
-          timestamp: now,
-          timeframe: 'tick',
-          source: 'DCA_ENGINE',
-          type: 'DCA_BUY',
-          priority: 5,
-          symbol: params.symbol,
-          price: currentPrice,
-          reason: `[DCA ${nextSlot.slotNumber}차 물타기] 평단 대비 -${dropFromEntry.toFixed(2)}% 하락 분할 매수`,
-          indicatorSnapshot: snapshot
-        });
-        return signals;
+      if (nextSlot) {
+        // Slot 1: -2.0% (1차 30% 덜어낸 후 저점 추매) | Slot 2: -4.2% (2차 50% 덜어낸 후 저점 추매) | Slot 3: -5.5%
+        const slotDropTarget = nextSlot.slotNumber === 1 ? 2.0 : nextSlot.slotNumber === 2 ? 4.2 : 5.5;
+        if (dropFromEntry >= slotDropTarget) {
+          signals.push({
+            id: `SIG_DCA_${nextSlot.slotNumber}_${now}`,
+            timestamp: now,
+            timeframe: 'tick',
+            source: 'DCA_ENGINE',
+            type: 'DCA_BUY',
+            priority: 5,
+            symbol: params.symbol,
+            price: currentPrice,
+            reason: `[DCA ${nextSlot.slotNumber}차 리사이클링 추매] 평단 대비 -${dropFromEntry.toFixed(2)}% 저점 도달 ➡️ 세이브된 현금으로 평단가 대폭 인하 매수`,
+            indicatorSnapshot: snapshot
+          });
+          return signals;
+        }
       }
     }
+
+    // Trailing Distribution Gate: 한 번이라도 트레일링 익절이 시작된 포지션은 전량 청산(FLAT)까지 모든 불타기 일체 금지
+    const hasTrailingExitedThisCycle = Boolean(position.trailingExitCount && position.trailingExitCount >= 1);
 
     // --- Rule 7: Pyramiding Buy (Priority 6) ---
     if (
       hasPosition &&
       params.pyramidingEnabled &&
+      !hasTrailingExitedThisCycle &&
+      !position.trailingActive &&
       position.pyramidingCount < params.maxPyramidingOrders &&
       pnlPercent >= params.pyramidingStepPercent * (position.pyramidingCount + 1) &&
       adaptive.marketRegime === 'BULL'
@@ -332,19 +395,23 @@ export class ATRStrategyCore {
       return signals;
     }
 
-    // --- Rule 7-b: Sideways Box-Range Pyramid Buy (Priority 6, 독립 카운터, 최대 1회) ---
-    const BOX_PYRAMID_MAX_ADDS = 1; // 박스권에서는 최대 1회만 (하락 리스크 제한)
-    const BOX_PYRAMID_STEP_PERCENT = 0.25; // 짤짤이 목표수익(0.5~0.8%)보다 낮은 지점에서만
+    // --- Rule 7-b: Sideways Box-Range Pyramid Buy (Priority 6, 2-Stage Scaled: 0.50 -> 0.50 Unit) ---
+    const BOX_PYRAMID_MAX_ADDS = 2; // 최대 2회 분할 불타기 (0.50 Unit씩)
+    const BOX_PYRAMID_STEP_PERCENT = 0.25; // 각 단계별 평단 대비 +0.25% 상승 시 추가 매수
+    const BOX_PYRAMID_RATIOS = [0.50, 0.50];
 
     if (
       hasPosition &&
       params.pyramidingEnabled &&
       params.autoPilotEnabled &&
-      adaptive.marketRegime === 'SIDEWAYS' &&
+      !hasTrailingExitedThisCycle &&
       !position.trailingActive &&
+      adaptive.marketRegime === 'SIDEWAYS' &&
       position.boxPyramidCount < BOX_PYRAMID_MAX_ADDS &&
       pnlPercent >= BOX_PYRAMID_STEP_PERCENT
     ) {
+      const stage = position.boxPyramidCount + 1;
+      const unitScale = BOX_PYRAMID_RATIOS[position.boxPyramidCount] || 0.50;
       signals.push({
         id: `SIG_BOX_PYRAMID_${now}`,
         timestamp: now,
@@ -354,14 +421,17 @@ export class ATRStrategyCore {
         priority: 6,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[박스권 불타기 추가매수] 보유 포지션 +${pnlPercent.toFixed(2)}% 수익 중 소액 추가매수 (국면: SIDEWAYS)`,
+        reason: `[박스권 불타기 #${stage}차] 보유 포지션 +${pnlPercent.toFixed(2)}% 수익 중 (${unitScale} Unit) 적극 추가매수 (국면: SIDEWAYS)`,
         indicatorSnapshot: snapshot
       });
       return signals;
     }
 
+    // Falling Knife Shield: 상위 타임프레임이 하락세이면서 급락 속도가 빠르면 바닥 확인 전 진입 보류
+    const isFallingKnife = snapshot.slope < -0.08 && (higherTfTrend?.trend === 'BEAR' || adaptive.marketRegime === 'BEAR');
+
     // --- Rule 8: Initial 1st Entry Buy (Priority 6) ---
-    if (!hasPosition && position.state === 'FLAT' && currentPrice <= lowerBand) {
+    if (!hasPosition && position.state === 'FLAT' && currentPrice <= lowerBand && !isFallingKnife) {
       signals.push({
         id: `SIG_ENTRY_${now}`,
         timestamp: now,
@@ -445,12 +515,17 @@ export class ATRStrategyCore {
     }
 
     // --- Rule 9: Breakout 1st Entry Buy (Priority 6) ---
+    const isBreakoutOverbought = adaptive.rsi > 68;
+    const isVolumeConfirmed = !snapshot.volumeMultiplier || snapshot.volumeMultiplier >= 1.15;
+
     if (
       !hasPosition &&
       position.state === 'FLAT' &&
       params.breakoutEntryEnabled !== false &&
       currentPrice > baselineValue &&
-      (adaptive.marketRegime === 'BULL' || adaptive.slope >= 0.10)
+      (adaptive.marketRegime === 'BULL' || adaptive.slope >= 0.10) &&
+      !isBreakoutOverbought &&
+      isVolumeConfirmed
     ) {
       signals.push({
         id: `SIG_BREAKOUT_${now}`,
@@ -461,20 +536,23 @@ export class ATRStrategyCore {
         priority: 6,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[1차 돌파 진입] 상승 추세(BULL) 모멘텀(기울기: +${adaptive.slope.toFixed(2)}%) 돌파 매수`,
+        reason: `[1차 돌파 진입] 상승 추세(BULL) 모멘텀(기울기: +${adaptive.slope.toFixed(2)}%, RSI: ${adaptive.rsi.toFixed(0)}, 거래량: ${adaptive.volumeMultiplier.toFixed(2)}x) 돌파 매수`,
         indicatorSnapshot: snapshot
       });
       return signals;
     }
 
     // --- Rule 9-b: Sideways Box-Range Upside Scalp Buy (Priority 6) ---
+    const isBoxOverbought = adaptive.rsi > 65;
+
     if (
       !hasPosition &&
       position.state === 'FLAT' &&
       params.autoPilotEnabled &&
       adaptive.marketRegime === 'SIDEWAYS' &&
       currentPrice > baselineValue &&
-      currentPrice <= (baselineValue + (effectiveAtr * adaptive.dynamicScalpBandMultiplier))
+      currentPrice <= (baselineValue + (effectiveAtr * adaptive.dynamicScalpBandMultiplier)) &&
+      !isBoxOverbought
     ) {
       signals.push({
         id: `SIG_SCALP_UP_${now}`,
@@ -485,7 +563,7 @@ export class ATRStrategyCore {
         priority: 6,
         symbol: params.symbol,
         price: currentPrice,
-        reason: `[박스권 상단 스캘핑 진입] 기준선 소폭 상향 돌파 포착 (국면: SIDEWAYS)`,
+        reason: `[박스권 상단 스캘핑 진입] 기준선 소폭 상향 돌파 포착 (RSI: ${adaptive.rsi.toFixed(0)}, 국면: SIDEWAYS)`,
         indicatorSnapshot: snapshot
       });
       return signals;

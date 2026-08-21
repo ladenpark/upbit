@@ -101,6 +101,7 @@ export default function App() {
   const [trailingCallbackPercent, setTrailingCallbackPercent] = useState<number>(0.8);
   const [isTrailingActive, setIsTrailingActive] = useState<boolean>(false);
   const [trailingPeakPrice, setTrailingPeakPrice] = useState<number | null>(null);
+  const [trailingExitCount, setTrailingExitCount] = useState<number>(0);
 
   // Pyramiding & Partial Loss-Cut State
   const [pyramidingEnabled, setPyramidingEnabled] = useState<boolean>(true);
@@ -142,8 +143,11 @@ export default function App() {
   const [marketRegime, setMarketRegime] = useState<'BULL' | 'SIDEWAYS' | 'BEAR'>('SIDEWAYS');
 
   // API Credentials State (Upbit Exclusive)
-  const [upbitAccess, setUpbitAccess] = useState<string>(() => localStorage.getItem('UPBIT_ACCESS_KEY') || '');
-  const [upbitSecret, setUpbitSecret] = useState<string>(() => localStorage.getItem('UPBIT_SECRET_KEY') || '');
+  // Exchange secrets must never be retained in browser storage.  They exist
+  // only in this component until explicitly sent over the authenticated
+  // same-origin WebSocket to the server-side secret store.
+  const [upbitAccess, setUpbitAccess] = useState<string>('');
+  const [upbitSecret, setUpbitSecret] = useState<string>('');
   const [apiKeyTestStatus, setApiKeyTestStatus] = useState<string | null>(null);
   const [hasApiKeys, setHasApiKeys] = useState<{ upbit: boolean }>({ upbit: false });
 
@@ -153,6 +157,7 @@ export default function App() {
   const [positionAmount, setPositionAmount] = useState<number>(0);
   const [entryPrice, setEntryPrice] = useState<number | null>(null);
   const [totalRealizedPnl, setTotalRealizedPnl] = useState<number>(0);
+  const [totalFeesPaid, setTotalFeesPaid] = useState<number>(0);
   const [totalTrades, setTotalTrades] = useState<number>(0);
   const [winTrades, setWinTrades] = useState<number>(0);
   const [realBalances, setRealBalances] = useState<Record<string, number>>({});
@@ -187,7 +192,12 @@ export default function App() {
     marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
     slope: number;
     volatilityRatio: number;
+    rsi?: number;
+    volumeMultiplier?: number;
+    volumeMa?: number;
   } | null>(null);
+  const [rsiValue, setRsiValue] = useState<number>(50.0);
+  const [volumeMultiplier, setVolumeMultiplier] = useState<number>(1.0);
   const [dropSpeed, setDropSpeed] = useState<number>(0);
   const [activeRadarTab, setActiveRadarTab] = useState<'BUY' | 'SELL' | 'ALL'>('ALL');
   const [radarExpanded, setRadarExpanded] = useState<boolean>(true);
@@ -301,6 +311,9 @@ export default function App() {
               setPositionAmount(s.position.amount);
               setEntryPrice(s.position.entryPrice);
               if (s.position.state) setPositionLifecycleState(s.position.state);
+              if (s.position.trailingActive !== undefined) setIsTrailingActive(s.position.trailingActive);
+              if (s.position.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.position.trailingPeakPrice);
+              if (s.position.trailingExitCount !== undefined) setTrailingExitCount(s.position.trailingExitCount);
             }
             if (s.safetyOrderCount !== undefined) setSafetyOrderCount(s.safetyOrderCount);
             if (s.pyramidingCount !== undefined) setPyramidingCount(s.pyramidingCount);
@@ -309,12 +322,16 @@ export default function App() {
             if (s.awaitingReentry !== undefined) setAwaitingReentry(s.awaitingReentry);
             if (s.isTrailingActive !== undefined) setIsTrailingActive(s.isTrailingActive);
             if (s.trailingPeakPrice !== undefined) setTrailingPeakPrice(s.trailingPeakPrice);
+            if (s.trailingExitCount !== undefined) setTrailingExitCount(s.trailingExitCount);
             if (s.totalRealizedPnl !== undefined) setTotalRealizedPnl(s.totalRealizedPnl);
+            if (s.totalFeesPaid !== undefined) setTotalFeesPaid(s.totalFeesPaid);
             if (s.totalTrades !== undefined) setTotalTrades(s.totalTrades);
             if (s.winTrades !== undefined) setWinTrades(s.winTrades);
             if (s.currentPrice !== undefined) setCurrentPrice(s.currentPrice);
             if (s.atrValue !== undefined) setAtrValue(s.atrValue);
             if (s.baselineValue !== undefined) setBaselineValue(s.baselineValue);
+            if (s.rsi !== undefined) setRsiValue(s.rsi);
+            if (s.volumeMultiplier !== undefined) setVolumeMultiplier(s.volumeMultiplier);
             if (s.priceHistory) setPriceHistory(s.priceHistory);
             if (s.logs) setLogs(s.logs);
             if (s.realBalances) setRealBalances(s.realBalances);
@@ -433,6 +450,8 @@ export default function App() {
       upbitAccessKey: upbitAccess,
       upbitSecretKey: upbitSecret
     });
+    setUpbitAccess('');
+    setUpbitSecret('');
     setApiKeyTestStatus('🔑 Upbit API 키가 백엔드에 안전하게 저장되었습니다.');
   };
 
@@ -673,9 +692,9 @@ export default function App() {
   const calculatedStopLoss = useMemo(() => {
     const lastPoint = priceHistory[priceHistory.length - 1];
     if (lastPoint && lastPoint.stopLoss) return lastPoint.stopLoss;
-    const lower = baselineValue - atrValue * atrMultiplier;
-    return Math.round(lower - atrValue * stopLossMultiplier);
-  }, [priceHistory, baselineValue, atrValue, atrMultiplier, stopLossMultiplier]);
+    const refPrice = positionAmount > 0 && entryPrice ? entryPrice : currentPrice;
+    return Math.round(refPrice * 0.94);
+  }, [priceHistory, positionAmount, entryPrice, currentPrice]);
 
   const stopLossPercent = useMemo(() => {
     const refPrice = positionAmount > 0 && entryPrice ? entryPrice : currentPrice;
@@ -943,9 +962,21 @@ export default function App() {
               {formatPrice(currentPrice)}
             </div>
           </div>
-          <div className="text-right">
-            <div className="text-[10px] text-slate-400 mono">ATR: {formatPrice(atrValue)}</div>
-            <div className="text-[10px] text-slate-500 font-medium">기준선: {formatPrice(baselineValue)}</div>
+          <div className="text-right flex flex-col items-end">
+            <div className="flex items-center gap-1.5 text-[10px] font-mono">
+              <span className="text-slate-400">ATR: {formatPrice(atrValue)}</span>
+              <span className={`px-1.5 py-0.2 rounded-md font-bold text-[9px] ${
+                rsiValue >= 68 ? 'bg-rose-100 text-rose-700' : rsiValue <= 35 ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700'
+              }`}>
+                RSI {rsiValue.toFixed(0)}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5 text-[10px] font-medium text-slate-500 mt-0.5">
+              <span>기준선: {formatPrice(baselineValue)}</span>
+              <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-50 text-indigo-600 font-bold">
+                Vol {volumeMultiplier.toFixed(2)}x
+              </span>
+            </div>
           </div>
         </div>
 
@@ -1053,52 +1084,85 @@ export default function App() {
 
               {/* Asset & Position Cards */}
               <div className="grid grid-cols-2 gap-2">
-                <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-2xs">
-                  <div className="text-[10px] font-semibold text-slate-400">총 자산 (Equity)</div>
-                  <div className="text-sm font-extrabold mono text-slate-900 mt-0.5">
-                    {formatPrice(currentEquity)}
+                <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs flex flex-col justify-between">
+                  <div>
+                    <div className="text-[10px] font-semibold text-slate-400">총 자산 (Equity)</div>
+                    <div className="text-sm font-extrabold mono text-slate-900 mt-1">
+                      {formatPrice(currentEquity)}
+                    </div>
                   </div>
-                  <div className={`text-[10px] font-bold ${totalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                  <div className={`text-[10px] font-bold mt-1.5 pt-1.5 border-t border-slate-100 ${totalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                     실현손익: {totalRealizedPnl >= 0 ? '+' : ''}{formatPrice(totalRealizedPnl)} ({totalTrades}회 매매)
                   </div>
                 </div>
 
-                <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-2xs flex flex-col justify-between">
+                {/* Current Position Card (Prominent Entry Price & 1-Decimal Qty) */}
+                <div className="bg-white p-3 rounded-2xl border border-indigo-200/80 shadow-2xs flex flex-col justify-between">
                   <div>
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-semibold text-slate-400">현재 포지션</span>
-                      {awaitingReentry && (
-                        <span className="text-[9px] font-extrabold text-cyan-700 bg-cyan-100 px-1.5 py-0.2 rounded-md animate-pulse flex items-center gap-0.5">
+                      <span className="text-[10px] font-extrabold text-indigo-950 uppercase tracking-wide">내 포지션</span>
+                      {awaitingReentry ? (
+                        <span className="text-[9px] font-black text-cyan-700 bg-cyan-100 px-1.5 py-0.5 rounded-md animate-pulse flex items-center gap-0.5">
                           🎯 바닥 재매수 대기
                         </span>
-                      )}
-                      {!awaitingReentry && isTrailingActive && (
-                        <span className="text-[9px] font-extrabold text-emerald-600 bg-emerald-100 px-1.5 py-0.2 rounded-md animate-pulse flex items-center gap-0.5">
+                      ) : isTrailingActive ? (
+                        <span className="text-[9px] font-black text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded-md animate-pulse flex items-center gap-0.5">
                           🔥 Trailing TP
                         </span>
-                      )}
-                      {!awaitingReentry && !isTrailingActive && pyramidingCount > 0 && (
-                        <span className="text-[9px] font-extrabold text-amber-700 bg-amber-100 px-1.5 py-0.2 rounded-md flex items-center gap-0.5">
+                      ) : boxPyramidCount > 0 ? (
+                        <span className="text-[9px] font-black text-fuchsia-700 bg-fuchsia-100 px-1.5 py-0.5 rounded-md flex items-center gap-0.5">
+                          🚀 불타기 {boxPyramidCount}/2
+                        </span>
+                      ) : pyramidingCount > 0 ? (
+                        <span className="text-[9px] font-black text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-md flex items-center gap-0.5">
                           🚀 불타기 {pyramidingCount}/{maxPyramidingOrders}
                         </span>
-                      )}
-                      {!awaitingReentry && !isTrailingActive && boxPyramidCount > 0 && (
-                        <span className="text-[9px] font-extrabold text-fuchsia-700 bg-fuchsia-100 px-1.5 py-0.2 rounded-md flex items-center gap-0.5 ml-1">
-                          🚀 박스불타기 {boxPyramidCount}/1
-                        </span>
-                      )}
-                      {!awaitingReentry && !isTrailingActive && pyramidingCount === 0 && safetyOrderCount > 0 && (
-                        <span className="text-[9px] font-extrabold text-indigo-600 bg-indigo-100 px-1.5 py-0.2 rounded-md">
+                      ) : safetyOrderCount > 0 ? (
+                        <span className="text-[9px] font-black text-indigo-700 bg-indigo-100 px-1.5 py-0.5 rounded-md flex items-center gap-0.5">
                           💧 DCA {safetyOrderCount}/{maxSafetyOrders}
                         </span>
+                      ) : positionAmount > 0 ? (
+                        <span className="text-[9px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded-md">
+                          진입 완료
+                        </span>
+                      ) : (
+                        <span className="text-[9px] font-bold text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded-md">
+                          FLAT
+                        </span>
                       )}
                     </div>
-                    <div className="text-xs font-extrabold mono text-indigo-700 mt-0.5 truncate">
-                      {positionAmount > 0 ? `LONG ${positionAmount} @ ${formatPrice(entryPrice || currentPrice)}` : 'FLAT (무포지션)'}
-                    </div>
+
+                    {positionAmount > 0 ? (
+                      <div className="mt-1">
+                        <div className="flex items-baseline gap-1">
+                          <span className="text-[10px] font-bold text-slate-400">평단</span>
+                          <span className="text-sm font-black mono text-indigo-700 tracking-tight">
+                            {formatPrice(entryPrice || currentPrice)}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-500 font-mono font-medium mt-0.5">
+                          보유: <strong className="text-slate-800 font-extrabold">{positionAmount.toFixed(1)} ETH</strong> (약 ₩{Math.round(positionAmount * currentPrice).toLocaleString()})
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="mt-1">
+                        <div className="text-xs font-extrabold text-slate-600">무포지션 (FLAT)</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">1차 저점/돌파 진입 대기 중</div>
+                      </div>
+                    )}
                   </div>
-                  <div className={`text-[10px] font-bold mt-1 ${unrealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
-                    손익: {unrealizedPnl >= 0 ? '+' : ''}{formatPrice(unrealizedPnl)} ({unrealizedPnlPercent.toFixed(1)}%)
+
+                  <div className={`text-[10.5px] font-extrabold mt-1.5 pt-1.5 border-t border-slate-100 flex items-center justify-between ${
+                    unrealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'
+                  }`}>
+                    <span className="text-[9.5px] text-slate-400 font-medium">평가손익</span>
+                    <span className="mono">
+                      {positionAmount > 0 ? (
+                        `${unrealizedPnl >= 0 ? '+' : ''}${formatPrice(unrealizedPnl)} (${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}%)`
+                      ) : (
+                        '₩0 (0.00%)'
+                      )}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -1174,7 +1238,11 @@ export default function App() {
                           isAmber ? 'bg-amber-600' : isEmerald ? 'bg-emerald-600' : isBlue ? 'bg-blue-600' : 'bg-indigo-600'
                         }`} />
                         <span className="text-[11px] font-extrabold text-slate-800 flex items-center gap-1">
-                          다음 매수 예상 금액
+                          {currentPage.category === 'SCALP_TP' || currentPage.category === 'TRAILING_TP'
+                            ? '다음 익절 매도 예상 금액'
+                            : currentPage.category === 'COMPLETED'
+                            ? '추가 매수 한도 상태'
+                            : '다음 매수 예상 금액'}
                           <span className={`px-1.5 py-0.2 rounded-md text-[10px] font-bold ${
                             isAmber ? 'bg-amber-200/80 text-amber-900' : isEmerald ? 'bg-emerald-200/80 text-emerald-900' : isBlue ? 'bg-blue-200/80 text-blue-900' : 'bg-indigo-200/80 text-indigo-900'
                           }`}>
@@ -1193,9 +1261,9 @@ export default function App() {
                         <button
                           onClick={() => setNextOrderPageIndex((prev) => (prev + 1) % pages.length)}
                           className="px-1.5 py-0.5 rounded-lg bg-white/90 border border-slate-200 flex items-center gap-0.5 text-[9px] text-slate-700 font-bold hover:bg-white shadow-2xs cursor-pointer active:scale-95 transition"
-                          title="플랜 전환"
+                          title="다음 플랜으로 전환"
                         >
-                          <span>{pageNum === 1 ? '불타기' : '물타기'}</span>
+                          <span>{pages[(nextOrderPageIndex + 1) % pages.length]?.categoryLabel?.substring(0, 4) || '다음'}</span>
                           <span className="text-[10px]">⇄</span>
                         </button>
                       </div>
@@ -1207,17 +1275,24 @@ export default function App() {
                         <div className={`text-base font-black mono tracking-tight ${
                           isAmber ? 'text-amber-900' : isEmerald ? 'text-emerald-900' : isBlue ? 'text-blue-900' : 'text-indigo-900'
                         }`}>
-                          {currentPage.budgetKrw > 0
+                          {currentPage.category === 'COMPLETED'
+                            ? '₩0 (매수 완료)'
+                            : currentPage.budgetKrw > 0
                             ? formatPrice(currentPage.budgetKrw)
-                            : formatPrice(currentEquity * ((orderRatio || 25) / 100))}
+                            : formatPrice(currentEquity * (((currentPage.unitPercent || (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio ? adaptiveIndicators.dynamicOrderRatio : orderRatio || 20))) / 100))}
                         </div>
                         <div className="text-[10px] text-slate-500 font-medium mt-0.5">
-                          {currentPage.categoryLabel} · 총자산의 {orderRatio || 25}% 
-                          {currentPage.scaleMultiplier > 1 ? ` (×${currentPage.scaleMultiplier}배 스케일링)` : ' (기본 1 Unit)'}
+                          {currentPage.category === 'SCALP_TP' || currentPage.category === 'TRAILING_TP'
+                            ? `${currentPage.categoryLabel} · 보유 수량의 ${currentPage.unitPercent}% 매도`
+                            : currentPage.category === 'COMPLETED'
+                            ? `${currentPage.categoryLabel} · 목표 수익 도달 대기`
+                            : `${currentPage.categoryLabel} · 총자산의 ${currentPage.unitPercent || (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio ? adaptiveIndicators.dynamicOrderRatio : orderRatio || 20)}% (1 Unit)`}
                         </div>
                       </div>
                       <div className="text-right">
-                        <div className="text-[10px] font-semibold text-slate-400">진입 예상 타이밍</div>
+                        <div className="text-[10px] font-semibold text-slate-400">
+                          {currentPage.category === 'SCALP_TP' || currentPage.category === 'TRAILING_TP' ? '익절 발동 타이밍' : '진입 예상 타이밍'}
+                        </div>
                         <div className="text-[11px] font-bold text-slate-700 mt-0.5">
                           {currentPage.targetPriceLabel}
                         </div>
@@ -1240,7 +1315,7 @@ export default function App() {
                         ))}
                       </div>
                       <span className="text-[9px] text-slate-400 font-medium flex items-center gap-0.5">
-                        👆 좌우로 스와이프하여 {pageNum === 1 ? '불타기(2/2)' : '물타기(1/2)'} 확인
+                        👆 좌우로 스와이프하여 {pages[(nextOrderPageIndex + 1) % pages.length]?.categoryLabel || '다음 플랜'}({((nextOrderPageIndex + 1) % pages.length) + 1}/{totalPages}) 확인
                       </span>
                     </div>
                   </div>
@@ -1406,25 +1481,23 @@ export default function App() {
                 const calcScalpUpper = baselineValue + (effectiveAtr * dynamicScalpMult);
 
                 const baseBudget = currentEquity * (effectiveRatio / 100);
-                const scalpBudget = baseBudget * 0.5;
+                const scalpBudget = baseBudget * 0.8;
 
-                // Buy Rule Distances
-                const distScalpLower = currentPrice - calcScalpLower;
-                const distScalpLowerPct = (distScalpLower / currentPrice) * 100;
-                const isScalpLowerActive = !positionAmount && autoPilotEnabled && marketRegime !== 'BULL' && currentPrice <= calcScalpLower && currentPrice > calcLowerBand;
+                const hasPos = positionAmount > 0;
+                const effectiveEntry = entryPrice || currentPrice;
 
-                const isAboveBaseline = currentPrice > baselineValue;
-                const isBelowScalpUpper = currentPrice <= calcScalpUpper;
-                const isScalpUpperActive = !positionAmount && autoPilotEnabled && marketRegime === 'SIDEWAYS' && isAboveBaseline && isBelowScalpUpper;
-                const scalpUpperExceeded = isAboveBaseline && !isBelowScalpUpper;
-                const distScalpUpperExceed = currentPrice - calcScalpUpper;
-                const distScalpUpperExceedPct = (distScalpUpperExceed / currentPrice) * 100;
-
+                // ── Buy Conditions ──
+                // Rule 8: Lower Band Dip
                 const distLowerBand = currentPrice - calcLowerBand;
                 const distLowerBandPct = (distLowerBand / currentPrice) * 100;
-                const isLowerBandActive = !positionAmount && currentPrice <= calcLowerBand;
+                const isLowerBandActive = !hasPos && currentPrice <= calcLowerBand;
 
-                // Rule 8-c: Box-Range Bounce
+                // Rule 8-b: Box Lower Scalp
+                const distScalpLower = currentPrice - calcScalpLower;
+                const distScalpLowerPct = (distScalpLower / currentPrice) * 100;
+                const isScalpLowerActive = !hasPos && autoPilotEnabled && marketRegime !== 'BULL' && currentPrice <= calcScalpLower && currentPrice > calcLowerBand;
+
+                // Rule 8-c: Box Low Bounce
                 const SCALP_BOUNCE_LOOKBACK = 10;
                 const SCALP_BOUNCE_CONFIRM_PERCENT = 0.15;
                 const recentSlice = priceHistory.slice(-SCALP_BOUNCE_LOOKBACK).map((p: any) => p.price);
@@ -1433,40 +1506,77 @@ export default function App() {
                 const wasGenuineDip = recentLow <= baselineValue;
                 const stillBelowBaseline = currentPrice <= baselineValue;
                 const hasBounced = currentPrice > recentLow && currentPrice >= bounceThreshold;
-                const isScalpBounceActive = !positionAmount && autoPilotEnabled && marketRegime !== 'BULL' && priceHistory.length >= SCALP_BOUNCE_LOOKBACK && wasGenuineDip && stillBelowBaseline && hasBounced;
+                const isScalpBounceActive = !hasPos && autoPilotEnabled && marketRegime !== 'BULL' && priceHistory.length >= SCALP_BOUNCE_LOOKBACK && wasGenuineDip && stillBelowBaseline && hasBounced;
                 const distBounce = bounceThreshold - currentPrice;
                 const bounceConditionMet = currentPrice > recentLow && wasGenuineDip && stillBelowBaseline;
 
-                // Rule 7-b: Box-Range Pyramid Buy
-                const BOX_PYRAMID_STEP_PERCENT = 0.25;
-                const effectiveEntryPrice = entryPrice || currentPrice;
-                const boxPyramidTargetPrice = effectiveEntryPrice * (1 + BOX_PYRAMID_STEP_PERCENT / 100);
-                const isBoxPyramidActive = positionAmount > 0 && pyramidingEnabled && autoPilotEnabled && marketRegime === 'SIDEWAYS' && !isTrailingActive && boxPyramidCount < 1 && currentPrice >= boxPyramidTargetPrice;
-                const distBoxPyramid = boxPyramidTargetPrice - currentPrice;
-                const distBoxPyramidPct = (distBoxPyramid / currentPrice) * 100;
-
-                const isBreakoutActive = !positionAmount && currentPrice > baselineValue && (marketRegime === 'BULL' || currentSlope >= 0.10);
+                // Rule 9: Breakout Entry (3-Tier Filter Checks)
+                const isBreakoutBaselineMet = currentPrice > baselineValue;
+                const isBreakoutSlopeMet = marketRegime === 'BULL' || currentSlope >= 0.10;
+                const isBreakoutRsiMet = rsiValue <= 68;
+                const isBreakoutVolumeMet = volumeMultiplier >= 1.15;
+                const isBreakoutActive = !hasPos && isBreakoutBaselineMet && isBreakoutSlopeMet && isBreakoutRsiMet && isBreakoutVolumeMet;
                 const distBaseline = currentPrice - baselineValue;
-                const distBaselinePct = (distBaseline / currentPrice) * 100;
 
-                // Sell Rule Distances
-                const effectiveEntry = entryPrice || currentPrice;
-                const scalpTpPrice = effectiveEntry * (1 + dynamicScalpTp / 100);
+                // Rule 9-b: Box Upper Scalp
+                const isAboveBaseline = currentPrice > baselineValue;
+                const isBelowScalpUpper = currentPrice <= calcScalpUpper;
+                const isBoxRsiMet = rsiValue <= 65;
+                const isScalpUpperActive = !hasPos && autoPilotEnabled && marketRegime === 'SIDEWAYS' && isAboveBaseline && isBelowScalpUpper && isBoxRsiMet;
+                const scalpUpperExceeded = isAboveBaseline && !isBelowScalpUpper;
+                const distScalpUpperExceed = currentPrice - calcScalpUpper;
+
+                // Rule 6: DCA Slots (-2.0%, -4.2%, -5.5%)
+                const dca1Price = effectiveEntry * 0.980;
+                const dca2Price = effectiveEntry * 0.958;
+                const dca3Price = effectiveEntry * 0.945;
+                const distDca1 = currentPrice - dca1Price;
+                const distDca2 = currentPrice - dca2Price;
+                const distDca3 = currentPrice - dca3Price;
+                const isDca1Active = hasPos && safetyOrderCount === 0 && currentPrice <= dca1Price;
+                const isDca2Active = hasPos && safetyOrderCount === 1 && currentPrice <= dca2Price;
+
+                // Rule 7 & 7-b: Pyramiding Buy
+                const BOX_PYRAMID_MAX_ADDS = 2;
+                const BOX_PYRAMID_STEP_PERCENT = 0.25;
+                const boxPyramidTargetPrice = effectiveEntry * (1 + BOX_PYRAMID_STEP_PERCENT / 100);
+                const isBoxPyramidActive = hasPos && pyramidingEnabled && autoPilotEnabled && marketRegime === 'SIDEWAYS' && !isTrailingActive && boxPyramidCount < BOX_PYRAMID_MAX_ADDS && currentPrice >= boxPyramidTargetPrice;
+                const distBoxPyramid = boxPyramidTargetPrice - currentPrice;
+
+                const bullPyramidTargetPrice = effectiveEntry * (1 + (pyramidingStepPercent * (pyramidingCount + 1)) / 100);
+                const isBullPyramidActive = hasPos && pyramidingEnabled && marketRegime === 'BULL' && !isTrailingActive && pyramidingCount < maxPyramidingOrders && currentPrice >= bullPyramidTargetPrice;
+                const distBullPyramid = bullPyramidTargetPrice - currentPrice;
+
+                // ── Sell & Defense Conditions ──
+                // Rule 4: Stepped Scalp TP
+                let steppedScalpTp = dynamicScalpTp;
+                if (boxPyramidCount === 1) steppedScalpTp = Math.max(steppedScalpTp, 0.65);
+                else if (boxPyramidCount >= 2) steppedScalpTp = Math.max(steppedScalpTp, 0.85);
+                const scalpTpPrice = effectiveEntry * (1 + steppedScalpTp / 100);
                 const distScalpTp = scalpTpPrice - currentPrice;
                 const distScalpTpPct = ((scalpTpPrice - currentPrice) / currentPrice) * 100;
-                const isScalpTpActive = positionAmount > 0 && autoPilotEnabled && marketRegime === 'SIDEWAYS' && !isTrailingActive && unrealizedPnlPercent >= dynamicScalpTp;
+                const isScalpTpActive = hasPos && autoPilotEnabled && marketRegime === 'SIDEWAYS' && !isTrailingActive && unrealizedPnlPercent >= steppedScalpTp;
 
-                const distUpperBand = calcUpperBand - currentPrice;
-                const distUpperBandPct = (distUpperBand / currentPrice) * 100;
+                // Rule 5: Trailing Stop Exit
+                const minProfitArmingPrice = effectiveEntry * 1.010;
+                const effectiveArmingPrice = Math.max(calcUpperBand, minProfitArmingPrice);
+                const distUpperBand = effectiveArmingPrice - currentPrice;
+                const trailingTriggerPrice = Math.max((trailingPeakPrice || currentPrice) * (1 - dynamicTrailingCb / 100), effectiveEntry * 1.002);
+                const distTrailingTrigger = currentPrice - trailingTriggerPrice;
 
+                // Rule 3-a & 3-b: Capital Recycling Partial Cuts
+                const trim1Price = effectiveEntry * 0.990; // -1.0%
+                const trim2Price = effectiveEntry * 0.968; // -3.2%
+                const distTrim1 = currentPrice - trim1Price;
+                const distTrim2 = currentPrice - trim2Price;
+
+                // Rule 1: Absolute Stop Loss (-6.0%)
                 const distStopLoss = currentPrice - calculatedStopLoss;
                 const distStopLossPct = (distStopLoss / currentPrice) * 100;
 
-                const hasPos = positionAmount > 0;
-
                 return (
                   <div className="space-y-3">
-                    {/* Top Summary Banner */}
+                    {/* Top Summary & 3-Tier Indicator Matrix */}
                     <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-950 text-white p-4 rounded-3xl border border-slate-700/80 shadow-md space-y-3">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
@@ -1485,13 +1595,6 @@ export default function App() {
                             </div>
                           </div>
                         </div>
-
-                        {remainingCooldown > 0 && (
-                          <div className="p-2 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-300 flex items-center justify-between text-xs font-bold animate-pulse">
-                            <span className="flex items-center gap-1.5"><ShieldAlert className="w-4 h-4" /> 진입 쿨다운 중 (연속 체결 방지)</span>
-                            <span className="font-mono bg-rose-500/30 px-2 py-0.5 rounded-md">{remainingCooldown}초 후 해제</span>
-                          </div>
-                        )}
 
                         {/* Filter Tabs */}
                         <div className="flex items-center p-0.5 bg-slate-950/80 rounded-xl border border-slate-700/60 text-[10px] font-bold">
@@ -1522,42 +1625,133 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* 4-Grid Metrics */}
-                      <div className="grid grid-cols-4 gap-1.5 p-2 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-[9.5px]">
-                        <div className="flex flex-col">
+                      {/* 6-Grid 3-Tier Indicator Matrix */}
+                      <div className="grid grid-cols-3 gap-1.5 p-2.5 rounded-2xl bg-slate-950/70 border border-slate-800/80 text-[9.5px]">
+                        <div className="flex flex-col bg-slate-900/60 p-1.5 rounded-xl">
                           <span className="text-slate-400 font-medium">현재 체결가</span>
-                          <span className="text-slate-100 font-black mono text-[11px]">{formatPrice(currentPrice)}</span>
+                          <span className="text-slate-100 font-black mono text-xs mt-0.5">{formatPrice(currentPrice)}</span>
                         </div>
-                        <div className="flex flex-col">
-                          <span className="text-slate-400 font-medium">기준선(20MA)</span>
-                          <span className="text-slate-200 font-bold mono">₩{Math.round(baselineValue).toLocaleString()}</span>
+                        <div className="flex flex-col bg-slate-900/60 p-1.5 rounded-xl">
+                          <span className="text-slate-400 font-medium">20MA 기준선</span>
+                          <span className="text-slate-200 font-bold mono text-xs mt-0.5">₩{Math.round(baselineValue).toLocaleString()}</span>
                         </div>
-                        <div className="flex flex-col">
-                          <span className="text-slate-400 font-medium">1분 ATR변동폭</span>
-                          <span className="text-cyan-400 font-bold mono">₩{Math.round(effectiveAtr).toLocaleString()}</span>
+                        <div className="flex flex-col bg-slate-900/60 p-1.5 rounded-xl">
+                          <span className="text-slate-400 font-medium">1분 ATR 변동폭</span>
+                          <span className="text-cyan-400 font-bold mono text-xs mt-0.5">₩{Math.round(effectiveAtr).toLocaleString()}</span>
                         </div>
-                        <div className="flex flex-col text-right">
-                          <span className="text-slate-400 font-medium">1분 기울기</span>
-                          <span className={`font-bold mono ${currentSlope >= 0.1 ? 'text-emerald-400' : currentSlope <= -0.1 ? 'text-rose-400' : 'text-amber-400'}`}>
+                        <div className="flex flex-col bg-slate-900/60 p-1.5 rounded-xl">
+                          <span className="text-slate-400 font-medium">14주기 RSI (과열필터)</span>
+                          <span className={`font-black mono text-xs mt-0.5 ${rsiValue >= 68 ? 'text-rose-400' : rsiValue <= 35 ? 'text-emerald-400' : 'text-slate-200'}`}>
+                            {rsiValue.toFixed(1)} {rsiValue >= 68 ? '(과열🔥)' : rsiValue <= 35 ? '(과매도💧)' : '(적정)'}
+                          </span>
+                        </div>
+                        <div className="flex flex-col bg-slate-900/60 p-1.5 rounded-xl">
+                          <span className="text-slate-400 font-medium">거래량 승수 (돌파검증)</span>
+                          <span className={`font-black mono text-xs mt-0.5 ${volumeMultiplier >= 1.15 ? 'text-emerald-400' : 'text-slate-300'}`}>
+                            {volumeMultiplier.toFixed(2)}x {volumeMultiplier >= 1.15 ? '(급증🚀)' : '(평균)'}
+                          </span>
+                        </div>
+                        <div className="flex flex-col bg-slate-900/60 p-1.5 rounded-xl text-right">
+                          <span className="text-slate-400 font-medium">1분 추세 기울기</span>
+                          <span className={`font-black mono text-xs mt-0.5 ${currentSlope >= 0.1 ? 'text-emerald-400' : currentSlope <= -0.1 ? 'text-rose-400' : 'text-amber-400'}`}>
                             {currentSlope >= 0 ? '+' : ''}{currentSlope.toFixed(2)}%
                           </span>
                         </div>
                       </div>
                     </div>
 
-                    {/* ── 🟢 매수 조건 섹션 (BUY TRIGGERS) ── */}
+                    {/* ── 🟢 매수 조건 섹션 (BUY & PYRAMIDING & DCA) ── */}
                     {(activeRadarTab === 'ALL' || activeRadarTab === 'BUY') && (
                       <div className="space-y-2">
                         <div className="text-[11px] font-extrabold text-emerald-800 flex items-center justify-between px-1">
                           <span className="flex items-center gap-1.5">
                             <Target className="w-3.5 h-3.5 text-emerald-600" />
-                            매수 진입 대기 레이더 ({hasPos ? '포지션 보유 중 · 추가매수 감시' : 'FLAT 상태 · 1차 진입 감시'})
+                            매수 진입 & 추가매수 레이더 ({hasPos ? '포지션 보유 중 · 추가매수 감시' : 'FLAT 상태 · 1차 진입 감시'})
                           </span>
                           <span className="text-[9.5px] text-slate-500 font-mono">1 Unit = {effectiveRatio}%</span>
                         </div>
 
                         <div className="grid grid-cols-1 gap-2">
-                          {/* 1. Rule 8-b: 박스권 하단 스캘핑 */}
+                          {/* 1. Rule 9: 상승 모멘텀 돌파 진입 (3-Tier Filter) */}
+                          <div className={`p-3 rounded-2xl border transition-all ${
+                            isBreakoutActive
+                              ? 'bg-emerald-50 border-emerald-400 ring-2 ring-emerald-200 shadow-xs'
+                              : 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
+                          }`}>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 9
+                                </span>
+                                <span className="font-extrabold text-xs text-slate-900">상승 모멘텀 돌파 진입</span>
+                                <span className="text-[10px] text-emerald-700 font-bold bg-emerald-50 px-1 py-0.2 rounded border border-emerald-200">1.0 Unit</span>
+                              </div>
+                              <div>
+                                {isBreakoutActive ? (
+                                  <span className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-black text-[10px] animate-pulse">
+                                    🎯 즉시 돌파 매수
+                                  </span>
+                                ) : hasPos ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">1차 진입 완료됨</span>
+                                ) : (
+                                  <span className="text-[10px] text-slate-500 font-mono font-bold">
+                                    {marketRegime === 'BULL' ? '기준선 상향 돌파 대기' : '기울기 +0.10% 또는 BULL 전환 대기'}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            {/* 3-Tier Filter Check badges */}
+                            <div className="grid grid-cols-4 gap-1 mt-2 pt-2 border-t border-slate-100 text-[9px] font-mono">
+                              <div className={`p-1 rounded-lg text-center ${isBreakoutBaselineMet ? 'bg-emerald-100 text-emerald-800 font-bold' : 'bg-slate-100 text-slate-500'}`}>
+                                {isBreakoutBaselineMet ? '✅' : '⏳'} 기준선 돌파
+                              </div>
+                              <div className={`p-1 rounded-lg text-center ${isBreakoutSlopeMet ? 'bg-emerald-100 text-emerald-800 font-bold' : 'bg-slate-100 text-slate-500'}`}>
+                                {isBreakoutSlopeMet ? '✅' : '⏳'} 기울기≥+0.1%
+                              </div>
+                              <div className={`p-1 rounded-lg text-center ${isBreakoutRsiMet ? 'bg-emerald-100 text-emerald-800 font-bold' : 'bg-rose-100 text-rose-800 font-bold'}`}>
+                                {isBreakoutRsiMet ? '✅' : '❌'} RSI≤68 ({rsiValue.toFixed(0)})
+                              </div>
+                              <div className={`p-1 rounded-lg text-center ${isBreakoutVolumeMet ? 'bg-emerald-100 text-emerald-800 font-bold' : 'bg-slate-100 text-slate-500'}`}>
+                                {isBreakoutVolumeMet ? '✅' : '⏳'} 거래량≥1.15x ({volumeMultiplier.toFixed(2)}x)
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* 2. Rule 8: 하단 밴드 과매도 진입 */}
+                          <div className={`p-3 rounded-2xl border transition-all ${
+                            isLowerBandActive
+                              ? 'bg-blue-50 border-blue-400 ring-2 ring-blue-200 shadow-xs'
+                              : 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
+                          }`}>
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded-md bg-blue-100 text-blue-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 8
+                                </span>
+                                <span className="font-extrabold text-xs text-slate-900">하단 밴드 과매도 진입</span>
+                                <span className="text-[10px] text-blue-700 font-bold bg-blue-50 px-1 py-0.2 rounded border border-blue-200">1.0 Unit</span>
+                              </div>
+                              <div>
+                                {isLowerBandActive ? (
+                                  <span className="px-2 py-0.5 rounded-md bg-blue-600 text-white font-black text-[10px] animate-pulse">
+                                    🎯 과매도 진입 발동
+                                  </span>
+                                ) : hasPos ? (
+                                  <span className="text-[9.5px] text-slate-400 font-medium">1차 진입 완료됨</span>
+                                ) : (
+                                  <span className="text-[10px] text-slate-500 font-mono font-bold">
+                                    -{Math.round(distLowerBand).toLocaleString()}원 (-{distLowerBandPct.toFixed(2)}%) 하락 시
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
+                              <span>하단 매수가: <strong className="text-slate-800">₩{Math.round(calcLowerBand).toLocaleString()} 이하</strong></span>
+                              <span className="text-slate-400">ATR×{effectiveMultiplier} 과매도 포착</span>
+                            </div>
+                          </div>
+
+                          {/* 3. Rule 8-b: 박스권 하단 스캘핑 */}
                           <div className={`p-3 rounded-2xl border transition-all ${
                             isScalpLowerActive
                               ? 'bg-cyan-50 border-cyan-400 ring-2 ring-cyan-200 shadow-xs'
@@ -1568,42 +1762,33 @@ export default function App() {
                                 <span className="px-1.5 py-0.5 rounded-md bg-cyan-100 text-cyan-800 font-extrabold font-mono text-[9.5px]">
                                   Rule 8-b
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">하단 스캘핑 (기준선)</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(0.5 Unit)</span>
+                                <span className="font-extrabold text-xs text-slate-900">박스권 하단 스캘핑 진입</span>
+                                <span className="text-[10px] text-cyan-700 font-bold bg-cyan-50 px-1 py-0.2 rounded border border-cyan-200">0.8 Unit</span>
                               </div>
                               <div>
                                 {isScalpLowerActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-cyan-600 text-white font-black text-[10px] animate-pulse shadow-sm">
-                                    🎯 발동 구간
+                                  <span className="px-2 py-0.5 rounded-md bg-cyan-600 text-white font-black text-[10px] animate-pulse">
+                                    🎯 스캘핑 진입 구간
                                   </span>
                                 ) : marketRegime === 'BULL' ? (
                                   <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 font-bold text-[9px]">BULL 제외</span>
                                 ) : (
-                                  <span className={`text-[10px] font-mono font-bold ${distScalpLower > 0 ? 'text-cyan-700' : 'text-slate-500'}`}>
-                                    {distScalpLower > 0 ? `+${Math.round(distScalpLower).toLocaleString()}원 하락 필요` : '도달'}
+                                  <span className="text-[10px] font-mono font-bold text-cyan-700">
+                                    {distScalpLower > 0 ? `+${Math.round(distScalpLower).toLocaleString()}원 하락 시` : '도달'}
                                   </span>
                                 )}
                               </div>
                             </div>
-                            {distScalpLower > 0 && marketRegime !== 'BULL' && (
-                              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2.5 overflow-hidden flex">
-                                <div className="bg-cyan-400 h-full rounded-full transition-all" style={{ width: `${Math.max(5, 100 - distScalpLowerPct * 20)}%` }}></div>
-                              </div>
-                            )}
-                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span className="font-mono">
-                                진입 기준: <strong className="text-slate-800">₩{Math.round(calcScalpLower).toLocaleString()} 이하</strong>
-                              </span>
-                              <span className="text-slate-400">하한 가드: ₩{Math.round(calcLowerBand).toLocaleString()}</span>
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
+                              <span>진입 기준가: <strong className="text-slate-800">₩{Math.round(calcScalpLower).toLocaleString()} 이하</strong></span>
+                              <span className="text-slate-400">하한선: ₩{Math.round(calcLowerBand).toLocaleString()}</span>
                             </div>
                           </div>
 
-                          {/* 1.5 Rule 8-c: 저점 반등 스캘핑 */}
+                          {/* 4. Rule 8-c: 저점 반등 확인 매수 */}
                           <div className={`p-3 rounded-2xl border transition-all ${
                             isScalpBounceActive
                               ? 'bg-fuchsia-50 border-fuchsia-400 ring-2 ring-fuchsia-200 shadow-xs'
-                              : bounceConditionMet
-                              ? 'bg-fuchsia-50/50 border-fuchsia-200 shadow-2xs'
                               : 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
                           }`}>
                             <div className="flex items-center justify-between">
@@ -1611,22 +1796,16 @@ export default function App() {
                                 <span className="px-1.5 py-0.5 rounded-md bg-fuchsia-100 text-fuchsia-800 font-extrabold font-mono text-[9.5px]">
                                   Rule 8-c
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">저점 반등 확인 매수</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(0.5 Unit)</span>
+                                <span className="font-extrabold text-xs text-slate-900">박스권 저점 반등 확인 진입</span>
+                                <span className="text-[10px] text-fuchsia-700 font-bold bg-fuchsia-50 px-1 py-0.2 rounded border border-fuchsia-200">0.8 Unit</span>
                               </div>
                               <div>
                                 {isScalpBounceActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-fuchsia-600 text-white font-black text-[10px] animate-pulse shadow-sm">
+                                  <span className="px-2 py-0.5 rounded-md bg-fuchsia-600 text-white font-black text-[10px] animate-pulse">
                                     🚀 반등 확인! (진입)
                                   </span>
                                 ) : marketRegime === 'BULL' ? (
                                   <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-500 font-bold text-[9px]">BULL 제외</span>
-                                ) : priceHistory.length < SCALP_BOUNCE_LOOKBACK ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">데이터 수집중</span>
-                                ) : !wasGenuineDip ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">유효한 저점 없음</span>
-                                ) : !stillBelowBaseline ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">기준선 초과 (종료)</span>
                                 ) : (
                                   <span className="text-[10px] font-mono font-bold text-fuchsia-700">
                                     +0.15% 반등 대기 (+{Math.round(distBounce).toLocaleString()}원)
@@ -1634,67 +1813,13 @@ export default function App() {
                                 )}
                               </div>
                             </div>
-                            {wasGenuineDip && stillBelowBaseline && marketRegime !== 'BULL' && !isScalpBounceActive && (
-                              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2.5 overflow-hidden flex">
-                                <div className="bg-fuchsia-400 h-full rounded-full transition-all" style={{ width: `${Math.max(5, 100 - (distBounce / bounceThreshold) * 10000)}%` }}></div>
-                              </div>
-                            )}
-                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span className="font-mono">
-                                최근 10분 저점: <strong className="text-slate-800">₩{Math.round(recentLow).toLocaleString()}</strong>
-                              </span>
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
+                              <span>최근 10분 저점: <strong>₩{Math.round(recentLow).toLocaleString()}</strong></span>
                               <span className="text-slate-400">목표 반등가: ₩{Math.round(bounceThreshold).toLocaleString()}</span>
                             </div>
                           </div>
 
-                          {/* 1.6 Rule 7-b: 박스권 소액 불타기 */}
-                          <div className={`p-3 rounded-2xl border transition-all ${
-                            isBoxPyramidActive
-                              ? 'bg-fuchsia-50 border-fuchsia-400 ring-2 ring-fuchsia-200 shadow-xs'
-                              : positionAmount > 0 && marketRegime === 'SIDEWAYS' && boxPyramidCount < 1
-                              ? 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
-                              : 'bg-slate-50/50 border-slate-100 opacity-60'
-                          }`}>
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-1.5">
-                                <span className="px-1.5 py-0.5 rounded-md bg-fuchsia-100 text-fuchsia-800 font-extrabold font-mono text-[9.5px]">
-                                  Rule 7-b
-                                </span>
-                                <span className="font-extrabold text-xs text-slate-900">박스권 소액 불타기</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(0.25 Unit)</span>
-                              </div>
-                              <div>
-                                {isBoxPyramidActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-fuchsia-600 text-white font-black text-[10px] animate-pulse shadow-sm">
-                                    🚀 추가매수 발동!
-                                  </span>
-                                ) : positionAmount === 0 ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">보유량 없음</span>
-                                ) : marketRegime !== 'SIDEWAYS' ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">SIDEWAYS 전용</span>
-                                ) : boxPyramidCount >= 1 ? (
-                                  <span className="text-[9.5px] text-slate-400 font-medium">1회 한도 소진됨</span>
-                                ) : (
-                                  <span className="text-[10px] font-mono font-bold text-fuchsia-700">
-                                    +0.25% 수익 도달 대기 (+{Math.round(distBoxPyramid).toLocaleString()}원)
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                            {positionAmount > 0 && marketRegime === 'SIDEWAYS' && boxPyramidCount < 1 && !isBoxPyramidActive && (
-                              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2.5 overflow-hidden flex">
-                                <div className="bg-fuchsia-400 h-full rounded-full transition-all" style={{ width: `${Math.max(5, 100 - (distBoxPyramid / (effectiveEntryPrice * 0.0025)) * 100)}%` }}></div>
-                              </div>
-                            )}
-                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span className="font-mono">
-                                평단가: <strong className="text-slate-800">₩{Math.round(effectiveEntryPrice).toLocaleString()}</strong>
-                              </span>
-                              <span className="text-slate-400">목표가: ₩{Math.round(boxPyramidTargetPrice).toLocaleString()}</span>
-                            </div>
-                          </div>
-
-                          {/* 2. Rule 9-b: 박스권 상단 스캘핑 */}
+                          {/* 5. Rule 9-b: 박스권 상단 스캘핑 */}
                           <div className={`p-3 rounded-2xl border transition-all ${
                             isScalpUpperActive
                               ? 'bg-teal-50 border-teal-400 ring-2 ring-teal-200 shadow-xs'
@@ -1707,109 +1832,114 @@ export default function App() {
                                 <span className="px-1.5 py-0.5 rounded-md bg-teal-100 text-teal-800 font-extrabold font-mono text-[9.5px]">
                                   Rule 9-b
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">박스권 상단 스캘핑</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(0.5 Unit · ₩{Math.round(scalpBudget).toLocaleString()})</span>
+                                <span className="font-extrabold text-xs text-slate-900">박스권 상단 스캘핑 진입</span>
+                                <span className="text-[10px] text-teal-700 font-bold bg-teal-50 px-1 py-0.2 rounded border border-teal-200">0.8 Unit</span>
                               </div>
                               <div>
                                 {isScalpUpperActive ? (
                                   <span className="px-2 py-0.5 rounded-md bg-teal-600 text-white font-black text-[10px] animate-pulse">
-                                    🎯 진입 구간
+                                    🎯 상단 진입 구간
                                   </span>
                                 ) : scalpUpperExceeded ? (
                                   <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-900 border border-amber-300 font-bold text-[9px]">
-                                    ⚠️ 상한선 +{Math.round(distScalpUpperExceed).toLocaleString()}원 초과 (추격방지)
+                                    ⚠️ 상한선 +{Math.round(distScalpUpperExceed).toLocaleString()}원 초과 (보호)
                                   </span>
                                 ) : marketRegime !== 'SIDEWAYS' ? (
                                   <span className="text-[9.5px] text-slate-400 font-medium">SIDEWAYS 전용</span>
                                 ) : (
                                   <span className="text-[10px] text-teal-700 font-mono font-bold">
-                                    기준선 상향 돌파 시 진입 (+{Math.round(-distBaseline).toLocaleString()}원)
+                                    기준선 상향 돌파 시 진입 (+{Math.round(distBaseline).toLocaleString()}원)
                                   </span>
                                 )}
                               </div>
                             </div>
-                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span className="font-mono">
-                                진입 구간: <strong className="text-slate-800">₩{Math.round(baselineValue).toLocaleString()} ~ ₩{Math.round(calcScalpUpper).toLocaleString()}</strong>
-                              </span>
-                              <span className="text-slate-400">상태: {scalpUpperExceeded ? '상한선 이탈(보호)' : isAboveBaseline ? '구간 내' : '기준선 하단'}</span>
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
+                              <span>진입 구간: <strong className="text-slate-800">₩{Math.round(baselineValue).toLocaleString()} ~ ₩{Math.round(calcScalpUpper).toLocaleString()}</strong></span>
+                              <span className={isBoxRsiMet ? 'text-emerald-600 font-bold' : 'text-rose-600 font-bold'}>RSI {rsiValue.toFixed(0)} (≤65)</span>
                             </div>
                           </div>
 
-                          {/* 3. Rule 8: 하단 밴드 과매도 진입 */}
-                          <div className={`p-3 rounded-2xl border transition-all ${
-                            isLowerBandActive
-                              ? 'bg-blue-50 border-blue-400 ring-2 ring-blue-200 shadow-xs'
-                              : 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
-                          }`}>
+                          {/* 6. Rule 6: DCA 자금순환형 저점 스케일업 추매 (1.5x / 2.0x / 1.5x) */}
+                          <div className="p-3 rounded-2xl bg-white border border-indigo-200 shadow-2xs space-y-2">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-1.5">
-                                <span className="px-1.5 py-0.5 rounded-md bg-blue-100 text-blue-800 font-extrabold font-mono text-[9.5px]">
-                                  Rule 8
+                                <span className="px-1.5 py-0.5 rounded-md bg-indigo-100 text-indigo-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 6
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">하단 밴드 과매도 진입</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(1 Unit · ₩{Math.round(baseBudget).toLocaleString()})</span>
+                                <span className="font-extrabold text-xs text-slate-900">DCA 저점 스케일업 추매</span>
+                                <span className="text-[10px] text-indigo-700 font-bold bg-indigo-50 px-1 py-0.2 rounded border border-indigo-200">1.5x / 2.0x Unit</span>
                               </div>
-                              <div>
-                                {isLowerBandActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-blue-600 text-white font-black text-[10px] animate-pulse">
-                                    🎯 과매도 발동
-                                  </span>
-                                ) : (
-                                  <span className="text-[10px] text-slate-500 font-mono font-bold">
-                                    +{Math.round(distLowerBand).toLocaleString()}원 (+{distLowerBandPct.toFixed(2)}%) 하락 시
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span className="font-mono">
-                                하단 밴드: <strong className="text-slate-800">₩{Math.round(calcLowerBand).toLocaleString()} 이하</strong> (ATR×{effectiveMultiplier})
+                              <span className="text-[9.5px] text-indigo-600 font-bold font-mono">
+                                {hasPos ? `평단 ₩${Math.round(effectiveEntry).toLocaleString()} 기준` : '포지션 진입 시 활성'}
                               </span>
-                              <span className="text-slate-400">큰 눌림 반등 포착</span>
+                            </div>
+                            <div className="grid grid-cols-3 gap-1.5 text-[9.5px] font-mono">
+                              <div className={`p-2 rounded-xl border ${safetyOrderCount >= 1 ? 'bg-slate-100 border-slate-200 text-slate-400' : isDca1Active ? 'bg-indigo-100 border-indigo-400 text-indigo-900 font-bold animate-pulse' : 'bg-indigo-50/60 border-indigo-200 text-indigo-900'}`}>
+                                <div className="font-extrabold text-[10px] flex items-center justify-between">
+                                  <span>DCA #1차</span>
+                                  <span className="text-[8.5px] bg-indigo-200 px-1 rounded">1.5x Unit</span>
+                                </div>
+                                <div className="mt-1 font-bold">₩{Math.round(dca1Price).toLocaleString()}</div>
+                                <div className="text-[8.5px] text-slate-500">{safetyOrderCount >= 1 ? '✅ 체결 완료' : distDca1 > 0 ? `-${Math.round(distDca1).toLocaleString()}원 (-2.0%)` : '🎯 도달'}</div>
+                              </div>
+
+                              <div className={`p-2 rounded-xl border ${safetyOrderCount >= 2 ? 'bg-slate-100 border-slate-200 text-slate-400' : isDca2Active ? 'bg-indigo-100 border-indigo-400 text-indigo-900 font-bold animate-pulse' : 'bg-indigo-50/60 border-indigo-200 text-indigo-900'}`}>
+                                <div className="font-extrabold text-[10px] flex items-center justify-between">
+                                  <span>DCA #2차</span>
+                                  <span className="text-[8.5px] bg-indigo-200 px-1 rounded">2.0x Unit</span>
+                                </div>
+                                <div className="mt-1 font-bold">₩{Math.round(dca2Price).toLocaleString()}</div>
+                                <div className="text-[8.5px] text-slate-500">{safetyOrderCount >= 2 ? '✅ 체결 완료' : distDca2 > 0 ? `-${Math.round(distDca2).toLocaleString()}원 (-4.2%)` : '🎯 도달'}</div>
+                              </div>
+
+                              <div className="p-2 rounded-xl border bg-indigo-50/60 border-indigo-200 text-indigo-900">
+                                <div className="font-extrabold text-[10px] flex items-center justify-between">
+                                  <span>DCA #3차</span>
+                                  <span className="text-[8.5px] bg-indigo-200 px-1 rounded">1.5x Unit</span>
+                                </div>
+                                <div className="mt-1 font-bold">₩{Math.round(dca3Price).toLocaleString()}</div>
+                                <div className="text-[8.5px] text-slate-500">{safetyOrderCount >= 3 ? '✅ 체결 완료' : distDca3 > 0 ? `-${Math.round(distDca3).toLocaleString()}원 (-5.5%)` : '🎯 도달'}</div>
+                              </div>
                             </div>
                           </div>
 
-                          {/* 4. Rule 9: 상승 모멘텀 돌파 진입 */}
-                          <div className={`p-3 rounded-2xl border transition-all ${
-                            isBreakoutActive
-                              ? 'bg-emerald-50 border-emerald-400 ring-2 ring-emerald-200 shadow-xs'
-                              : 'bg-white border-slate-200 hover:border-slate-300 shadow-2xs'
-                          }`}>
+                          {/* 7. Rule 7 & 7-b: 불타기 (Pyramiding) */}
+                          <div className="p-3 rounded-2xl bg-white border border-fuchsia-200 shadow-2xs space-y-2">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-1.5">
-                                <span className="px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-800 font-extrabold font-mono text-[9.5px]">
-                                  Rule 9
+                                <span className="px-1.5 py-0.5 rounded-md bg-fuchsia-100 text-fuchsia-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 7 / 7-b
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">상승 모멘텀 돌파 진입</span>
-                                <span className="text-[10px] text-slate-500 font-medium">(1 Unit · ₩{Math.round(baseBudget).toLocaleString()})</span>
+                                <span className="font-extrabold text-xs text-slate-900">상승 불타기 (Pyramiding)</span>
+                                <span className="text-[10px] text-fuchsia-700 font-bold bg-fuchsia-50 px-1 py-0.2 rounded border border-fuchsia-200">0.50 Unit 스케일업</span>
+                              </div>
+                              <span className="text-[9.5px] text-fuchsia-700 font-bold font-mono">
+                                {marketRegime === 'SIDEWAYS' ? `박스권: +0.25% 마다 (최대 2회)` : `BULL: +1.5% 마다`}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between p-2 rounded-xl bg-fuchsia-50 border border-fuchsia-200 text-[10px] font-mono">
+                              <div>
+                                <span className="text-slate-500 font-medium">{marketRegime === 'SIDEWAYS' ? '박스권 불타기' : '대세 상승 불타기'}: </span>
+                                <strong className="text-fuchsia-900">₩{Math.round(marketRegime === 'SIDEWAYS' ? boxPyramidTargetPrice : bullPyramidTargetPrice).toLocaleString()}</strong>
                               </div>
                               <div>
-                                {isBreakoutActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-black text-[10px] animate-pulse">
-                                    🎯 돌파 발동
-                                  </span>
+                                {isBoxPyramidActive || isBullPyramidActive ? (
+                                  <span className="px-2 py-0.5 rounded-md bg-fuchsia-600 text-white font-bold animate-pulse">🚀 불타기 발동!</span>
+                                ) : !hasPos ? (
+                                  <span className="text-slate-400">포지션 진입 시 활성</span>
+                                ) : boxPyramidCount >= 2 ? (
+                                  <span className="text-slate-400">2회 한도 소진 (익절 대기)</span>
                                 ) : (
-                                  <span className="text-[10px] text-slate-500 font-mono">
-                                    {marketRegime === 'BULL' ? '기준선 상향 대기' : `기울기 +0.10% 또는 BULL 전환 대기`}
-                                  </span>
+                                  <span className="text-fuchsia-700 font-bold">+{Math.round(distBoxPyramid).toLocaleString()}원 상승 시 체결</span>
                                 )}
                               </div>
-                            </div>
-                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500">
-                              <span className="font-mono">
-                                조건: 기준선(₩{Math.round(baselineValue).toLocaleString()}) 위 + <strong className={currentSlope >= 0.1 ? 'text-emerald-700' : 'text-slate-700'}>기울기 {currentSlope.toFixed(2)}%</strong> (기준 ≥ 0.10%)
-                              </span>
-                              <span className={marketRegime === 'BULL' ? 'text-emerald-600 font-bold' : 'text-slate-400'}>
-                                국면: {marketRegime}
-                              </span>
                             </div>
                           </div>
                         </div>
                       </div>
                     )}
 
-                    {/* ── 🔴 매도/익절/손절 조건 섹션 (SELL & EXIT TRIGGERS) ── */}
+                    {/* ── 🔴 매도/익절/손절 조건 섹션 (SELL & EXIT & DEFENSE) ── */}
                     {(activeRadarTab === 'ALL' || activeRadarTab === 'SELL') && (
                       <div className="space-y-2 pt-1">
                         <div className="text-[11px] font-extrabold text-rose-800 flex items-center justify-between px-1">
@@ -1817,11 +1947,11 @@ export default function App() {
                             <ShieldCheck className="w-3.5 h-3.5 text-rose-600" />
                             매도 & 리스크 관리 레이더 {hasPos ? `(수익률: ${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}%)` : '(포지션 진입 시 즉시 활성화)'}
                           </span>
-                          <span className="text-[9.5px] text-slate-500 font-mono">손절 기준선 실시간 감시</span>
+                          <span className="text-[9.5px] text-slate-500 font-mono">손절선 실시간 감시</span>
                         </div>
 
                         <div className="grid grid-cols-1 gap-2">
-                          {/* 1. Rule 3-b: 박스권 짤짤이 전량 익절 */}
+                          {/* 1. Rule 4: 박스권 스캘핑 100% 전량 익절 */}
                           <div className={`p-3 rounded-2xl border transition-all ${
                             isScalpTpActive
                               ? 'bg-teal-50 border-teal-400 ring-2 ring-teal-200'
@@ -1832,78 +1962,136 @@ export default function App() {
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-1.5">
                                 <span className="px-1.5 py-0.5 rounded-md bg-teal-100 text-teal-800 font-extrabold font-mono text-[9.5px]">
-                                  Rule 3-b
+                                  Rule 4
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">박스권 짤짤이 전량 익절</span>
-                                <span className="text-[10px] text-teal-700 font-bold">(+{dynamicScalpTp.toFixed(2)}% 도달 시)</span>
+                                <span className="font-extrabold text-xs text-slate-900">박스권 스캘핑 전량 익절</span>
+                                <span className="text-[10px] text-teal-700 font-bold bg-teal-50 px-1 py-0.2 rounded border border-teal-200">+{steppedScalpTp.toFixed(2)}% 목표</span>
                               </div>
                               <div>
                                 {isScalpTpActive ? (
                                   <span className="px-2 py-0.5 rounded-md bg-teal-600 text-white font-black text-[10px] animate-pulse">
-                                    🎯 익절 발동!
+                                    🎯 익절 발동! (100% 매도)
                                   </span>
                                 ) : hasPos ? (
-                                  <span className={`text-[10px] font-mono font-bold ${distScalpTp > 0 ? 'text-teal-700' : 'text-emerald-600'}`}>
+                                  <span className="text-[10px] font-mono font-bold text-teal-700">
                                     {distScalpTp > 0 ? `+${Math.round(distScalpTp).toLocaleString()}원 (+${distScalpTpPct.toFixed(2)}%) 상승 시` : '도달'}
                                   </span>
                                 ) : (
-                                  <span className="text-[9.5px] text-slate-400 font-mono">목표 +{dynamicScalpTp.toFixed(1)}% (전량 100% 매도)</span>
+                                  <span className="text-[9.5px] text-slate-400 font-mono">목표 +{steppedScalpTp.toFixed(2)}%</span>
                                 )}
                               </div>
                             </div>
                             <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
-                              <span>
-                                목표가: <strong className="text-teal-700">₩{Math.round(scalpTpPrice).toLocaleString()}</strong>
-                              </span>
-                              <span className="text-slate-400">
-                                {marketRegime === 'BULL' ? 'BULL 국면 시 트레일링 인수인계' : '체결 시 FLAT 복귀 + 30초 쿨다운'}
-                              </span>
+                              <span>목표 익절가: <strong className="text-teal-700">₩{Math.round(scalpTpPrice).toLocaleString()}</strong></span>
+                              <span className="text-slate-400">체결 시 100% 전량 청산 ➡️ 30초 쿨다운</span>
                             </div>
                           </div>
 
-                          {/* 2. Rule 4: 트레일링 50% 분할 익절 */}
+                          {/* 2. Rule 5: 트레일링 2단계 익절 (1차 50% ➡️ 2차 전량 100%) */}
                           <div className={`p-3 rounded-2xl border transition-all ${
                             isTrailingActive
-                              ? 'bg-emerald-50 border-emerald-400 ring-2 ring-emerald-200'
+                              ? 'bg-emerald-50 border-emerald-400 ring-2 ring-emerald-200 shadow-xs'
                               : 'bg-white border-slate-200 shadow-2xs'
                           }`}>
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-1.5">
                                 <span className="px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-800 font-extrabold font-mono text-[9.5px]">
-                                  Rule 4
+                                  Rule 5
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">트레일링 50% 분할 익절</span>
-                                <span className="text-[10px] text-slate-500">(-{dynamicTrailingCb}% 콜백)</span>
+                                <span className="font-extrabold text-xs text-slate-900">
+                                  트레일링 {trailingExitCount >= 1 ? '2차 전량(100%)' : '1차 50%'} 익절
+                                </span>
+                                <span className="text-[10px] text-emerald-700 font-bold bg-emerald-50 px-1 py-0.2 rounded border border-emerald-200">-{dynamicTrailingCb}% 콜백</span>
                               </div>
                               <div>
                                 {isTrailingActive ? (
-                                  <span className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-black text-[10px] animate-pulse">
-                                    🔥 무장 활성 (최고 ₩{Math.round(trailingPeakPrice || currentPrice).toLocaleString()})
+                                  <span className="px-2 py-0.5 rounded-md bg-emerald-600 text-white font-black text-[10px] animate-pulse shadow-sm">
+                                    🔥 최고가 ₩{Math.round(trailingPeakPrice || currentPrice).toLocaleString()} 추적 중
                                   </span>
                                 ) : (
                                   <span className="text-[10px] text-slate-500 font-mono font-bold">
-                                    상단 터치까지 {distUpperBand > 0 ? `+${Math.round(distUpperBand).toLocaleString()}원` : '터치'}
+                                    무장까지 {distUpperBand > 0 ? `+${Math.round(distUpperBand).toLocaleString()}원` : '무장 완료'}
                                   </span>
                                 )}
                               </div>
                             </div>
                             <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
-                              <span>
-                                무장 밴드: <strong className="text-emerald-700">₩{Math.round(calcUpperBand).toLocaleString()}</strong> (상단 터치 시 무장)
-                              </span>
-                              <span className="text-slate-400">50% 익절 (더스트가드: 1만원 미만 전량)</span>
+                              {isTrailingActive ? (
+                                <>
+                                  <span>{trailingExitCount >= 1 ? '2차 전량 매도가' : '1차 50% 매도가'}: <strong className="text-emerald-700 font-bold">₩{Math.round(trailingTriggerPrice).toLocaleString()}</strong></span>
+                                  <span className="text-emerald-600 font-bold">현재가 대비 -{Math.round(distTrailingTrigger).toLocaleString()}원 시 체결</span>
+                                </>
+                              ) : (
+                                <>
+                                  <span>무장 목표가: <strong className="text-emerald-700">₩{Math.round(effectiveArmingPrice).toLocaleString()}</strong> (수익률 ≥ +1.0%)</span>
+                                  <span className="text-slate-400">1차 50% ➡️ 2차 100% 전량 청산</span>
+                                </>
+                              )}
                             </div>
                           </div>
 
-                          {/* 3. Rule 1: 마지노선 절대 손절 */}
+                          {/* 3. Rule 3-a & 3-b: 자금순환 2단계 리사이클링 덜어내기 */}
+                          <div className="p-3 rounded-2xl bg-white border border-amber-200 shadow-2xs space-y-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-900 font-extrabold font-mono text-[9.5px]">
+                                  Rule 3-a / 3-b
+                                </span>
+                                <span className="font-extrabold text-xs text-slate-900">자금순환 리사이클링 덜어내기</span>
+                                <span className="text-[10px] text-amber-800 font-bold bg-amber-50 px-1 py-0.2 rounded border border-amber-200">1차 30% ➡️ 2차 50%</span>
+                              </div>
+                              <span className="text-[9.5px] text-amber-700 font-bold font-mono">현금 확보 ➡️ DCA 바닥 추매 대기</span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2 text-[9.5px] font-mono">
+                              <div className="p-2 rounded-xl bg-amber-50/60 border border-amber-200 text-amber-950">
+                                <div className="font-extrabold flex items-center justify-between">
+                                  <span>1단계 (-1.0%)</span>
+                                  <span className="text-[8.5px] bg-amber-200 px-1 rounded">30% 매도</span>
+                                </div>
+                                <div className="mt-1 font-bold">₩{Math.round(trim1Price).toLocaleString()}</div>
+                                <div className="text-[8.5px] text-slate-500">{distTrim1 > 0 ? `-${Math.round(distTrim1).toLocaleString()}원 하락 시` : '발동'}</div>
+                              </div>
+
+                              <div className="p-2 rounded-xl bg-amber-50/60 border border-amber-200 text-amber-950">
+                                <div className="font-extrabold flex items-center justify-between">
+                                  <span>2단계 (-3.2%)</span>
+                                  <span className="text-[8.5px] bg-amber-200 px-1 rounded">50% 매도</span>
+                                </div>
+                                <div className="mt-1 font-bold">₩{Math.round(trim2Price).toLocaleString()}</div>
+                                <div className="text-[8.5px] text-slate-500">{distTrim2 > 0 ? `-${Math.round(distTrim2).toLocaleString()}원 하락 시` : '발동'}</div>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* 4. Rule 2: 급락 가속도 비상 탈출 */}
                           <div className="p-3 rounded-2xl bg-white border border-slate-200 shadow-2xs">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <span className="px-1.5 py-0.5 rounded-md bg-purple-100 text-purple-800 font-extrabold font-mono text-[9.5px]">
+                                  Rule 2
+                                </span>
+                                <span className="font-extrabold text-xs text-slate-900">급락 가속도 비상 탈출</span>
+                                <span className="text-[10px] text-purple-700 font-bold bg-purple-50 px-1 py-0.2 rounded border border-purple-200">40% 긴급 청산</span>
+                              </div>
+                              <span className={`text-[10px] font-mono font-black ${dropSpeed <= -1.0 ? 'text-rose-600 animate-pulse' : 'text-slate-500'}`}>
+                                현재 낙폭: {dropSpeed.toFixed(2)}% (기준: ≤-1.8%)
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
+                              <span>3초 내 -1.8% 폭락 감지 시 40% 즉시 손절하여 플래시 크래시 방어</span>
+                              <span className="text-slate-400">비상 상태 전환</span>
+                            </div>
+                          </div>
+
+                          {/* 5. Rule 1: 마지노선 절대 손절 */}
+                          <div className="p-3 rounded-2xl bg-white border border-rose-200 shadow-2xs">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-1.5">
                                 <span className="px-1.5 py-0.5 rounded-md bg-rose-100 text-rose-800 font-extrabold font-mono text-[9.5px]">
                                   Rule 1
                                 </span>
-                                <span className="font-extrabold text-xs text-slate-900">마지노선 절대 손절</span>
-                                <span className="text-[10px] text-rose-600 font-mono">(100% 전량 청산)</span>
+                                <span className="font-extrabold text-xs text-slate-900">마지노선 100% 절대 손절</span>
+                                <span className="text-[10px] text-rose-700 font-bold bg-rose-50 px-1 py-0.2 rounded border border-rose-200">-6.0% 바닥선</span>
                               </div>
                               <div>
                                 <span className={`text-[10px] font-mono font-bold ${distStopLoss < (atrValue * 0.5) ? 'text-rose-600 animate-pulse' : 'text-slate-500'}`}>
@@ -1912,30 +2100,8 @@ export default function App() {
                               </div>
                             </div>
                             <div className="flex items-center justify-between mt-2 pt-1.5 border-t border-slate-100 text-[10px] text-slate-500 font-mono">
-                              <span>
-                                손절선: <strong className="text-rose-600">₩{Math.round(calculatedStopLoss).toLocaleString()}</strong>
-                              </span>
-                              <span className="text-slate-400">
-                                {entryPrice ? `평단가(₩${Math.round(entryPrice).toLocaleString()}) 기준 스냅샷` : '하단 밴드 기준 산출'}
-                              </span>
-                            </div>
-                          </div>
-
-                          {/* 4. Rule 2 & Rule 3: 플래시 크래시 & 부분 손절 */}
-                          <div className="grid grid-cols-2 gap-2 text-[10px]">
-                            <div className="p-2.5 rounded-xl bg-white border border-slate-200 shadow-2xs">
-                              <div className="flex items-center justify-between font-extrabold text-slate-800">
-                                <span>Rule 2 급락 감지</span>
-                                <span className={dropSpeed <= -1.0 ? 'text-rose-600' : 'text-slate-500'}>{dropSpeed.toFixed(2)}%</span>
-                              </div>
-                              <div className="text-[9px] text-slate-400 mt-1">3초 내 -1.8% 급락 시 40% 조기손절</div>
-                            </div>
-                            <div className="p-2.5 rounded-xl bg-white border border-slate-200 shadow-2xs">
-                              <div className="flex items-center justify-between font-extrabold text-slate-800">
-                                <span>Rule 3 부분 손절</span>
-                                <span className="text-slate-600">-4.50%</span>
-                              </div>
-                              <div className="text-[9px] text-slate-400 mt-1">-4.5% 도달 시 40% 손절 현금회수</div>
+                              <span>절대 손절가: <strong className="text-rose-600 font-bold">₩{Math.round(calculatedStopLoss).toLocaleString()}</strong></span>
+                              <span className="text-slate-400">발동 시 100% 전량 매도 ➡️ 3분 진정 쿨다운</span>
                             </div>
                           </div>
                         </div>
@@ -2477,10 +2643,14 @@ export default function App() {
                     <span className="font-bold mono text-blue-600">{formatPrice(currentEquity)}</span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-slate-100">
-                    <span className="text-slate-500">누적 실현 손익</span>
+                    <span className="text-slate-500">누적 실현 순손익 (수수료 차감 후)</span>
                     <span className={`font-bold mono ${totalRealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                       {totalRealizedPnl >= 0 ? '+' : ''}{formatPrice(totalRealizedPnl)}
                     </span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100">
+                    <span className="text-slate-500">누적 거래 수수료 (0.05%)</span>
+                    <span className="font-bold mono text-amber-600">-{formatPrice(totalFeesPaid)}</span>
                   </div>
                   <div className="flex justify-between py-1.5 border-b border-slate-100">
                     <span className="text-slate-500">총 체결 횟수</span>

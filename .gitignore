@@ -7,3 +7,10 @@ coverage/
 .env*
 !.env.example
 data/history_eth.json
+data/secure_keys.dat
+data/order_history.json
+data/position_state.json
+data/processed_signals.json
+data/exposure_reservations.json
+data/trade_logs.json
+data/daily_risk_state.json
