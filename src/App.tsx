@@ -156,6 +156,9 @@ export default function App() {
   const [experimentDca2VolumeConfirmationEnabled, setExperimentDca2VolumeConfirmationEnabled] = useState(false);
   const [experimentPyramidRsiGuardEnabled, setExperimentPyramidRsiGuardEnabled] = useState(false);
   const [experimentPyramidVolumeConfirmationEnabled, setExperimentPyramidVolumeConfirmationEnabled] = useState(false);
+  const [experimentScalpTrendExpansionEnabled, setExperimentScalpTrendExpansionEnabled] = useState(false);
+  const [experimentScalpReentryCooldownEnabled, setExperimentScalpReentryCooldownEnabled] = useState(false);
+  const [experimentTrendTrailingArmingEnabled, setExperimentTrendTrailingArmingEnabled] = useState(false);
   const [researchStats, setResearchStats] = useState({ enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, startedAt: 0 });
   const [rebaseStatus, setRebaseStatus] = useState<string | null>(null);
 
@@ -325,6 +328,9 @@ export default function App() {
               if (s.params.experimentDca2VolumeConfirmationEnabled !== undefined) setExperimentDca2VolumeConfirmationEnabled(s.params.experimentDca2VolumeConfirmationEnabled);
               if (s.params.experimentPyramidRsiGuardEnabled !== undefined) setExperimentPyramidRsiGuardEnabled(s.params.experimentPyramidRsiGuardEnabled);
               if (s.params.experimentPyramidVolumeConfirmationEnabled !== undefined) setExperimentPyramidVolumeConfirmationEnabled(s.params.experimentPyramidVolumeConfirmationEnabled);
+              if (s.params.experimentScalpTrendExpansionEnabled !== undefined) setExperimentScalpTrendExpansionEnabled(s.params.experimentScalpTrendExpansionEnabled);
+              if (s.params.experimentScalpReentryCooldownEnabled !== undefined) setExperimentScalpReentryCooldownEnabled(s.params.experimentScalpReentryCooldownEnabled);
+              if (s.params.experimentTrendTrailingArmingEnabled !== undefined) setExperimentTrendTrailingArmingEnabled(s.params.experimentTrendTrailingArmingEnabled);
             }
             if (s.botState !== undefined) setBotLifecycleState(s.botState);
             if (s.marketState !== undefined) setMarketFeedState(s.marketState);
@@ -441,6 +447,9 @@ export default function App() {
     experimentDca2VolumeConfirmationEnabled?: boolean;
     experimentPyramidRsiGuardEnabled?: boolean;
     experimentPyramidVolumeConfirmationEnabled?: boolean;
+    experimentScalpTrendExpansionEnabled?: boolean;
+    experimentScalpReentryCooldownEnabled?: boolean;
+    experimentTrendTrailingArmingEnabled?: boolean;
   }) => {
     if (newParams.atrMultiplier !== undefined) setAtrMultiplier(newParams.atrMultiplier);
     if (newParams.orderRatio !== undefined) setOrderRatio(newParams.orderRatio);
@@ -463,6 +472,9 @@ export default function App() {
     if (newParams.experimentDca2VolumeConfirmationEnabled !== undefined) setExperimentDca2VolumeConfirmationEnabled(newParams.experimentDca2VolumeConfirmationEnabled);
     if (newParams.experimentPyramidRsiGuardEnabled !== undefined) setExperimentPyramidRsiGuardEnabled(newParams.experimentPyramidRsiGuardEnabled);
     if (newParams.experimentPyramidVolumeConfirmationEnabled !== undefined) setExperimentPyramidVolumeConfirmationEnabled(newParams.experimentPyramidVolumeConfirmationEnabled);
+    if (newParams.experimentScalpTrendExpansionEnabled !== undefined) setExperimentScalpTrendExpansionEnabled(newParams.experimentScalpTrendExpansionEnabled);
+    if (newParams.experimentScalpReentryCooldownEnabled !== undefined) setExperimentScalpReentryCooldownEnabled(newParams.experimentScalpReentryCooldownEnabled);
+    if (newParams.experimentTrendTrailingArmingEnabled !== undefined) setExperimentTrendTrailingArmingEnabled(newParams.experimentTrendTrailingArmingEnabled);
     sendWsCommand('UPDATE_CONFIG', newParams);
   };
 
@@ -2793,6 +2805,30 @@ export default function App() {
                   <strong>봇 가동 중:</strong> 실험 토글은 판단 규칙의 중간 변경을 막기 위해 봇을 정지한 상태에서만 바꿀 수 있습니다.
                 </div>
               )}
+
+              <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">
+                <div className="text-xs font-extrabold text-slate-900">박스권 익절 · 추세 전환 보호</div>
+                <p className="text-[10px] text-slate-500">거래량 20분 평균 1.5배·단기 기울기 +0.05% 이상인 상승 확장 구간에서만 적용됩니다. 기본 규칙은 전량 익절이며, 모든 항목은 독립 실험입니다.</p>
+                {[
+                  { key: 'expansion', title: '추세 확장 50% 분할 익절', detail: '전량 익절 대신 절반만 실현하고, 잔량은 평단 +0.2% 보호선으로 관리', enabled: experimentScalpTrendExpansionEnabled },
+                  { key: 'cooldown', title: '익절 후 추격매수 방지', detail: '박스권 전량 익절 뒤 3분간 신규 돌파 매수 등을 대기', enabled: experimentScalpReentryCooldownEnabled },
+                  { key: 'trailing', title: '추세 확장 트레일링 조기 무장', detail: '확장 조건일 때만 트레일링 무장 기준을 +1.0%에서 +0.8%로 완화', enabled: experimentTrendTrailingArmingEnabled }
+                ].map((experiment) => {
+                  const nextParams = experiment.key === 'expansion'
+                    ? { experimentScalpTrendExpansionEnabled: !experiment.enabled }
+                    : experiment.key === 'cooldown'
+                      ? { experimentScalpReentryCooldownEnabled: !experiment.enabled }
+                      : { experimentTrendTrailingArmingEnabled: !experiment.enabled };
+                  return (
+                    <div key={experiment.key} className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-slate-50 border border-slate-100">
+                      <div><div className="text-[11px] font-bold text-slate-800">{experiment.title}</div><div className="text-[9.5px] text-slate-500 mt-0.5">{experiment.detail}</div></div>
+                      <button disabled={isBotActive} onClick={() => handleParamsChange(nextParams)} className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${experiment.enabled ? 'bg-violet-600' : 'bg-slate-300'}`}>
+                        <span className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${experiment.enabled ? 'translate-x-5' : 'translate-x-1'}`} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
 
               <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2">
                 <div className="text-xs font-extrabold text-slate-900">DCA 2차 접근 반등 선매수</div>

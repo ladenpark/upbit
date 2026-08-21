@@ -319,6 +319,23 @@ export class GlobalRiskGovernor {
       };
     }
 
+    if (signal.type === 'SCALP_PARTIAL_TAKE_PROFIT') {
+      const volume = Math.floor(position.amount * 0.5 * 1e8) / 1e8;
+      if (volume <= 0) {
+        return { approved: false, rejectionReason: `[Risk Block] No coin position available for partial scalp take-profit.` };
+      }
+      const clientOrderId = `ORD_${signal.type}_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+      return {
+        approved: true,
+        calculatedVolume: volume,
+        orderRequest: {
+          clientOrderId, signalId: signal.id, signalType: signal.type, symbol: signal.symbol,
+          side: 'SELL', requestedVolume: volume, limitPrice: roundDownToTick(currentPrice * 0.985),
+          reason: signal.reason, createdAt: Date.now()
+        }
+      };
+    }
+
     if (signal.type === 'PARTIAL_LOSS_CUT' || signal.type === 'EMERGENCY_TREND_CUT') {
       let cutRatio = 0.4;
       if (signal.type === 'PARTIAL_LOSS_CUT') {

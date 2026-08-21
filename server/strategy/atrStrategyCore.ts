@@ -289,6 +289,25 @@ export class ATRStrategyCore {
       !position.trailingActive &&
       pnlPercent >= scalpTpTargetPercent
     ) {
+      // Strategy Lab: a volume-backed upward expansion is not treated as a
+      // normal box-range exit. Realize half, then protect the remaining half
+      // at breakeven-plus-fees so it can participate in a regime transition.
+      const isTrendExpansion = adaptive.volumeMultiplier >= 1.5 && adaptive.slope >= 0.05;
+      if (params.experimentScalpTrendExpansionEnabled && isTrendExpansion) {
+        signals.push({
+          id: `SIG_SCALP_PARTIAL_TP_${now}`,
+          timestamp: now,
+          timeframe: 'tick',
+          source: 'BOX_RANGE_SCALP_ENGINE',
+          type: 'SCALP_PARTIAL_TAKE_PROFIT',
+          priority: 3,
+          symbol: params.symbol,
+          price: currentPrice,
+          reason: `[추세 확장 박스권 익절] 거래량 ${adaptive.volumeMultiplier.toFixed(2)}x·기울기 +${adaptive.slope.toFixed(2)}% 확인 ➡️ 50% 익절, 잔량 본전 보호`,
+          indicatorSnapshot: snapshot
+        });
+        return signals;
+      }
       signals.push({
         id: `SIG_SCALP_TP_${now}`,
         timestamp: now,

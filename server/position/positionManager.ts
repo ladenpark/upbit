@@ -447,6 +447,24 @@ export class PositionManager {
     console.log(`[PositionManager] Trailing Partial Take-Profit (#${this.position.trailingExitCount}차): Sold ${cutVolume} @ ₩${cutPrice.toLocaleString()}, Remaining Qty=${this.position.amount}, PnL=₩${Math.round(pnl).toLocaleString()}`);
   }
 
+  /** Strategy Lab: 추세 확장 중 박스권 수익의 절반만 실현하고 잔량을 보호한다. */
+  public onScalpPartialTakeProfitFilled(cutVolume: number, cutPrice: number, pnl: number) {
+    this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
+    this.position.realizedPnl += pnl;
+    this.position.lastUpdatedAt = Date.now();
+    if (this.position.amount <= 0) {
+      this.onPositionClosed(0, 'SCALP_PARTIAL_TAKE_PROFIT');
+      return;
+    }
+    const entryPrice = this.position.entryPrice || cutPrice;
+    this.position.profitLockPrice = Number((entryPrice * 1.002).toFixed(2));
+    this.position.trailingActive = false;
+    this.position.trailingPeakPrice = null;
+    this.position.state = 'ENTRY_FILLED';
+    this.saveStateToFile();
+    console.log(`[PositionManager] Scalp expansion partial TP: Sold ${cutVolume}, remaining=${this.position.amount}, protected at ₩${Math.round(this.position.profitLockPrice).toLocaleString()}`);
+  }
+
   /**
    * Called when partial fill occurs on a Full Exit order (Trailing Stop, Absolute Stop, Emergency Exit).
    * Reduces position amount without fully closing to FLAT until 100% completed.
@@ -584,7 +602,7 @@ export class PositionManager {
     console.log(`[PositionManager] Position 100% CLOSED (${reason}). Realized PnL: ₩${Math.round(pnl).toLocaleString()}, Cooldown: ${cooldownSeconds}s`);
   }
 
-  public updateTrailingState(currentPrice: number, upperBand: number) {
+  public updateTrailingState(currentPrice: number, upperBand: number, minProfitArmPercent: number = 1.0) {
     const entryPrice = this.position.entryPrice || 0;
     if (this.position.amount <= 0 || entryPrice <= 0) return;
 
@@ -601,7 +619,7 @@ export class PositionManager {
     // Minimum Profit Arming Gate:
     // 트레일링 콜백이 -0.8%이므로, 매도 시 확실한 플러스 수익(+0.2% 이상)을 보장하기 위해
     // 평단 대비 최소 +1.0% 이상(또는 상단 밴드) 도달 시에만 트레일링을 무장(Active)
-    const minProfitArmingPrice = entryPrice * 1.010; // 평단가 대비 +1.0%
+    const minProfitArmingPrice = entryPrice * (1 + minProfitArmPercent / 100);
     const effectiveArmingPrice = Math.max(upperBand, minProfitArmingPrice);
 
     if (currentPrice >= effectiveArmingPrice) {
@@ -624,6 +642,12 @@ export class PositionManager {
   public setCooldown(seconds: number, reason: string) {
     this.position.cooldownUntil = Date.now() + (seconds * 1000);
     this.position.cooldownReason = reason;
+  }
+
+  /** Strategy Lab: 박스권 전량 익절 직후의 추격 돌파 진입을 지연한다. */
+  public setScalpReentryCooldown(seconds: number) {
+    this.setCooldown(seconds, 'SCALP_TAKE_PROFIT_REENTRY_GUARD');
+    this.saveStateToFile();
   }
 
   public isUnderCooldown(): boolean {

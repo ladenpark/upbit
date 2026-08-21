@@ -16,6 +16,7 @@ export type SignalType =
   | 'EMERGENCY_TREND_CUT'
   | 'TRAILING_STOP_EXIT'
   | 'SCALP_TAKE_PROFIT'
+  | 'SCALP_PARTIAL_TAKE_PROFIT'
   | 'ABSOLUTE_STOP_EXIT'
   | 'EMERGENCY_FULL_EXIT';
 
@@ -79,7 +80,8 @@ export const PROTECTIVE_SELL_SIGNALS: SignalType[] = [
   'PARTIAL_LOSS_CUT',
   'EMERGENCY_TREND_CUT',
   'EMERGENCY_FULL_EXIT',
-  'SCALP_TAKE_PROFIT'
+  'SCALP_TAKE_PROFIT',
+  'SCALP_PARTIAL_TAKE_PROFIT'
 ];
 
 export interface ExposureReservation {
@@ -320,6 +322,9 @@ export interface BotParams {
   experimentDca2VolumeConfirmationEnabled: boolean;
   experimentPyramidRsiGuardEnabled: boolean;
   experimentPyramidVolumeConfirmationEnabled: boolean;
+  experimentScalpTrendExpansionEnabled: boolean;
+  experimentScalpReentryCooldownEnabled: boolean;
+  experimentTrendTrailingArmingEnabled: boolean;
 }
 
 export interface ApiKeys {

@@ -67,7 +67,10 @@ export class ATREngine {
     experimentDca2RsiRecoveryEnabled: false,
     experimentDca2VolumeConfirmationEnabled: false,
     experimentPyramidRsiGuardEnabled: false,
-    experimentPyramidVolumeConfirmationEnabled: false
+    experimentPyramidVolumeConfirmationEnabled: false,
+    experimentScalpTrendExpansionEnabled: false,
+    experimentScalpReentryCooldownEnabled: false,
+    experimentTrendTrailingArmingEnabled: false
   };
 
   // Higher Timeframe (15m) Trend State for Whipsaw Filtering
@@ -299,7 +302,10 @@ export class ATREngine {
       experimentDca2RsiRecoveryEnabled: false,
       experimentDca2VolumeConfirmationEnabled: false,
       experimentPyramidRsiGuardEnabled: false,
-      experimentPyramidVolumeConfirmationEnabled: false
+      experimentPyramidVolumeConfirmationEnabled: false,
+      experimentScalpTrendExpansionEnabled: false,
+      experimentScalpReentryCooldownEnabled: false,
+      experimentTrendTrailingArmingEnabled: false
     };
     const decisions: Record<string, ResearchDecision> = {
       active: summarize(activeSignals),
@@ -307,7 +313,10 @@ export class ATREngine {
       dca2Rsi: evaluate({ ...baselineParams, experimentDca2RsiRecoveryEnabled: true }),
       dca2Volume: evaluate({ ...baselineParams, experimentDca2VolumeConfirmationEnabled: true }),
       pyramidRsi: evaluate({ ...baselineParams, experimentPyramidRsiGuardEnabled: true }),
-      pyramidVolume: evaluate({ ...baselineParams, experimentPyramidVolumeConfirmationEnabled: true })
+      pyramidVolume: evaluate({ ...baselineParams, experimentPyramidVolumeConfirmationEnabled: true }),
+      scalpExpansion: evaluate({ ...baselineParams, experimentScalpTrendExpansionEnabled: true }),
+      scalpCooldown: evaluate({ ...baselineParams, experimentScalpReentryCooldownEnabled: true }),
+      trendTrailingArm: evaluate({ ...baselineParams, experimentTrendTrailingArmingEnabled: true })
     };
     const uniqueDecisions = new Set(Object.values(decisions).map((decision) => `${decision.type || 'NONE'}:${decision.dcaExecution || ''}`));
     if (uniqueDecisions.size <= 1) return;
@@ -384,7 +393,9 @@ export class ATREngine {
     const staticStopPrice = this.positionManager.getSnapshot().initialStopPrice || (lowerBand - (effectiveAtr * this.params.stopLossMultiplier));
 
     // Update trailing state if price touches upper band (now using dynamic band)
-    this.positionManager.updateTrailingState(price, upperBand);
+    const isTrendExpansion = adaptive.marketRegime === 'SIDEWAYS' && adaptive.volumeMultiplier >= 1.5 && adaptive.slope >= 0.05;
+    const trailingArmProfitPercent = this.params.experimentTrendTrailingArmingEnabled && isTrendExpansion ? 0.8 : 1.0;
+    this.positionManager.updateTrailingState(price, upperBand, trailingArmProfitPercent);
 
     // Calculate drop speed over explicit 5-second window
     const dropSpeed = this.marketManager.calculateDropSpeed(this.params.trendDropWindowSeconds || 5);
@@ -734,6 +745,19 @@ export class ATREngine {
         exchange: this.params.exchange,
         reason: `${record.reason} [${isFullExit ? '전량' : '부분'}체결: ${sellVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
+    } else if (signalType === 'SCALP_PARTIAL_TAKE_PROFIT') {
+      const sellVolume = effectiveVolume;
+      const entry = position.entryPrice || fillPrice;
+      const pnl = (fillPrice - entry) * sellVolume;
+      const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
+      this.positionManager.onScalpPartialTakeProfitFilled(sellVolume, fillPrice, pnl);
+      this.totalRealizedPnl += pnl;
+      this.totalTrades += 1;
+      if (pnl > 0) this.winTrades += 1;
+      this.addLog({
+        type: 'SELL', price: fillPrice, amount: sellVolume, pnl, pnlPercent, exchange: this.params.exchange,
+        reason: `${record.reason} [50% 부분체결: ${sellVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()} · 잔량 본전 보호]`
+      });
     } else if (
       signalType === 'ABSOLUTE_STOP_EXIT' ||
       signalType === 'EMERGENCY_FULL_EXIT' ||
@@ -746,6 +770,9 @@ export class ATREngine {
 
       if (record.status === 'FILLED') {
         this.positionManager.onPositionClosed(pnl, signalType);
+        if (signalType === 'SCALP_TAKE_PROFIT' && this.params.experimentScalpReentryCooldownEnabled) {
+          this.positionManager.setScalpReentryCooldown(180);
+        }
         this.totalRealizedPnl += pnl;
         this.totalTrades += 1;
         if (pnl > 0) this.winTrades += 1;
@@ -913,9 +940,6 @@ export class ATREngine {
 
     if (side === 'BUY') {
       const isAdditional = position.amount > 0 && position.state !== 'FLAT';
-      if (isAdditional && (position.trailingActive || (position.trailingExitCount || 0) >= 1)) {
-        throw new Error('Manual add blocked: trailing take-profit/distribution is active.');
-      }
       if (manualBuyPercent !== undefined && ![10, 20, 30].includes(manualBuyPercent)) {
         throw new Error('Manual buy percentage must be one of 10, 20, or 30.');
       }

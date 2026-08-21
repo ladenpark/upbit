@@ -48,7 +48,10 @@ async function runBacktest() {
     dca2Rsi: 'experimentDca2RsiRecoveryEnabled',
     dca2Volume: 'experimentDca2VolumeConfirmationEnabled',
     pyramidRsi: 'experimentPyramidRsiGuardEnabled',
-    pyramidVolume: 'experimentPyramidVolumeConfirmationEnabled'
+    pyramidVolume: 'experimentPyramidVolumeConfirmationEnabled',
+    scalpExpansion: 'experimentScalpTrendExpansionEnabled',
+    scalpCooldown: 'experimentScalpReentryCooldownEnabled',
+    trendTrailingArm: 'experimentTrendTrailingArmingEnabled'
   } as const;
   const unknownExperiments = [...requestedExperiments].filter((name) => !(name in experimentParamMap));
   if (unknownExperiments.length > 0) {
@@ -80,7 +83,10 @@ async function runBacktest() {
     experimentDca2RsiRecoveryEnabled: requestedExperiments.has('dca2Rsi'),
     experimentDca2VolumeConfirmationEnabled: requestedExperiments.has('dca2Volume'),
     experimentPyramidRsiGuardEnabled: requestedExperiments.has('pyramidRsi'),
-    experimentPyramidVolumeConfirmationEnabled: requestedExperiments.has('pyramidVolume')
+    experimentPyramidVolumeConfirmationEnabled: requestedExperiments.has('pyramidVolume'),
+    experimentScalpTrendExpansionEnabled: requestedExperiments.has('scalpExpansion'),
+    experimentScalpReentryCooldownEnabled: requestedExperiments.has('scalpCooldown'),
+    experimentTrendTrailingArmingEnabled: requestedExperiments.has('trendTrailingArm')
   };
   console.log(`[Backtest] Strategy Lab: ${requestedExperiments.size ? [...requestedExperiments].join(', ') : 'baseline (all OFF)'}`);
 

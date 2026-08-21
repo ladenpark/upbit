@@ -56,7 +56,10 @@ function validateConfig(payload: unknown): Partial<BotParams> {
     'experimentDca2RsiRecoveryEnabled',
     'experimentDca2VolumeConfirmationEnabled',
     'experimentPyramidRsiGuardEnabled',
-    'experimentPyramidVolumeConfirmationEnabled'
+    'experimentPyramidVolumeConfirmationEnabled',
+    'experimentScalpTrendExpansionEnabled',
+    'experimentScalpReentryCooldownEnabled',
+    'experimentTrendTrailingArmingEnabled'
   ];
   for (const key of experimentKeys) {
     if (key in config && typeof config[key] !== 'boolean') throw new Error(`Invalid ${key}. Expected a boolean.`);
@@ -69,7 +72,10 @@ function assertExperimentConfigIsSafe(config: Partial<BotParams>) {
     'experimentDca2RsiRecoveryEnabled',
     'experimentDca2VolumeConfirmationEnabled',
     'experimentPyramidRsiGuardEnabled',
-    'experimentPyramidVolumeConfirmationEnabled'
+    'experimentPyramidVolumeConfirmationEnabled',
+    'experimentScalpTrendExpansionEnabled',
+    'experimentScalpReentryCooldownEnabled',
+    'experimentTrendTrailingArmingEnabled'
   ];
   if (engine.params.isBotActive && experimentKeys.some((key) => key in config)) {
     throw new Error('전략 실험 토글은 봇을 정지한 상태에서만 변경할 수 있습니다.');
@@ -179,7 +185,18 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
           const side = data.payload.side as 'BUY' | 'SELL';
           if (side !== 'BUY' && side !== 'SELL') throw new Error('Invalid manual order side.');
           const manualBuyPercent = data.payload.manualBuyPercent;
-          await engine.executeManualTrade(side, manualBuyPercent);
+          try {
+            await engine.executeManualTrade(side, manualBuyPercent);
+            ws.send(JSON.stringify({ type: 'MANUAL_TRADE_RESULT', payload: { success: true } }));
+          } catch (err: any) {
+            console.error('[Server WS] Manual trade error:', err.message);
+            engine.addLog({
+              type: 'SYSTEM',
+              price: engine.currentPrice,
+              reason: `❌ 수동 주문 실패: ${err.message}`
+            });
+            ws.send(JSON.stringify({ type: 'MANUAL_TRADE_RESULT', payload: { success: false, error: err.message } }));
+          }
           break;
         }
 

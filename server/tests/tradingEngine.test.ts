@@ -76,7 +76,10 @@ async function runAllTests() {
     experimentDca2RsiRecoveryEnabled: false,
     experimentDca2VolumeConfirmationEnabled: false,
     experimentPyramidRsiGuardEnabled: false,
-    experimentPyramidVolumeConfirmationEnabled: false
+    experimentPyramidVolumeConfirmationEnabled: false,
+    experimentScalpTrendExpansionEnabled: false,
+    experimentScalpReentryCooldownEnabled: false,
+    experimentTrendTrailingArmingEnabled: false
   };
 
   const riskGovernor = new GlobalRiskGovernor(defaultParams);
@@ -1401,6 +1404,30 @@ async function runAllTests() {
   assert(pyramidWithConfirmedVolume.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid volume experiment permits add when volume is confirmed');
   const pyramidWithRsiFilter = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidRsiGuardEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 70, 1.2);
   assert(!pyramidWithRsiFilter.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid RSI experiment blocks an overbought add above RSI 68');
+
+  const scalpExpansionPosition: PositionSnapshot = {
+    ...labPyramidPosition,
+    entryPrice: 100,
+    amount: 1,
+    totalCostKrw: 100,
+    initialStopPrice: 90,
+    boxPyramidCount: 0,
+    dcaSlots: [{ slotNumber: 1, status: 'FILLED' }, { slotNumber: 2, status: 'FILLED' }, { slotNumber: 3, status: 'FILLED' }]
+  };
+  const expansionHistory = [99.9, 100, 100, 100.1, 100.2, 100.2, 100.3, 100.4, 100.4, 100.5, 100.5, 100.6, 100.6, 100.6, 100.6];
+  const normalScalpSignals = strategyCore.generateSignals(100.6, 101, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'BULL', htfSlope: 0.2 }, 60, 1.6);
+  assert(normalScalpSignals[0]?.type === 'SCALP_TAKE_PROFIT', '[Lab] Box scalp remains a full exit while trend-expansion experiment is OFF');
+  const expansionScalpSignals = strategyCore.generateSignals(100.6, 101, 1, { ...defaultParams, experimentScalpTrendExpansionEnabled: true }, scalpExpansionPosition, 0, expansionHistory, { trend: 'BULL', htfSlope: 0.2 }, 60, 1.6);
+  assert(expansionScalpSignals[0]?.type === 'SCALP_PARTIAL_TAKE_PROFIT', '[Lab] Trend expansion experiment converts box scalp exit to a 50% partial exit');
+  const partialScalpEval = riskGovernor.evaluateSignal(expansionScalpSignals[0], 'RUNNING', 'LIVE', 1_000_000, scalpExpansionPosition, 0, [], 0);
+  assert(partialScalpEval.approved === true && partialScalpEval.calculatedVolume === 0.5, '[Lab] Trend expansion partial exit sells exactly 50% of the position');
+  const scalpPartialManager = new PositionManager(defaultParams);
+  scalpPartialManager.onInitialEntryFilled(100, 1, 90, 1, 1, 1);
+  scalpPartialManager.onScalpPartialTakeProfitFilled(0.5, 100.6, 0.3);
+  const scalpPartialSnapshot = scalpPartialManager.getSnapshot();
+  assert(scalpPartialSnapshot.amount === 0.5 && scalpPartialSnapshot.profitLockPrice === 100.2, '[Lab] Partial scalp exit leaves 50% with a +0.2% breakeven protection floor');
+  scalpPartialManager.setScalpReentryCooldown(180);
+  assert(scalpPartialManager.isUnderCooldown() && scalpPartialManager.getSnapshot().cooldownReason === 'SCALP_TAKE_PROFIT_REENTRY_GUARD', '[Lab] Scalp re-entry guard persists a 3-minute cooldown');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 19: Research Recorder Isolation
