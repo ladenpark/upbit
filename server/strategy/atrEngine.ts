@@ -669,6 +669,11 @@ export class ATREngine {
         exchange: this.params.exchange,
         reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
+    } else if (signalType === 'REGIME_REBALANCE_BUY') {
+      const adaptive = this.strategyCore.evaluateAdaptiveParams(fillPrice, this.baselineValue, this.atrValue, this.params, this.priceHistory.map((point) => point.price), this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa);
+      this.positionManager.onRegimeRebalanceBuyFilled(fillPrice, effectiveVolume, this.baselineValue, Math.max(this.atrValue, 5000), adaptive.dynamicAtr, this.params.stopLossMultiplier);
+      this.totalTrades += 1;
+      this.addLog({ type: 'BUY', price: fillPrice, amount: effectiveVolume, exchange: this.params.exchange, reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]` });
     } else if (signalType === 'PARTIAL_LOSS_CUT') {
       const cutVolume = effectiveVolume;
       const entry = position.entryPrice || fillPrice;

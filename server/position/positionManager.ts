@@ -71,6 +71,7 @@ export class PositionManager {
       trailingPeakPrice: null,
       trailingExitCount: 0,
       profitLockPrice: null,
+      lastRegimeRebalanceAt: 0,
       cooldownUntil: 0
     };
   }
@@ -140,6 +141,7 @@ export class PositionManager {
     this.position.trailingPeakPrice = null;
     this.position.trailingExitCount = 0;
     this.position.profitLockPrice = null;
+    this.position.lastRegimeRebalanceAt = 0;
 
     this.saveStateToFile();
     console.log(`[PositionManager] Initial Entry Filled: Price=${fillPrice}, Qty=${fillVolume}, Static Absolute Stop Loss locked at ₩${Math.round(staticStopLossPrice).toLocaleString()}`);
@@ -205,6 +207,14 @@ export class PositionManager {
 
     this.saveStateToFile();
     console.log(`[PositionManager] Manual Add Filled: Added=${fillVolume}, New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()} (DCA slots preserved)`);
+  }
+
+  /** 국면별 목표 비중을 향한 자동 소액 매수. DCA/불타기 슬롯은 소비하지 않는다. */
+  public onRegimeRebalanceBuyFilled(fillPrice: number, fillVolume: number, baseline: number, atr: number, atrMultiplier: number, stopLossMultiplier: number) {
+    this.onManualAdditionalBuyFilled(fillPrice, fillVolume, baseline, atr, atrMultiplier, stopLossMultiplier);
+    this.position.lastRegimeRebalanceAt = Date.now();
+    this.saveStateToFile();
+    console.log(`[PositionManager] Regime rebalance filled: Added=${fillVolume}, next regime add delayed.`);
   }
 
   /**
@@ -436,6 +446,7 @@ export class PositionManager {
       this.position.partialCutCount = 0;
       this.position.trailingExitCount = 0;
       this.position.profitLockPrice = null;
+      this.position.lastRegimeRebalanceAt = 0;
       this.position.dcaSlots = Array.from({ length: this.params.maxSafetyOrders }, (_, i) => ({
         slotNumber: i + 1,
         status: 'AVAILABLE' as const
@@ -556,6 +567,7 @@ export class PositionManager {
     this.position.trailingPeakPrice = null;
     this.position.trailingExitCount = 0;
     this.position.profitLockPrice = null;
+    this.position.lastRegimeRebalanceAt = 0;
     this.position.cooldownUntil = 0;
     this.position.cooldownReason = 'RECONCILED_POSITION_REBASE';
     this.position.lastUpdatedAt = Date.now();

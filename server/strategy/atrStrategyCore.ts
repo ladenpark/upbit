@@ -470,6 +470,48 @@ export class ATRStrategyCore {
     // Trailing Distribution Gate: 한 번이라도 트레일링 익절이 시작된 포지션은 전량 청산(FLAT)까지 모든 불타기 일체 금지
     const hasTrailingExitedThisCycle = Boolean(position.trailingExitCount && position.trailingExitCount >= 1);
 
+    // Regime exposure controller: target allocation is reached gradually, not
+    // by enlarging the initial order. The governor calculates the actual gap
+    // to the target and caps every fill at 5% of total capital.
+    const sinceLastRegimeAddMs = now - (position.lastRegimeRebalanceAt || 0);
+    const canAddByTime = sinceLastRegimeAddMs >= 120_000;
+    const recentPrices = priceHistory.slice(-10);
+    const recentLow = recentPrices.length ? Math.min(...recentPrices) : currentPrice;
+    const reboundFromRecentLow = recentLow > 0 ? ((currentPrice - recentLow) / recentLow) * 100 : 0;
+
+    if (
+      hasPosition && params.autoPilotEnabled && params.pyramidingEnabled &&
+      adaptive.marketRegime === 'BULL' && higherTfTrend?.trend === 'BULL' &&
+      !position.trailingActive && !hasTrailingExitedThisCycle && canAddByTime &&
+      pnlPercent >= 0.30 && adaptive.slope >= 0.05 && adaptive.volumeMultiplier >= 1.05 &&
+      adaptive.rsi >= 50 && adaptive.rsi <= 70
+    ) {
+      signals.push({
+        id: `SIG_BULL_TARGET_ADD_${now}`, timestamp: now, timeframe: 'tick', source: 'REGIME_EXPOSURE_CONTROLLER',
+        type: 'REGIME_REBALANCE_BUY', priority: 6, symbol: params.symbol, price: currentPrice,
+        regimeTargetExposurePercent: 65,
+        reason: `[BULL 목표비중 채우기] 상승 추세·거래량 ${adaptive.volumeMultiplier.toFixed(2)}x·기울기 +${adaptive.slope.toFixed(2)}% 확인 ➡️ 목표 코인 비중 65%까지 5%p 이내 추가`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
+    if (
+      hasPosition && params.autoPilotEnabled && params.dcaEnabled &&
+      adaptive.marketRegime === 'BEAR' && !position.trailingActive && canAddByTime &&
+      pnlPercent <= -0.50 && reboundFromRecentLow >= 0.20 && adaptive.slope >= -0.15 &&
+      adaptive.rsi >= 25 && adaptive.rsi <= 48
+    ) {
+      signals.push({
+        id: `SIG_BEAR_TARGET_ADD_${now}`, timestamp: now, timeframe: 'tick', source: 'REGIME_EXPOSURE_CONTROLLER',
+        type: 'REGIME_REBALANCE_BUY', priority: 6, symbol: params.symbol, price: currentPrice,
+        regimeTargetExposurePercent: 40,
+        reason: `[BEAR 목표비중 채우기] 최근 저점 대비 +${reboundFromRecentLow.toFixed(2)}% 반등·하락 둔화 확인 ➡️ 목표 코인 비중 40%까지 5%p 이내 추가`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
     // --- Rule 7: Pyramiding Buy (Priority 6) ---
     const isPyramidRsiConfirmed = !params.experimentPyramidRsiGuardEnabled || (adaptive.rsi >= 55 && adaptive.rsi <= 68);
     const isPyramidVolumeConfirmed = !params.experimentPyramidVolumeConfirmationEnabled || adaptive.volumeMultiplier >= 1.15;

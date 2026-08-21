@@ -12,6 +12,7 @@ export type SignalType =
   | 'DCA_BUY'
   | 'PYRAMID_BUY'
   | 'BOX_PYRAMID_BUY'
+  | 'REGIME_REBALANCE_BUY'
   | 'REENTRY_BUY'
   | 'PARTIAL_LOSS_CUT'
   | 'EMERGENCY_TREND_CUT'
@@ -45,6 +46,8 @@ export interface Signal {
   dcaExecution?: 'RECOVERY_PREBUY' | 'COMPLETE_REMAINDER';
   /** 상승 추세 불타기의 단계별 예산 비율(1차 0.50 Unit, 2차 0.35 Unit) */
   pyramidBudgetFraction?: number;
+  /** 국면별 목표 노출까지 채우는 리밸런싱 매수의 목표 코인 비중 */
+  regimeTargetExposurePercent?: number;
   indicatorSnapshot: {
     baseline: number;
     atr: number;
@@ -189,6 +192,8 @@ export interface PositionSnapshot {
   trailingExitCount?: number;
   /** 불타기 1차 후 전체 평단의 수수료 포함 본전 이상을 지키는 보호 가격 */
   profitLockPrice?: number | null;
+  /** 국면 비중 리밸런싱의 마지막 체결 시각. 동일 추세에서 연속 주문을 제한한다. */
+  lastRegimeRebalanceAt?: number;
   // Cooldown
   cooldownUntil: number;
   cooldownReason?: string;

@@ -372,6 +372,7 @@ export class GlobalRiskGovernor {
       signal.type === 'DCA_BUY' ||
       signal.type === 'PYRAMID_BUY' ||
       signal.type === 'BOX_PYRAMID_BUY' ||
+      signal.type === 'REGIME_REBALANCE_BUY' ||
       signal.type === 'REENTRY_BUY'
     ) {
       const limits = this.calculateExposureLimits(actualKrwBalance, position.amount, currentPrice, pendingOrdersAmountKrw);
@@ -401,6 +402,17 @@ export class GlobalRiskGovernor {
         ? dynamicRatio / 100
         : (this.params.orderRatio || 25) / 100;
       let targetBudget = limits.totalCapitalKrw * effectiveOrderRatio;
+
+      if (signal.type === 'REGIME_REBALANCE_BUY') {
+        const targetRatio = (signal.regimeTargetExposurePercent || 0) / 100;
+        const targetExposureKrw = limits.totalCapitalKrw * targetRatio;
+        const gapToTargetKrw = targetExposureKrw - limits.currentExposureKrw - limits.pendingExposureKrw;
+        // 목표 비중까지 한 번에 채우지 않고 총자산 5%씩만 매수한다.
+        targetBudget = Math.min(gapToTargetKrw, limits.totalCapitalKrw * 0.05);
+        if (targetBudget < 5000) {
+          return { approved: false, rejectionReason: `[Risk Block] Regime target exposure already reached (${Math.round(targetRatio * 100)}%).` };
+        }
+      }
 
       const isScalpEntry = signal.reason.includes('스캘핑 진입');
       const isBoxPyramidEntry = signal.reason.includes('박스권 불타기');

@@ -1401,15 +1401,15 @@ async function runAllTests() {
   const pyramidWithVolumeFilter = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidVolumeConfirmationEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.0);
   assert(!pyramidWithVolumeFilter.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid volume experiment blocks add when volume is below 1.15x');
   const pyramidWithConfirmedVolume = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidVolumeConfirmationEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.2);
-  assert(pyramidWithConfirmedVolume.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid volume experiment permits add when volume is confirmed');
+  assert(pyramidWithConfirmedVolume[0]?.type === 'REGIME_REBALANCE_BUY' && pyramidWithConfirmedVolume[0]?.regimeTargetExposurePercent === 65, '[Regime Controller] Confirmed BULL uses gradual target-exposure add before legacy pyramid');
   const pyramidWithRsiFilter = strategyCore.generateSignals(2750000, 2650000, 30000, { ...defaultParams, experimentPyramidRsiGuardEnabled: true }, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 70, 1.2);
   assert(!pyramidWithRsiFilter.some((signal) => signal.type === 'PYRAMID_BUY'), '[Lab] Pyramid RSI experiment blocks an overbought add above RSI 68');
 
   const earlyTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.3);
-  assert(earlyTrendFollowSignals[0]?.id.startsWith('SIG_BULL_TREND_FOLLOW'), '[BULL Trend Follow] Confirmed BULL continuation deploys cash before the standard +1.5% pyramid step');
-  assert(earlyTrendFollowSignals[0]?.pyramidBudgetFraction === 0.35, '[BULL Trend Follow] Early continuation add is capped at 0.35 Unit');
-  const weakTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.2);
-  assert(!weakTrendFollowSignals.some((signal) => signal.id.startsWith('SIG_BULL_TREND_FOLLOW')), '[BULL Trend Follow] Low-volume rise does not consume additional cash');
+  assert(earlyTrendFollowSignals[0]?.id.startsWith('SIG_BULL_TARGET_ADD'), '[BULL Target] Confirmed BULL continuation deploys cash toward its target exposure');
+  assert(earlyTrendFollowSignals[0]?.regimeTargetExposurePercent === 65, '[BULL Target] Target exposure is capped at 65%');
+  const weakTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.0);
+  assert(!weakTrendFollowSignals.some((signal) => signal.type === 'REGIME_REBALANCE_BUY'), '[BULL Target] Low-volume rise does not consume additional cash');
 
   const scalpExpansionPosition: PositionSnapshot = {
     ...labPyramidPosition,
