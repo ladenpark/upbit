@@ -462,6 +462,46 @@ export class ATRStrategyCore {
     const isPyramidRsiConfirmed = !params.experimentPyramidRsiGuardEnabled || (adaptive.rsi >= 55 && adaptive.rsi <= 68);
     const isPyramidVolumeConfirmed = !params.experimentPyramidVolumeConfirmationEnabled || adaptive.volumeMultiplier >= 1.15;
 
+    // BULL 지속 확인(15분 추세 상승) 뒤에는, 기존 +1.5% 불타기 전에
+    // +0.7%~+1.0% 구간의 강한 상승 모멘텀을 0.35 Unit만 추종한다.
+    // 트레일링 무장(+1.0%) 전 구간으로 제한해 상단 추격과 기존 불타기 규칙의
+    // 중복을 피하고, 한 번 체결되면 pyramidingCount를 공유해 총 2회 제한도 유지한다.
+    const isBullContinuationConfirmed =
+      higherTfTrend?.trend === 'BULL' &&
+      higherTfTrend.htfSlope > 0 &&
+      adaptive.slope >= 0.10 &&
+      adaptive.volumeMultiplier >= 1.30 &&
+      adaptive.rsi >= 52 && adaptive.rsi <= 68;
+    const isEarlyTrendFollowWindow = pnlPercent >= 0.70 && pnlPercent < 1.0;
+
+    if (
+      hasPosition &&
+      params.pyramidingEnabled &&
+      !hasTrailingExitedThisCycle &&
+      !position.trailingActive &&
+      position.pyramidingCount === 0 &&
+      adaptive.marketRegime === 'BULL' &&
+      isEarlyTrendFollowWindow &&
+      isBullContinuationConfirmed &&
+      isPyramidRsiConfirmed &&
+      isPyramidVolumeConfirmed
+    ) {
+      signals.push({
+        id: `SIG_BULL_TREND_FOLLOW_${now}`,
+        timestamp: now,
+        timeframe: 'tick',
+        source: 'BULL_TREND_FOLLOW_ENGINE',
+        type: 'PYRAMID_BUY',
+        priority: 6,
+        symbol: params.symbol,
+        price: currentPrice,
+        pyramidBudgetFraction: 0.35,
+        reason: `[BULL 추세추종 불타기] 15분 상승 추세·기울기 +${adaptive.slope.toFixed(2)}%·거래량 ${adaptive.volumeMultiplier.toFixed(2)}x·RSI ${adaptive.rsi.toFixed(0)} 확인, 수익 +${pnlPercent.toFixed(2)}% ➡️ 0.35 Unit 추가 매수`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
+    }
+
     if (
       hasPosition &&
       params.pyramidingEnabled &&
