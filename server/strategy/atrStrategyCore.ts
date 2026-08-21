@@ -1,4 +1,4 @@
-import { Signal, SignalType, BotParams, PositionSnapshot } from '../types/trading';
+import { Signal, SignalType, BotParams, PositionSnapshot, SidewaysContext } from '../types/trading';
 
 export class ATRStrategyCore {
   private recentPrices: number[] = [];
@@ -69,6 +69,14 @@ export class ATRStrategyCore {
       marketRegime = 'BEAR';
     }
 
+    // SIDEWAYS is split internally because an uptrend pullback and a bear-market
+    // pause must not be treated as a neutral box range.
+    let sidewaysContext: SidewaysContext = 'NEUTRAL_RANGE';
+    if (marketRegime === 'SIDEWAYS') {
+      if (htf === 'BULL') sidewaysContext = 'BULL_PULLBACK';
+      else if (htf === 'BEAR') sidewaysContext = 'BEAR_PAUSE';
+    }
+
     // 1. Dynamic ATR Multiplier: 1.8x (BULL) ~ 3.5x (BEAR)
     let dynamicAtr = 2.4;
     if (marketRegime === 'BULL') {
@@ -121,6 +129,7 @@ export class ATRStrategyCore {
       dynamicScalpBandMultiplier,
       dynamicScalpTakeProfitPercent,
       marketRegime,
+      sidewaysContext,
       slope,
       volatilityRatio,
       rsi,
@@ -165,6 +174,7 @@ export class ATRStrategyCore {
       lowerBand,
       currentStopLoss: position.initialStopPrice || (lowerBand - (effectiveAtr * params.stopLossMultiplier)),
       marketRegime: adaptive.marketRegime,
+      sidewaysContext: adaptive.sidewaysContext,
       slope: adaptive.slope,
       volatilityRatio: adaptive.volatilityRatio,
       dynamicOrderRatio: adaptive.dynamicOrderRatio,
@@ -175,6 +185,8 @@ export class ATRStrategyCore {
     const hasPosition = position.amount > 0 && position.entryPrice !== null;
     const entryPrice = position.entryPrice || currentPrice;
     const pnlPercent = hasPosition ? ((currentPrice - entryPrice) / entryPrice) * 100 : 0;
+    const isNeutralRange = adaptive.marketRegime === 'SIDEWAYS' && adaptive.sidewaysContext === 'NEUTRAL_RANGE';
+    const isBearPause = adaptive.marketRegime === 'SIDEWAYS' && adaptive.sidewaysContext === 'BEAR_PAUSE';
 
     // --- Rule 1: Absolute Stop Loss (Priority 1) ---
     // Uses position's static initialStopPrice snapshot if available (-6.0% absolute floor)
@@ -285,7 +297,7 @@ export class ATRStrategyCore {
     if (
       hasPosition &&
       params.autoPilotEnabled &&
-      adaptive.marketRegime === 'SIDEWAYS' &&
+      isNeutralRange &&
       !position.trailingActive &&
       pnlPercent >= scalpTpTargetPercent
     ) {
@@ -542,7 +554,7 @@ export class ATRStrategyCore {
       params.autoPilotEnabled &&
       !hasTrailingExitedThisCycle &&
       !position.trailingActive &&
-      adaptive.marketRegime === 'SIDEWAYS' &&
+      isNeutralRange &&
       position.boxPyramidCount < BOX_PYRAMID_MAX_ADDS &&
       pnlPercent >= BOX_PYRAMID_STEP_PERCENT
     ) {
@@ -567,7 +579,7 @@ export class ATRStrategyCore {
     const isFallingKnife = snapshot.slope < -0.08 && (higherTfTrend?.trend === 'BEAR' || adaptive.marketRegime === 'BEAR');
 
     // --- Rule 8: Initial 1st Entry Buy (Priority 6) ---
-    if (!hasPosition && position.state === 'FLAT' && currentPrice <= lowerBand && !isFallingKnife) {
+    if (!hasPosition && position.state === 'FLAT' && currentPrice <= lowerBand && !isFallingKnife && !isBearPause) {
       signals.push({
         id: `SIG_ENTRY_${now}`,
         timestamp: now,
@@ -587,8 +599,9 @@ export class ATRStrategyCore {
     if (
       !hasPosition &&
       position.state === 'FLAT' &&
+      !isBearPause &&
       params.autoPilotEnabled &&
-      adaptive.marketRegime !== 'BULL' &&
+      isNeutralRange &&
       currentPrice <= (baselineValue - (effectiveAtr * adaptive.dynamicScalpBandMultiplier)) &&
       currentPrice > lowerBand
     ) {
@@ -617,7 +630,7 @@ export class ATRStrategyCore {
       !hasPosition &&
       position.state === 'FLAT' &&
       params.autoPilotEnabled &&
-      adaptive.marketRegime !== 'BULL' &&
+      isNeutralRange &&
       priceHistory.length >= SCALP_BOUNCE_LOOKBACK
     ) {
       const lookbackSlice = priceHistory.slice(-SCALP_BOUNCE_LOOKBACK);
@@ -685,7 +698,7 @@ export class ATRStrategyCore {
       !hasPosition &&
       position.state === 'FLAT' &&
       params.autoPilotEnabled &&
-      adaptive.marketRegime === 'SIDEWAYS' &&
+      isNeutralRange &&
       currentPrice > baselineValue &&
       currentPrice <= (baselineValue + (effectiveAtr * adaptive.dynamicScalpBandMultiplier)) &&
       !isBoxOverbought

@@ -3,6 +3,7 @@
  */
 
 export type ExchangeType = 'UPBIT';
+export type SidewaysContext = 'BULL_PULLBACK' | 'NEUTRAL_RANGE' | 'BEAR_PAUSE';
 
 export type SignalType = 
   | 'ENTRY_BUY'
@@ -51,6 +52,7 @@ export interface Signal {
     lowerBand: number;
     currentStopLoss: number;
     marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
+    sidewaysContext?: SidewaysContext;
     slope: number;
     volatilityRatio: number;
     dynamicOrderRatio: number;

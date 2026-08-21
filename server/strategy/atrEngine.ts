@@ -1284,7 +1284,8 @@ export class ATREngine {
       }
 
       // Page 2: 불타기 (상승 시 대응: BULL vs SIDEWAYS 구분)
-      if (adaptive.marketRegime === 'SIDEWAYS') {
+      const isNeutralRange = adaptive.marketRegime === 'SIDEWAYS' && adaptive.sidewaysContext === 'NEUTRAL_RANGE';
+      if (isNeutralRange) {
         const BOX_RATIOS = [0.50, 0.50];
         if (this.params.pyramidingEnabled && pos.boxPyramidCount < 2) {
           const nextBoxStep = pos.boxPyramidCount + 1;
@@ -1343,7 +1344,7 @@ export class ATREngine {
       }
 
       // Page 3: 박스권 짤짤이 익절 (Rule 3-b) - Stepped target based on boxPyramidCount
-      if (adaptive.marketRegime === 'SIDEWAYS') {
+      if (isNeutralRange) {
         let steppedScalpTpPercent = adaptive.dynamicScalpTakeProfitPercent;
         if (pos.boxPyramidCount === 1) steppedScalpTpPercent = Math.max(steppedScalpTpPercent, 0.60);
         else if (pos.boxPyramidCount === 2) steppedScalpTpPercent = Math.max(steppedScalpTpPercent, 0.70);

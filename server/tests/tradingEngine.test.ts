@@ -1421,9 +1421,9 @@ async function runAllTests() {
     dcaSlots: [{ slotNumber: 1, status: 'FILLED' }, { slotNumber: 2, status: 'FILLED' }, { slotNumber: 3, status: 'FILLED' }]
   };
   const expansionHistory = [99.9, 100, 100, 100.1, 100.2, 100.2, 100.3, 100.4, 100.4, 100.5, 100.5, 100.6, 100.6, 100.6, 100.6];
-  const normalScalpSignals = strategyCore.generateSignals(100.6, 101, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'BULL', htfSlope: 0.2 }, 60, 1.6);
+  const normalScalpSignals = strategyCore.generateSignals(100.6, 100.7, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'SIDEWAYS', htfSlope: 0 }, 60, 1.6);
   assert(normalScalpSignals[0]?.type === 'SCALP_TAKE_PROFIT', '[Lab] Box scalp remains a full exit while trend-expansion experiment is OFF');
-  const expansionScalpSignals = strategyCore.generateSignals(100.6, 101, 1, { ...defaultParams, experimentScalpTrendExpansionEnabled: true }, scalpExpansionPosition, 0, expansionHistory, { trend: 'BULL', htfSlope: 0.2 }, 60, 1.6);
+  const expansionScalpSignals = strategyCore.generateSignals(100.6, 100.7, 1, { ...defaultParams, experimentScalpTrendExpansionEnabled: true }, scalpExpansionPosition, 0, expansionHistory, { trend: 'SIDEWAYS', htfSlope: 0 }, 60, 1.6);
   assert(expansionScalpSignals[0]?.type === 'SCALP_PARTIAL_TAKE_PROFIT', '[Lab] Trend expansion experiment converts box scalp exit to a 50% partial exit');
   const partialScalpEval = riskGovernor.evaluateSignal(expansionScalpSignals[0], 'RUNNING', 'LIVE', 1_000_000, scalpExpansionPosition, 0, [], 0);
   assert(partialScalpEval.approved === true && partialScalpEval.calculatedVolume === 0.5, '[Lab] Trend expansion partial exit sells exactly 50% of the position');
@@ -1434,6 +1434,13 @@ async function runAllTests() {
   assert(scalpPartialSnapshot.amount === 0.5 && scalpPartialSnapshot.profitLockPrice === 100.2, '[Lab] Partial scalp exit leaves 50% with a +0.2% breakeven protection floor');
   scalpPartialManager.setScalpReentryCooldown(180);
   assert(scalpPartialManager.isUnderCooldown() && scalpPartialManager.getSnapshot().cooldownReason === 'SCALP_TAKE_PROFIT_REENTRY_GUARD', '[Lab] Scalp re-entry guard persists a 3-minute cooldown');
+
+  const bullPullbackAdaptive = strategyCore.evaluateAdaptiveParams(100.6, 100.7, 1, defaultParams, expansionHistory, { trend: 'BULL', htfSlope: 0.2 }, 60, 1.0);
+  assert(bullPullbackAdaptive.marketRegime === 'SIDEWAYS' && bullPullbackAdaptive.sidewaysContext === 'BULL_PULLBACK', '[Regime Context] Higher-timeframe BULL pullback is separated from a neutral box');
+  const bullPullbackSignals = strategyCore.generateSignals(100.6, 100.7, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'BULL', htfSlope: 0.2 }, 60, 1.0);
+  assert(!bullPullbackSignals.some((signal) => signal.type === 'SCALP_TAKE_PROFIT'), '[Regime Context] BULL pullback blocks box-range full take-profit');
+  const bearPauseAdaptive = strategyCore.evaluateAdaptiveParams(100, 100, 1, defaultParams, Array.from({ length: 15 }, () => 100), { trend: 'BEAR', htfSlope: -0.2 }, 50, 1.0);
+  assert(bearPauseAdaptive.marketRegime === 'SIDEWAYS' && bearPauseAdaptive.sidewaysContext === 'BEAR_PAUSE', '[Regime Context] Higher-timeframe BEAR pause is separated from a neutral box');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 19: Research Recorder Isolation

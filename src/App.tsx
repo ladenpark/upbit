@@ -213,6 +213,7 @@ export default function App() {
     dynamicScalpBandMultiplier: number;
     dynamicScalpTakeProfitPercent: number;
     marketRegime: 'BULL' | 'SIDEWAYS' | 'BEAR';
+    sidewaysContext?: 'BULL_PULLBACK' | 'NEUTRAL_RANGE' | 'BEAR_PAUSE';
     slope: number;
     volatilityRatio: number;
     rsi?: number;
@@ -1162,7 +1163,7 @@ export default function App() {
                         <span className="text-xs font-extrabold">
                           {marketRegime === 'BULL' && '상승 국면'}
                           {marketRegime === 'BEAR' && '하락 국면'}
-                          {marketRegime === 'SIDEWAYS' && '횡보 국면'}
+                          {marketRegime === 'SIDEWAYS' && (adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK' ? '상승 조정 국면' : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE' ? '하락 정체 국면' : '중립 박스 국면')}
                         </span>
                         <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-white/20 font-bold uppercase">
                           Auto-Pilot {autoPilotEnabled ? 'ON' : 'OFF'}
@@ -1171,7 +1172,7 @@ export default function App() {
                       <div className="text-[10px] text-slate-300 mt-0.5">
                         {marketRegime === 'BULL' && '돌파·추세 추적 중심'}
                         {marketRegime === 'BEAR' && '진입 규모를 낮추고 방어 우선'}
-                        {marketRegime === 'SIDEWAYS' && '짧은 진입과 익절 중심'}
+                        {marketRegime === 'SIDEWAYS' && (adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK' ? '박스권 전량 익절 보류 · 추세 보유 우선' : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE' ? '박스권 신규 매수·불타기 차단 · 현금 보존' : '짧은 진입과 익절 중심')}
                       </div>
                     </div>
                   </div>
@@ -1628,7 +1629,8 @@ export default function App() {
                 // comes before the trailing arming price, trailing cannot
                 // execute for this position unless the scalp condition is
                 // bypassed by a regime/state change.
-                const scalpPrecedesTrailing = hasPosition && marketRegime === 'SIDEWAYS' && !isTrailingActive && scalpTarget <= trailingArm;
+                const isNeutralRange = marketRegime === 'SIDEWAYS' && adaptiveIndicators?.sidewaysContext !== 'BULL_PULLBACK' && adaptiveIndicators?.sidewaysContext !== 'BEAR_PAUSE';
+                const scalpPrecedesTrailing = hasPosition && isNeutralRange && !isTrailingActive && scalpTarget <= trailingArm;
                 const dcaSteps = [2.0, 4.2, 5.5];
                 const nextDca = nextDcaPage?.targetPrice || entry * (1 - (dcaSteps[Math.min(authoritativeNextDcaNumber - 1, 2)] || 5.5) / 100);
                 const dca2ApproachPrice = entry * 0.965;
@@ -1664,7 +1666,7 @@ export default function App() {
                   { label: '반등 확인', detail: `기준선 ${formatPrice(baselineValue)} 아래`, active: false, enabled: autoPilotEnabled, icon: '↗' }
                 ];
                 const sellRows = [
-                  { label: '단기 익절', detail: hasPosition ? `${formatPrice(scalpTarget)} · 전량 매도` : '포지션 진입 후 활성화', active: hasPosition && marketRegime === 'SIDEWAYS' && currentPrice >= scalpTarget, enabled: hasPosition, icon: '◎' },
+                  { label: '단기 익절', detail: !isNeutralRange ? (adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK' ? '상승 조정형: 전량 익절 보류' : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE' ? '하락 정체형: 박스 익절 비활성' : '상승·하락 국면에서는 비활성') : hasPosition ? `${formatPrice(scalpTarget)} · 전량 매도` : '포지션 진입 후 활성화', active: hasPosition && isNeutralRange && currentPrice >= scalpTarget, enabled: hasPosition && isNeutralRange, icon: '◎' },
                   { label: '트레일링 익절', detail: isTrailingActive ? `${formatPrice(trailingExit)} 이탈 · 콜백 ${effectiveTrailingCallback.toFixed(1)}%` : scalpPrecedesTrailing ? `단기 익절(${formatPrice(scalpTarget)}) 우선 실행` : `${formatPrice(trailingArm)} 도달 시 무장`, active: isTrailingActive, enabled: trailingStopEnabled && hasPosition && !scalpPrecedesTrailing, statusOverride: scalpPrecedesTrailing ? '후순위' : undefined, icon: '⌁' },
                   { label: '불타기 수익 보호', detail: profitLockPrice ? `${formatPrice(profitLockPrice)} 이탈 시 전량 청산` : '불타기 1차 체결 후 활성화', active: Boolean(profitLockPrice && currentPrice <= profitLockPrice), enabled: Boolean(profitLockPrice), icon: '⌑' },
                   { label: '급락 방어', detail: `하단 이탈 + ${trendDropSpeedThreshold.toFixed(1)}% 급락`, active: isEmergency, enabled: trendAwareCutEnabled && hasPosition, icon: '!' },
