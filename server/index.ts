@@ -183,6 +183,11 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
           break;
         }
 
+        case 'REBASE_POSITION':
+          await engine.rebaseCurrentPosition();
+          ws.send(JSON.stringify({ type: 'POSITION_REBASE_RESULT', payload: { success: true } }));
+          break;
+
         default:
           console.warn('[Server WS] Unknown action:', data.type);
       }

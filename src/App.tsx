@@ -157,6 +157,7 @@ export default function App() {
   const [experimentPyramidRsiGuardEnabled, setExperimentPyramidRsiGuardEnabled] = useState(false);
   const [experimentPyramidVolumeConfirmationEnabled, setExperimentPyramidVolumeConfirmationEnabled] = useState(false);
   const [researchStats, setResearchStats] = useState({ enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, startedAt: 0 });
+  const [rebaseStatus, setRebaseStatus] = useState<string | null>(null);
 
   // API Credentials State (Upbit Exclusive)
   // Exchange secrets must never be retained in browser storage.  They exist
@@ -375,6 +376,8 @@ export default function App() {
             } else {
               setApiKeyTestStatus(`❌ Upbit API 연결 실패: ${res.error}`);
             }
+          } else if (data.type === 'POSITION_REBASE_RESULT') {
+            setRebaseStatus('✅ 거래소 잔고와 최신 지표 기준으로 포지션 보호 조건을 보정했습니다.');
           }
         } catch (err) {
           console.error('Error parsing backend WS message:', err);
@@ -465,6 +468,16 @@ export default function App() {
 
   const handleToggleBot = () => {
     sendWsCommand('TOGGLE_BOT', { isBotActive: !isBotActive });
+  };
+
+  const handlePositionRebase = () => {
+    if (isBotActive) {
+      setRebaseStatus('❌ 봇을 정지한 상태에서만 포지션 보정이 가능합니다.');
+      return;
+    }
+    if (!window.confirm('거래소의 실제 보유 수량·평단을 다시 확인한 뒤, 손절·부분손절·트레일링 기준을 새 포지션 기준으로 재설정합니다. DCA 사용 기록은 유지합니다. 계속할까요?')) return;
+    setRebaseStatus('⏳ 거래소 잔고와 최신 지표를 확인하는 중입니다…');
+    sendWsCommand('REBASE_POSITION', {});
   };
 
   const handleTestApiKeys = () => {
@@ -2767,6 +2780,13 @@ export default function App() {
                 ))}
               </div>
               <p className="px-1 text-[9.5px] text-slate-500">{researchStats.enabled ? '● 수집 중 — 실제 주문 없이 기본 규칙과 각 후보의 신호 차이만 기록합니다.' : '서버 재시작 후 연구 수집기가 시작됩니다.'}</p>
+
+              <div className="bg-white p-3 rounded-2xl border border-amber-200 shadow-2xs space-y-2">
+                <div className="text-xs font-extrabold text-slate-900">포지션 안전 보정</div>
+                <p className="text-[10px] leading-relaxed text-slate-500">재시작·부분 체결 뒤 실제 보유 수량과 평단은 맞지만 손절·부분손절 상태가 오래된 경우에만 사용합니다. DCA 사용 기록은 유지합니다.</p>
+                <button disabled={isBotActive} onClick={handlePositionRebase} className="w-full rounded-xl bg-amber-500 py-2 text-[11px] font-extrabold text-white transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-40">거래소 기준으로 포지션 보정</button>
+                {rebaseStatus && <p className="text-[10px] text-slate-600">{rebaseStatus}</p>}
+              </div>
 
               {isBotActive && (
                 <div className="p-3 rounded-2xl border border-amber-200 bg-amber-50 text-[11px] text-amber-800">

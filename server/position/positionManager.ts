@@ -510,6 +510,41 @@ export class PositionManager {
   }
 
   /**
+   * Repairs an existing exchange-reconciled position after a previously
+   * unrecorded fill. DCA slot usage is retained, but price-dependent safety
+   * fields and defensive cycle state are rebuilt from the authoritative average.
+   */
+  public rebaseReconciledPosition(
+    baseline: number,
+    atr: number,
+    atrMultiplier: number,
+    stopLossMultiplier: number
+  ) {
+    if (this.position.amount <= 0 || !this.position.entryPrice || atr <= 0 || baseline <= 0) {
+      throw new Error('Cannot rebase without a confirmed open position and current indicators.');
+    }
+    const lowerBand = baseline - (atr * atrMultiplier);
+    const dynamicStop = lowerBand - (atr * stopLossMultiplier);
+    const absoluteFloor = this.position.entryPrice * 0.94;
+
+    this.position.state = 'ENTRY_FILLED';
+    this.position.positionEntryAtr = atr;
+    this.position.initialBaseline = baseline;
+    this.position.initialBand = lowerBand;
+    this.position.initialStopPrice = Number(Math.max(dynamicStop, absoluteFloor).toFixed(2));
+    this.position.totalCostKrw = this.position.amount * this.position.entryPrice;
+    this.position.partialCutCount = 0;
+    this.position.trailingActive = false;
+    this.position.trailingPeakPrice = null;
+    this.position.trailingExitCount = 0;
+    this.position.profitLockPrice = null;
+    this.position.cooldownUntil = 0;
+    this.position.cooldownReason = 'RECONCILED_POSITION_REBASE';
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+  }
+
+  /**
    * Full Position Close (Take Profit, Absolute Stop Loss, or Emergency Full Exit)
    */
   public onPositionClosed(pnl: number, reason: string) {

@@ -1436,6 +1436,10 @@ async function runAllTests() {
   assert(reentryManager.markReentryPending() === false, '[Re-entry] A second re-entry cannot consume the same permission');
   reentryManager.onReentryBuyFilled(2660000, 0.2, 2700000, 30000, 3, 2);
   assert(reentryManager.getSnapshot().state === 'ENTRY_FILLED' && reentryManager.getSnapshot().amount === 0.9, '[Re-entry] Any confirmed fill returns position to normal holding state');
+  reentryManager.rebaseReconciledPosition(2700000, 30000, 3, 2);
+  const rebasedSnapshot = reentryManager.getSnapshot();
+  assert(rebasedSnapshot.partialCutCount === 0 && rebasedSnapshot.trailingActive === false && rebasedSnapshot.state === 'ENTRY_FILLED', '[Rebase] Defensive and trailing state are reset from the reconciled position');
+  assert(rebasedSnapshot.initialStopPrice === Math.max(2700000 - (30000 * 3) - (30000 * 2), rebasedSnapshot.entryPrice! * 0.94), '[Rebase] Static stop is rebuilt from current baseline, ATR, and exchange average');
   const reentryPendingRisk = new GlobalRiskGovernor(defaultParams).evaluateSignal(
     { ...bullBuySignal, type: 'REENTRY_BUY' }, 'RUNNING', 'LIVE', 5000000,
     { ...labPyramidPosition, state: 'REENTRY_PENDING' }, 2750000, [], 0

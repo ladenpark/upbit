@@ -983,7 +983,7 @@ export class ATREngine {
   /**
    * Authoritative balance fetch & reconciliation with exchange
    */
-  public async fetchRealAccountBalance() {
+  public async fetchRealAccountBalance(): Promise<boolean> {
     try {
       const keys = this.secretManager.getKeys();
       if (this.params.exchange === 'UPBIT' && keys.upbitAccessKey && keys.upbitSecretKey) {
@@ -1008,10 +1008,50 @@ export class ATREngine {
           if (this.initialBalance === 0 && (krw > 0 || realCoinQty > 0)) {
             this.initialBalance = krw + (realCoinQty * this.currentPrice);
           }
+          this.notifyClients();
+          return true;
         }
       }
       this.notifyClients();
-    } catch (e) {}
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** Safe, explicit repair path for a position that was exchange-filled while local state was stale. */
+  public async rebaseCurrentPosition() {
+    if (this.botState === 'RUNNING' || this.params.isBotActive) {
+      throw new Error('포지션 보정은 봇을 정지한 상태에서만 실행할 수 있습니다.');
+    }
+    if (this.orderManager.getPendingOrdersCount() > 0) {
+      throw new Error('미체결 주문이 있어 포지션 보정을 실행할 수 없습니다.');
+    }
+    await this.refreshAtrFromExchange();
+    const synchronized = await this.fetchRealAccountBalance();
+    if (!synchronized) {
+      throw new Error('거래소 잔고 동기화에 실패해 포지션 보정을 중단했습니다.');
+    }
+    const position = this.positionManager.getSnapshot();
+    if (position.amount <= 0 || !position.entryPrice) {
+      throw new Error('거래소에서 확인된 보유 포지션이 없어 보정을 중단했습니다.');
+    }
+    const adaptive = this.strategyCore.evaluateAdaptiveParams(
+      this.currentPrice, this.baselineValue, this.atrValue, this.params,
+      this.priceHistory.map((point) => point.price), this.higherTfTrend,
+      this.rsiValue, this.volumeMultiplier, this.volumeMa
+    );
+    const atrMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
+    this.positionManager.rebaseReconciledPosition(
+      this.baselineValue, this.atrValue, atrMultiplier, this.params.stopLossMultiplier
+    );
+    const repaired = this.positionManager.getSnapshot();
+    this.addLog({
+      type: 'SYSTEM',
+      price: this.currentPrice,
+      reason: `[포지션 안전 보정] 거래소 실수량·평단으로 동기화 후 보호 기준 재설정 (평단 ₩${Math.round(repaired.entryPrice || 0).toLocaleString()}, 정적 손절 ₩${Math.round(repaired.initialStopPrice || 0).toLocaleString()})`
+    });
+    this.notifyClients();
   }
 
   public updateParams(newParams: Partial<BotParams>) {
