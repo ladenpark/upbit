@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { roundDownToTick } from '../utils/priceUtils';
+import { FIXED_DCA_UNIT_SCALES, PARTIAL_CUT_RULES } from '../strategy/strategyRuleConstants';
 import {
   Signal,
   OrderRequest,
@@ -285,7 +286,6 @@ export class GlobalRiskGovernor {
           symbol: signal.symbol,
           side: 'SELL',
           requestedVolume: volume,
-          limitPrice: roundDownToTick(currentPrice * 0.985),
           reason: signal.reason,
           createdAt: Date.now()
         }
@@ -312,7 +312,6 @@ export class GlobalRiskGovernor {
           symbol: signal.symbol,
           side: 'SELL',
           requestedVolume: volume,
-          limitPrice: roundDownToTick(currentPrice * 0.985),
           reason: signal.reason,
           createdAt: Date.now()
         }
@@ -341,7 +340,9 @@ export class GlobalRiskGovernor {
       if (signal.type === 'PARTIAL_LOSS_CUT') {
         const cutCount = position.partialCutCount || 0;
         // 1st cut: 30%, 2nd cut: 50% of remaining
-        cutRatio = cutCount === 0 ? 0.30 : 0.50;
+        cutRatio = cutCount === 0
+          ? PARTIAL_CUT_RULES.first.sellFraction
+          : PARTIAL_CUT_RULES.second.sellFraction;
       }
       const volume = Math.floor(position.amount * cutRatio * 1e8) / 1e8;
       if (volume <= 0 || position.amount <= 0) {
@@ -428,8 +429,7 @@ export class GlobalRiskGovernor {
       if (signal.type === 'DCA_BUY') {
         const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
         const slotNum = nextSlot ? nextSlot.slotNumber : 1;
-        const DCA_SCALES = [1.5, 2.0, 1.5];
-        const scale = DCA_SCALES[slotNum - 1] || 1.5;
+        const scale = FIXED_DCA_UNIT_SCALES[slotNum - 1] || FIXED_DCA_UNIT_SCALES[0];
         targetBudget *= scale;
         // DCA 2차 접근 반등 선매수(40%)와 이후 본 기준가 잔여 매수(60%)는
         // 합쳐서 기존 DCA 2차 예산을 절대 넘지 않는다.

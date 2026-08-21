@@ -1,4 +1,5 @@
 import { Signal, SignalType, BotParams, PositionSnapshot, SidewaysContext } from '../types/trading';
+import { DCA2_RECOVERY_PREBUY_FRACTION, FIXED_DCA_DROP_PERCENTS, PARTIAL_CUT_RULES } from './strategyRuleConstants';
 
 export class ATRStrategyCore {
   private recentPrices: number[] = [];
@@ -152,7 +153,8 @@ export class ATRStrategyCore {
     higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number },
     rsi: number = 50.0,
     volumeMultiplier: number = 1.0,
-    volumeMa: number = 0.0
+    volumeMa: number = 0.0,
+    microPriceHistory: number[] = priceHistory
   ): Signal[] {
     const signals: Signal[] = [];
     const now = Date.now();
@@ -249,7 +251,7 @@ export class ATRStrategyCore {
     const cutCount = position.partialCutCount || 0;
     if (hasPosition && params.partialLossCutEnabled && position.state !== 'EMERGENCY_EXIT') {
       // 1st Stage: -1.0% drop -> trim 30% to secure cash for DCA #1
-      if (cutCount === 0 && pnlPercent <= -1.0) {
+      if (cutCount === 0 && pnlPercent <= -PARTIAL_CUT_RULES.first.lossPercent) {
         signals.push({
           id: `SIG_PARTIAL_CUT_1_${now}`,
           timestamp: now,
@@ -265,7 +267,7 @@ export class ATRStrategyCore {
         return signals;
       }
       // 2nd Stage: -3.2% drop -> trim 50% of remaining to secure cash for DCA #2
-      else if (cutCount === 1 && pnlPercent <= -3.2) {
+      else if (cutCount === 1 && pnlPercent <= -PARTIAL_CUT_RULES.second.lossPercent) {
         signals.push({
           id: `SIG_PARTIAL_CUT_2_${now}`,
           timestamp: now,
@@ -400,7 +402,7 @@ export class ATRStrategyCore {
       const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
       if (nextSlot) {
         // Slot 1: -2.0% (1차 30% 덜어낸 후 저점 추매) | Slot 2: -4.2% (2차 50% 덜어낸 후 저점 추매) | Slot 3: -5.5%
-        const slotDropTarget = nextSlot.slotNumber === 1 ? 2.0 : nextSlot.slotNumber === 2 ? 4.2 : 5.5;
+        const slotDropTarget = FIXED_DCA_DROP_PERCENTS[nextSlot.slotNumber - 1] || FIXED_DCA_DROP_PERCENTS[0];
         const slotTargetPrice = nextSlot.status === 'PARTIALLY_FILLED' && nextSlot.plannedTargetPrice
           ? nextSlot.plannedTargetPrice
           : entryPrice * (1 - slotDropTarget / 100);
@@ -408,7 +410,7 @@ export class ATRStrategyCore {
         // DCA 2차 접근 반등 선매수: -3.5%~-4.15%에서 최근 20틱 저점 대비
         // 0.7% 이상 회복하고 단기 추세가 전환될 때에만, 2차 예산의 40%를 집행한다.
         // 단순히 -3.5%를 통과했다고 매수하지 않으므로 하락 중 추격 매수를 피한다.
-        const recentWindow = priceHistory.slice(-20);
+        const recentWindow = microPriceHistory.slice(-20);
         const recoveryLow = Math.min(currentPrice, ...(recentWindow.length ? recentWindow : [currentPrice]));
         const reboundFromLow = recoveryLow > 0 ? ((currentPrice - recoveryLow) / recoveryLow) * 100 : 0;
         const recoveryLowDrop = entryPrice > 0 ? ((entryPrice - recoveryLow) / entryPrice) * 100 : 0;
@@ -436,7 +438,7 @@ export class ATRStrategyCore {
             priority: 5,
             symbol: params.symbol,
             price: currentPrice,
-            dcaBudgetFraction: 0.4,
+            dcaBudgetFraction: DCA2_RECOVERY_PREBUY_FRACTION,
             dcaExecution: 'RECOVERY_PREBUY',
             reason: `[DCA 2차 접근 반등 선매수] -${dropFromEntry.toFixed(2)}% 구간에서 최근 저점 대비 +${reboundFromLow.toFixed(2)}% 반등·단기 추세 전환 확인${params.experimentDca2RsiRecoveryEnabled ? ` · RSI ${adaptive.rsi.toFixed(0)}≥35` : ''}${params.experimentDca2VolumeConfirmationEnabled ? ` · 거래량 ${adaptive.volumeMultiplier.toFixed(2)}x≥1.05x` : ''} ➡️ 2차 예산의 40%만 선매수`,
             indicatorSnapshot: snapshot
@@ -455,7 +457,7 @@ export class ATRStrategyCore {
             priority: 5,
             symbol: params.symbol,
             price: currentPrice,
-            dcaBudgetFraction: isDca2Remainder ? 0.6 : undefined,
+            dcaBudgetFraction: isDca2Remainder ? 1 - DCA2_RECOVERY_PREBUY_FRACTION : undefined,
             dcaExecution: isDca2Remainder ? 'COMPLETE_REMAINDER' : undefined,
             reason: isDca2Remainder
               ? `[DCA 2차 잔여 매수] 평단 대비 -${dropFromEntry.toFixed(2)}%로 본 기준(-4.2%) 도달 ➡️ 남은 2차 예산 60% 집행`
@@ -475,7 +477,7 @@ export class ATRStrategyCore {
     // to the target and caps every fill at 5% of total capital.
     const sinceLastRegimeAddMs = now - (position.lastRegimeRebalanceAt || 0);
     const canAddByTime = sinceLastRegimeAddMs >= 120_000;
-    const recentPrices = priceHistory.slice(-10);
+    const recentPrices = microPriceHistory.slice(-10);
     const recentLow = recentPrices.length ? Math.min(...recentPrices) : currentPrice;
     const reboundFromRecentLow = recentLow > 0 ? ((currentPrice - recentLow) / recentLow) * 100 : 0;
 

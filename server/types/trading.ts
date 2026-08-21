@@ -194,6 +194,8 @@ export interface PositionSnapshot {
   profitLockPrice?: number | null;
   /** 국면 비중 리밸런싱의 마지막 체결 시각. 동일 추세에서 연속 주문을 제한한다. */
   lastRegimeRebalanceAt?: number;
+  /** 한 포지션 안에서 완료된 방어→재진입 순환 횟수 */
+  recycleCycleCount?: number;
   // Cooldown
   cooldownUntil: number;
   cooldownReason?: string;
@@ -298,6 +300,7 @@ export interface BotParams {
   // DCA (물타기) 파라미터
   dcaEnabled: boolean;
   maxSafetyOrders: number;
+  /** Legacy display/compatibility values. Live DCA uses fixed three-stage rules. */
   safetyOrderStepPercent: number;
   safetyOrderVolumeScale: number;
   // Trailing Take-Profit (트레일링 익절) 파라미터
@@ -309,6 +312,7 @@ export interface BotParams {
   pyramidingStepPercent: number;
   // Partial Loss-Cut & Cash Recycling (자금순환 부분손절) 파라미터
   partialLossCutEnabled: boolean;
+  /** Legacy display/compatibility values. Live partial cuts use fixed two-stage rules. */
   partialLossCutPercent: number;
   partialLossCutThreshold: number;
   // Trend-Aware Predictive Loss-Cut & Bottom Re-entry

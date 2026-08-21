@@ -19,6 +19,7 @@ import { UpbitClient } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
 import { roundDownToTick } from '../utils/priceUtils';
 import { ResearchRecorder, ResearchDecision } from '../research/researchRecorder';
+import { DCA2_RECOVERY_PREBUY_FRACTION, FIXED_DCA_DROP_PERCENTS, FIXED_DCA_UNIT_SCALES } from './strategyRuleConstants';
 
 export class ATREngine {
   // Sub-modules
@@ -338,9 +339,12 @@ export class ATREngine {
     this.currentPrice = price;
     this.researchRecorder?.recordTick(this.params.symbol, price, timestamp);
 
-    // Build price history array for adaptive indicators (computed early for band consistency)
-    const historyPrices = this.priceHistory.map((p) => p.price);
-    historyPrices.push(price);
+    // Candle closes drive regime/slope/scalp decisions; raw ticks remain for
+    // DCA rebound and short-term microstructure checks.
+    const tickHistoryPrices = [...this.priceHistory.map((p) => p.price), price];
+    const historyPrices = this.recent1mCloses.length >= 15
+      ? [...this.recent1mCloses.slice(-19), price]
+      : tickHistoryPrices;
 
     // Real-time 1m RSI(14) calculation: base 1m candles + latest tick price
     const rsiCloses = this.recent1mCloses.length >= 14
@@ -409,6 +413,7 @@ export class ATREngine {
         positionForReentry.state === 'DEFENSIVE_2' ||
         positionForReentry.state === 'EMERGENCY_EXIT'
       ) &&
+      (positionForReentry.recycleCycleCount || 0) < 2 &&
       !this.positionManager.isUnderCooldown() &&
       dropSpeed >= -0.3 &&
       price > lowerBand
@@ -434,7 +439,8 @@ export class ATREngine {
       this.higherTfTrend,
       this.rsiValue,
       this.volumeMultiplier,
-      this.volumeMa
+      this.volumeMa,
+      tickHistoryPrices
     );
     this.captureShadowDecisions(timestamp, price, position, dropSpeed, historyPrices, candidateSignals);
 
@@ -660,7 +666,8 @@ export class ATREngine {
         reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
     } else if (signalType === 'BOX_PYRAMID_BUY') {
-      this.positionManager.onBoxPyramidFilled(fillPrice, effectiveVolume);
+      if (isIncremental) this.positionManager.addAdditionalBoxPyramidFilled(fillPrice, effectiveVolume);
+      else this.positionManager.onBoxPyramidFilled(fillPrice, effectiveVolume);
       this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
@@ -850,24 +857,25 @@ export class ATREngine {
     try {
       // 1. Fetch 1-minute candles for immediate ATR & Baseline calculation
       const candles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/1');
-      if (candles && candles.length >= 14) {
-        this.researchRecorder?.recordCompletedCandles(this.params.symbol, candles.slice(0, -1));
+      const completedCandles = candles?.slice(0, -1) || [];
+      if (completedCandles.length >= 14) {
+        this.researchRecorder?.recordCompletedCandles(this.params.symbol, completedCandles);
         let trSum = 0;
-        for (let i = 1; i < candles.length; i++) {
-          const prevClose = candles[i - 1].trade_price;
-          const high = candles[i].high_price;
-          const low = candles[i].low_price;
+        for (let i = 1; i < completedCandles.length; i++) {
+          const prevClose = completedCandles[i - 1].trade_price;
+          const high = completedCandles[i].high_price;
+          const low = completedCandles[i].low_price;
           const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
           trSum += tr;
         }
-        const calculatedAtr = Math.round(trSum / (candles.length - 1));
+        const calculatedAtr = Math.round(trSum / (completedCandles.length - 1));
         if (calculatedAtr > 0) {
           this.atrValue = calculatedAtr;
-          const sumClose = candles.reduce((acc, c) => acc + c.trade_price, 0);
-          this.baselineValue = Math.round(sumClose / candles.length);
+          const sumClose = completedCandles.reduce((acc, c) => acc + c.trade_price, 0);
+          this.baselineValue = Math.round(sumClose / completedCandles.length);
 
           // Calculate RSI(14) from candle closes
-          const closes = candles.map((c) => c.trade_price);
+          const closes = completedCandles.map((c) => c.trade_price);
           this.recent1mCloses = closes;
           let gains = 0;
           let losses = 0;
@@ -887,7 +895,7 @@ export class ATREngine {
           }
 
           // Calculate Volume MA & Volume Multiplier
-          const volumes = candles.map((c) => c.candle_acc_trade_volume).filter((v) => v > 0);
+          const volumes = completedCandles.map((c) => c.candle_acc_trade_volume).filter((v) => v > 0);
           if (volumes.length >= 5) {
             this.volumeMa = Number((volumes.reduce((a, b) => a + b, 0) / volumes.length).toFixed(4));
             const latestVol = volumes[volumes.length - 1] || this.volumeMa;
@@ -900,8 +908,9 @@ export class ATREngine {
 
       // 2. Fetch 15-minute candles for Higher Timeframe trend confluence
       const htfCandles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/15');
-      if (htfCandles && htfCandles.length >= 10) {
-        const htfCloses = htfCandles.map((c) => c.trade_price);
+      const completedHtfCandles = htfCandles?.slice(0, -1) || [];
+      if (completedHtfCandles.length >= 10) {
+        const htfCloses = completedHtfCandles.map((c) => c.trade_price);
         const fastHtf = htfCloses.slice(-3).reduce((a, b) => a + b, 0) / 3;
         const slowHtf = htfCloses.slice(-10).reduce((a, b) => a + b, 0) / 10;
         const htfSlope = ((fastHtf - slowHtf) / slowHtf) * 100;
@@ -995,7 +1004,6 @@ export class ATREngine {
         symbol: this.params.symbol,
         side: 'SELL' as const,
         requestedVolume: position.amount,
-        limitPrice: roundDownToTick(this.currentPrice * 0.985),
         reason: '[전량 청산] 사용자 긴급 전량 매도 요청',
         createdAt: Date.now()
       };
@@ -1251,12 +1259,11 @@ export class ATREngine {
       // Page 1: DCA 물타기 (하락 시 대응)
       const nextDcaSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
       if (this.params.dcaEnabled && nextDcaSlot) {
-        const DCA_SCALES = [1.5, 2.0, 1.5];
-        const dcaScale = DCA_SCALES[nextDcaSlot.slotNumber - 1] || 1.5;
+        const dcaScale = FIXED_DCA_UNIT_SCALES[nextDcaSlot.slotNumber - 1] || FIXED_DCA_UNIT_SCALES[0];
         const isDca2Remainder = nextDcaSlot.slotNumber === 2 && nextDcaSlot.status === 'PARTIALLY_FILLED';
-        const dcaBudgetRaw = baseUnitBudget * dcaScale * (isDca2Remainder ? 0.6 : 1);
+        const dcaBudgetRaw = baseUnitBudget * dcaScale * (isDca2Remainder ? 1 - DCA2_RECOVERY_PREBUY_FRACTION : 1);
         const dcaBudget = Math.floor(Math.min(dcaBudgetRaw, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
-        const targetDcaDrop = nextDcaSlot.slotNumber === 1 ? 2.0 : nextDcaSlot.slotNumber === 2 ? 4.2 : 5.5;
+        const targetDcaDrop = FIXED_DCA_DROP_PERCENTS[nextDcaSlot.slotNumber - 1] || FIXED_DCA_DROP_PERCENTS[0];
         const targetDcaPrice = isDca2Remainder && nextDcaSlot.plannedTargetPrice
           ? nextDcaSlot.plannedTargetPrice
           : entry * (1 - targetDcaDrop / 100);
@@ -1265,12 +1272,12 @@ export class ATREngine {
           categoryLabel: '하락 시 저점 추매',
           type: isDca2Remainder ? 'DCA #2차 잔여 매수 (60%)' : `DCA #${nextDcaSlot.slotNumber}차 리사이클링 (${dcaScale}x)`,
           budgetKrw: dcaBudget,
-          unitPercent: Number((effectiveOrderRatio * dcaScale * (isDca2Remainder ? 0.6 : 1)).toFixed(1)),
+          unitPercent: Number((effectiveOrderRatio * dcaScale * (isDca2Remainder ? 1 - DCA2_RECOVERY_PREBUY_FRACTION : 1)).toFixed(1)),
           scaleMultiplier: dcaScale,
           targetPriceLabel: isDca2Remainder
             ? `₩${Math.round(targetDcaPrice).toLocaleString()} (-4.2% 도달 시 · 2차 잔여 60%)`
             : nextDcaSlot.slotNumber === 2
-              ? `접근 반등: -3.5%~-4.15%에서 저점 +0.7% 반등 시 40% · ₩${Math.round(targetDcaPrice).toLocaleString()}(-4.2%)에서 잔여 60%`
+              ? `접근 반등: -3.5%~-4.15%에서 저점 +0.7% 반등 시 ${DCA2_RECOVERY_PREBUY_FRACTION * 100}% · ₩${Math.round(targetDcaPrice).toLocaleString()}(-4.2%)에서 잔여 ${(1 - DCA2_RECOVERY_PREBUY_FRACTION) * 100}%`
               : `₩${Math.round(targetDcaPrice).toLocaleString()} (-${targetDcaDrop.toFixed(1)}% 저점 도달 시)`,
           targetPrice: targetDcaPrice,
           themeColor: 'indigo'

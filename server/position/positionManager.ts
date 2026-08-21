@@ -142,6 +142,7 @@ export class PositionManager {
     this.position.trailingExitCount = 0;
     this.position.profitLockPrice = null;
     this.position.lastRegimeRebalanceAt = 0;
+    this.position.recycleCycleCount = 0;
 
     this.saveStateToFile();
     console.log(`[PositionManager] Initial Entry Filled: Price=${fillPrice}, Qty=${fillVolume}, Static Absolute Stop Loss locked at ₩${Math.round(staticStopLossPrice).toLocaleString()}`);
@@ -370,6 +371,18 @@ export class PositionManager {
     console.log(`[PositionManager] Box-Range Pyramid #${this.position.boxPyramidCount} Filled: New Total Qty=${newTotalQty}, New Avg Price=₩${newWeightedAvgPrice.toLocaleString()}`);
   }
 
+  /** Additional fill of the same box-pyramid order; never consumes a new stage. */
+  public addAdditionalBoxPyramidFilled(fillPrice: number, additionalVolume: number) {
+    const currentQty = this.position.amount;
+    const currentEntry = this.position.entryPrice || fillPrice;
+    const newTotalQty = Number((currentQty + additionalVolume).toFixed(8));
+    this.position.amount = newTotalQty;
+    this.position.entryPrice = Number(((currentQty * currentEntry + additionalVolume * fillPrice) / newTotalQty).toFixed(2));
+    this.position.totalCostKrw += fillPrice * additionalVolume;
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+  }
+
   /**
    * Called on Partial Loss Cut:
    * Sells portion (1차 30%, 2차 50%), transitions to DEFENSIVE_1/2, frees cash for DCA dip buy.
@@ -492,6 +505,7 @@ export class PositionManager {
    * Signal stabilization after dip: moves state to REENTRY_ALLOWED
    */
   public enableReentry() {
+    if ((this.position.recycleCycleCount || 0) >= 2) return;
     if (
       this.position.state === 'EMERGENCY_EXIT' ||
       this.position.state === 'DEFENSIVE' ||
@@ -533,6 +547,7 @@ export class PositionManager {
     stopLossMultiplier: number
   ) {
     this.onManualAdditionalBuyFilled(fillPrice, fillVolume, baseline, atr, atrMultiplier, stopLossMultiplier);
+    this.position.recycleCycleCount = (this.position.recycleCycleCount || 0) + 1;
     this.position.state = 'ENTRY_FILLED';
     this.position.lastUpdatedAt = Date.now();
     this.saveStateToFile();
@@ -568,6 +583,7 @@ export class PositionManager {
     this.position.trailingExitCount = 0;
     this.position.profitLockPrice = null;
     this.position.lastRegimeRebalanceAt = 0;
+    this.position.recycleCycleCount = 0;
     this.position.cooldownUntil = 0;
     this.position.cooldownReason = 'RECONCILED_POSITION_REBASE';
     this.position.lastUpdatedAt = Date.now();

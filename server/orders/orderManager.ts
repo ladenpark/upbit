@@ -433,7 +433,10 @@ export class OrderManager {
           onFilled(incrementalRecord);
         }
       }
-    } else if (status === 'PARTIALLY_FILLED') {
+    } else if (status === 'OPEN' || status === 'PARTIALLY_FILLED') {
+      // Every live exchange order must be watched. OPEN orders are especially
+      // important for protective limit sells: waiting for a partial fill before
+      // registering them can leave an unfilled stop unmanaged indefinitely.
       this.watchingOrderIds.add(record.id);
       if (newlyFilledVolume > 0) {
         if (source === 'WATCHER') {
@@ -569,7 +572,7 @@ export class OrderManager {
         const elapsed = now - ord.updatedAt;
         if (elapsed <= UNKNOWN_ORDER_TIMEOUT_MS) continue;
 
-        console.warn(`[OrderManager] ⏰ UNKNOWN order timeout (${Math.round(elapsed / 1000)}s): ${ord.clientOrderId}. Force-releasing...`);
+        console.warn(`[OrderManager] ⏳ UNKNOWN order unresolved for ${Math.round(elapsed / 1000)}s: ${ord.clientOrderId}. Keeping reservation until exchange confirmation.`);
 
         // Try one last reconciliation
         try {
@@ -587,15 +590,10 @@ export class OrderManager {
           }
         } catch {}
 
-        // If still unresolved, force-release
-        ord.status = 'CANCELLED';
-        ord.error = 'Force-released after UNKNOWN timeout (120s)';
-        ord.updatedAt = Date.now();
-        if (ord.side === 'BUY' && this.riskGovernor) {
-          this.riskGovernor.releaseExposure(ord.clientOrderId);
-        }
-        this.saveOrdersToFile();
-        console.log(`[OrderManager] 🔓 Force-released UNKNOWN order: ${ord.clientOrderId}`);
+        // An API lookup failure is never evidence that an exchange order does
+        // not exist. Leave UNKNOWN and its BUY reservation intact; startup and
+        // background reconciliation will keep retrying until a confirmed state
+        // arrives from the exchange.
       }
     }, 4000);
 
