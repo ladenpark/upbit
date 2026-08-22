@@ -440,6 +440,10 @@ export class OrderManager {
       let submitResponse: { success: boolean; orderId?: string; raw?: any; error?: string } | null = null;
 
       try {
+        // A POST may have reached Upbit even when its response is lost. Never
+        // retry it through the gateway: a second POST with the same identifier
+        // is not a safe recovery mechanism. Network failures are instead
+        // persisted as UNKNOWN and reconciled by identifier below.
         submitResponse = await this.apiGateway.enqueue(priority, async () => {
           if (req.side === 'BUY') {
             return await this.upbitClient.executeOrder(
@@ -454,7 +458,7 @@ export class OrderManager {
               req.clientOrderId
             );
           }
-        });
+        }, 0);
       } catch (netErr: any) {
         console.warn(`[OrderManager] ⚠️ Upbit network error on submit: ${netErr.message}. Starting reconciliation...`);
         record.status = 'UNKNOWN_PENDING_RECONCILIATION';
@@ -764,36 +768,36 @@ export class OrderManager {
           this.getStrategyFillDurabilityWatermark?.(order.clientOrderId)?.volume || 0
         ))
     );
+    if (pending.length > 0 && (!apiKeys.upbitAccessKey || !apiKeys.upbitSecretKey)) {
+      throw new Error(`Cannot authoritatively reconcile ${pending.length} startup order candidate(s) without exchange credentials.`);
+    }
+
     for (const ord of pending) {
       try {
-        if (apiKeys.upbitAccessKey && apiKeys.upbitSecretKey) {
-          const res = await this.reconcileUpbitOrder(
-            ord.clientOrderId,
-            ord.exchangeOrderId,
-            symbol,
-            ord.side,
-            apiKeys.upbitAccessKey,
-            apiKeys.upbitSecretKey
-          );
-          // The exchange response may belong to a symbol/account/startup
-          // generation that was invalidated while this request was in flight.
-          // Never let it mutate the order ledger, strategy watermark or
-          // position callback path after that point.
-          if (!isContextCurrent()) {
-            console.warn(`[OrderManager] Discarding stale startup reconcile result: ${ord.clientOrderId}`);
-            continue;
-          }
-          if (res.found && res.order) {
-            this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
-            reconciledCount++;
-          }
+        const res = await this.reconcileUpbitOrder(
+          ord.clientOrderId,
+          ord.exchangeOrderId,
+          symbol,
+          ord.side,
+          apiKeys.upbitAccessKey,
+          apiKeys.upbitSecretKey
+        );
+        // The exchange response may belong to a symbol/account/startup
+        // generation that was invalidated while this request was in flight.
+        // A stale result is not confirmation: startup must remain blocked.
+        if (!isContextCurrent()) {
+          throw new Error(`Startup reconciliation context became stale for ${ord.clientOrderId}.`);
         }
+        if (!res.found || !res.order) {
+          throw new Error(`Startup reconciliation could not authoritatively confirm ${ord.clientOrderId}.`);
+        }
+        this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
+        reconciledCount++;
       } catch (e) {
-        console.error(`[OrderManager] Failed to reconcile pending order ${ord.clientOrderId} on startup:`, e);
-        // A persistence failure means the local durable ledger can no longer
-        // prove exactly-once delivery. Startup must fail closed rather than
-        // silently continue into READY with a potentially stale watermark.
-        if (this.durabilityFailure) throw e;
+        console.error(`[OrderManager] Failed to reconcile startup order ${ord.clientOrderId}:`, e);
+        // Any unconfirmed candidate (including terminal records with an
+        // unapplied fill) makes the local/exchange state unsafe to resume.
+        throw e;
       }
     }
 

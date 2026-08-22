@@ -848,7 +848,9 @@ async function runAllTests() {
   );
   staleReconcileContextCurrent = false;
   resolveStaleReconcile({ found: true, order: { ...responseC, uuid: 'mock-stale-reconcile', identifier: staleReconcileRecord.clientOrderId } });
-  assert(await staleReconcileRun === 0, '[Stale reconcile] Stale exchange result is not counted as reconciled');
+  let staleReconcileRejected = false;
+  try { await staleReconcileRun; } catch { staleReconcileRejected = true; }
+  assert(staleReconcileRejected, '[Stale reconcile] Stale exchange result fails closed instead of counting as reconciled');
   assert(staleReconcileRecord.status === 'ORDER_SUBMITTED' && staleReconcileRecord.filledVolume === 0 && staleReconcileRecord.strategyAppliedFilledVolume === undefined, '[Stale reconcile] Stale response cannot mutate order state or watermark');
   assert(staleReconcileCallbacks === 0, '[Stale reconcile] Stale response cannot trigger a position callback');
 
@@ -2469,6 +2471,69 @@ async function runAllTests() {
   feedManager.destroy();
   assert(feedManager.lastAnyPriceReceivedAt > feedManager.lastWsReceivedAt && reconnectCalls >= 1, '[Market feed] Healthy REST fallback does not reset WS zombie watchdog or prevent reconnect');
 
+  // A POST response can disappear after Upbit accepts the order. The gateway
+  // must never replay that POST: the only safe next step is identifier-based
+  // reconciliation of the single submitted clientOrderId.
+  const postLossManager = new OrderManager();
+  let postAttempts = 0;
+  let postGatewayRetries: number | undefined;
+  let postError = '';
+  (postLossManager as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>, maxRetries?: number) => {
+    postGatewayRetries = maxRetries;
+    return task();
+  };
+  (postLossManager as any).upbitClient.executeOrder = async () => {
+    postAttempts += 1;
+    throw new Error('NETWORK_ERROR: response lost after exchange accepted POST');
+  };
+  (postLossManager as any).reconcileUpbitOrder = async (clientOrderId: string) => ({
+    found: true,
+    order: { uuid: 'POST_LOSS_UUID', identifier: clientOrderId, state: 'wait', executed_volume: '0', paid_fee: '0', trades: [] }
+  });
+  (postLossManager as any).sleep = async () => {};
+  const postLossRecord = await postLossManager.submitOrder({
+    clientOrderId: `POST_LOSS_${Date.now()}`, signalId: `SIG_POST_LOSS_${Date.now()}`, signalType: 'ENTRY_BUY',
+    symbol: 'KRW-ETH', side: 'BUY', requestedAmountKrw: 100_000, reason: 'post response loss regression', createdAt: Date.now()
+  }, { upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' }, 'UPBIT', () => {}, (error) => { postError = error; });
+  assert(postAttempts === 1 && postGatewayRetries === 0 && postLossRecord.status === 'OPEN' && postError === '', '[Order POST] Response loss sends one POST only and recovers exclusively through identifier reconciliation');
+
+  // A terminal order with a durable-position delta still missing is a startup
+  // candidate. If the exchange cannot confirm it, startup must stop before a
+  // stale balance response could make the bot appear safe to run.
+  const terminalCandidateEngine = new ATREngine(undefined, { backtest: true });
+  const terminalCandidate: OrderRecord = {
+    id: `ORD_TERMINAL_UNAPPLIED_${Date.now()}`, clientOrderId: `CLIENT_TERMINAL_UNAPPLIED_${Date.now()}`,
+    signalId: `SIG_TERMINAL_UNAPPLIED_${Date.now()}`, signalType: 'DCA_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'FILLED', requestedBudgetOrVolume: 1_000_000, filledVolume: 0.4, avgFillPrice: 2_700_000, fee: 100,
+    strategyAppliedFilledVolume: 0, strategyAppliedFee: 0, strategyAppliedFunds: 0, strategyInitialFillApplied: false,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'terminal unapplied startup regression', fills: []
+  };
+  ((terminalCandidateEngine.orderManager as any).orders as Map<string, OrderRecord>).set(terminalCandidate.id, terminalCandidate);
+  (terminalCandidateEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (terminalCandidateEngine.orderManager as any).reconcileUpbitOrder = async () => { throw new Error('exchange query timeout'); };
+  let staleBalanceAccepted = false;
+  (terminalCandidateEngine as any).fetchRealAccountBalance = async () => { staleBalanceAccepted = true; return true; };
+  (terminalCandidateEngine as any).startupReady = false;
+  terminalCandidateEngine.botState = 'STARTING';
+  (terminalCandidateEngine as any).refreshAtrFromExchange = async () => true;
+  await (terminalCandidateEngine as any).startStartupBarrier();
+  assert((terminalCandidateEngine as any).startupReady === false && (terminalCandidateEngine as any).botState === 'PAUSED' && !staleBalanceAccepted, '[Startup reconcile] Terminal unapplied query failure blocks READY before a stale balance can be accepted');
+
+  // A newly connected socket can be zombie before its very first tick. REST
+  // may keep prices visible, but it must not suppress reconnect; the cooldown
+  // prevents watchdog cycles from reconnecting repeatedly.
+  const firstTickFeedManager = new MarketDataManager('UPBIT', 'KRW-ETH', undefined, undefined, false);
+  let firstTickReconnects = 0;
+  (firstTickFeedManager as any).upbitClient.fetchTicker = async () => ({ symbol: 'KRW-ETH', price: 2_700_000, timestamp: Date.now() });
+  (firstTickFeedManager as any).upbitClient.reconnect = () => { firstTickReconnects += 1; };
+  firstTickFeedManager.lastWsReceivedAt = 0;
+  firstTickFeedManager.streamStartedAt = Date.now() - 25_000;
+  firstTickFeedManager.wsExpectedSince = firstTickFeedManager.streamStartedAt;
+  (firstTickFeedManager as any).startWatchdog();
+  await new Promise((resolve) => setTimeout(resolve, 6_500));
+  firstTickFeedManager.destroy();
+  assert(firstTickFeedManager.lastAnyPriceReceivedAt > 0 && firstTickReconnects === 1, '[Market feed] Zero first WS ticks triggers REST fallback and one cooldown-limited reconnect');
+
   // Isolate this parameter semantic test from the intentionally persisted
   // daily-circuit restart scenario immediately above.
   if (fs.existsSync(dailyRiskFile)) fs.unlinkSync(dailyRiskFile);
@@ -2489,6 +2554,11 @@ async function runAllTests() {
   if (failed > 0) {
     process.exit(1);
   }
+
+  // OrderManager intentionally owns background watcher timers. They are
+  // useful in the application but must not leave a standalone regression run
+  // alive after every assertion has completed.
+  process.exit(0);
 }
 
 runAllTests().catch((err) => {
