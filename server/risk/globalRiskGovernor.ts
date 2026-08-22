@@ -36,6 +36,8 @@ export class GlobalRiskGovernor {
   private dailyRealizedLossKrw = 0;
   private dailyLossResetDate: string = '';
   public circuitBreakerTriggered = false;
+  private persistenceFailure: Error | null = null;
+  private onPersistenceFailure?: (error: unknown) => void;
 
   constructor(params: BotParams) {
     this.params = params;
@@ -92,6 +94,19 @@ export class GlobalRiskGovernor {
 
   public setParams(newParams: BotParams) {
     this.params = newParams;
+  }
+
+  public setPersistenceFailureHandler(handler: (error: unknown) => void) {
+    this.onPersistenceFailure = handler;
+  }
+
+  public getPersistenceFailure(): Error | null { return this.persistenceFailure; }
+
+  private failPersistence(error: unknown): never {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    this.persistenceFailure = normalized;
+    this.onPersistenceFailure?.(normalized);
+    throw normalized;
   }
 
   /**
@@ -204,7 +219,11 @@ export class GlobalRiskGovernor {
     }
 
     // 1. Bot State Check
-    if (botState !== 'RUNNING' && signal.type !== 'EMERGENCY_FULL_EXIT') {
+    // Daily-loss circuit HALTED state is intentionally sell-only.  A
+    // durability/emergency halt is not circuitBreakerTriggered and remains
+    // restart-only except for the legacy explicit emergency exit path.
+    const dailyLossProtectiveException = botState === 'HALTED' && this.circuitBreakerTriggered && isProtectiveSell;
+    if (botState !== 'RUNNING' && signal.type !== 'EMERGENCY_FULL_EXIT' && !dailyLossProtectiveException) {
       return { approved: false, rejectionReason: `[Risk Block] Bot is currently in ${botState} state.` };
     }
 
@@ -474,7 +493,10 @@ export class GlobalRiskGovernor {
     try {
       if (fs.existsSync(RESERVATION_FILE)) {
         const raw = fs.readFileSync(RESERVATION_FILE, 'utf-8');
-        const list: ExposureReservation[] = JSON.parse(raw);
+        const list: unknown = JSON.parse(raw);
+        if (!Array.isArray(list) || !list.every((r) => r && typeof r === 'object' && typeof (r as ExposureReservation).clientOrderId === 'string' && Number.isFinite((r as ExposureReservation).amountKrw) && (r as ExposureReservation).amountKrw >= 0 && ['RESERVED', 'COMMITTED', 'RELEASED'].includes((r as ExposureReservation).status))) {
+          throw new Error('Invalid exposure reservation ledger schema.');
+        }
         list.forEach((r) => {
           // Do not release reservations purely because the process was down
           // for five minutes.  The matching order must first be reconciled
@@ -485,9 +507,7 @@ export class GlobalRiskGovernor {
         this.recalculateReservedExposure();
         console.log(`[GlobalRiskGovernor] Exposure Reservations restored: ₩${Math.round(this.reservedBuyExposureKrw).toLocaleString()}`);
       }
-    } catch (e) {
-      console.error('[GlobalRiskGovernor] Failed to load exposure reservations:', e);
-    }
+    } catch (e) { console.error('[GlobalRiskGovernor] Failed to load exposure reservations:', e); this.persistenceFailure = e instanceof Error ? e : new Error(String(e)); }
   }
 
   private loadDailyRiskState() {
@@ -496,13 +516,12 @@ export class GlobalRiskGovernor {
       const parsed = JSON.parse(fs.readFileSync(DAILY_RISK_FILE, 'utf-8')) as {
         date?: string; dailyRealizedLossKrw?: number; circuitBreakerTriggered?: boolean;
       };
+      if (typeof parsed.date !== 'string' || !Number.isFinite(parsed.dailyRealizedLossKrw) || typeof parsed.circuitBreakerTriggered !== 'boolean') throw new Error('Invalid daily risk ledger schema.');
       if (parsed.date === this.dailyLossResetDate) {
         this.dailyRealizedLossKrw = Math.max(0, Number(parsed.dailyRealizedLossKrw) || 0);
         this.circuitBreakerTriggered = Boolean(parsed.circuitBreakerTriggered);
       }
-    } catch (e) {
-      console.error('[GlobalRiskGovernor] Failed to load daily risk state:', e);
-    }
+    } catch (e) { console.error('[GlobalRiskGovernor] Failed to load daily risk state:', e); this.persistenceFailure = e instanceof Error ? e : new Error(String(e)); }
   }
 
   private saveDailyRiskState() {
@@ -516,9 +535,7 @@ export class GlobalRiskGovernor {
         circuitBreakerTriggered: this.circuitBreakerTriggered
       }), 'utf-8');
       fs.renameSync(tmpFile, DAILY_RISK_FILE);
-    } catch (e) {
-      console.error('[GlobalRiskGovernor] Failed to save daily risk state:', e);
-    }
+    } catch (e) { this.failPersistence(e); }
   }
 
   private saveReservations() {
@@ -529,8 +546,6 @@ export class GlobalRiskGovernor {
       const tmpFile = RESERVATION_FILE + '.tmp';
       fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), 'utf-8');
       fs.renameSync(tmpFile, RESERVATION_FILE);
-    } catch (e) {
-      console.error('[GlobalRiskGovernor] Failed to save exposure reservations:', e);
-    }
+    } catch (e) { this.failPersistence(e); }
   }
 }

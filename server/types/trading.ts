@@ -108,7 +108,8 @@ export interface OrderFill {
 export interface OrderRequest {
   clientOrderId: string; // Idempotency key
   signalId: string;
-  signalType?: SignalType;
+  /** Every exchange order must have a durable strategy transition owner. */
+  signalType: SignalType;
   symbol: string;
   side: OrderSide;
   requestedAmountKrw?: number; // for Market BUY on Upbit
@@ -122,7 +123,7 @@ export interface OrderRecord {
   id: string;
   clientOrderId: string;
   signalId: string;
-  signalType?: SignalType;
+  signalType?: SignalType; // Optional only while loading pre-hardening legacy ledgers.
   exchangeOrderId?: string;
   symbol: string;
   side: OrderSide;
@@ -143,12 +144,19 @@ export interface OrderRecord {
    */
   strategyAppliedFilledVolume?: number;
   strategyAppliedFee?: number;
+  strategyAppliedFunds?: number;
+  /** Legacy records with applied volume but no notional must be reconciled from exchange trades before use. */
+  strategyAppliedFundsRecoveryRequired?: boolean;
   strategyInitialFillApplied?: boolean;
   strategyInitialFillAppliedAt?: number;
   /** Transient delivery marker; never persisted as authoritative state. */
   strategyFillKind?: 'INITIAL' | 'INCREMENTAL';
   /** Stable fill-event key used to recover safely when order and position files commit at different times. */
   strategyFillEventId?: string;
+  /** Transient cumulative values carried to PositionManager's durable fill transaction. */
+  strategyFillCumulativeVolume?: number;
+  strategyFillCumulativeFee?: number;
+  strategyFillCumulativeFunds?: number;
 }
 
 export type PositionState = 
@@ -172,6 +180,8 @@ export type PositionState =
 export interface PositionSnapshot {
   id: string;
   symbol: string;
+  /** One-way hash of the account that owns this persisted position ledger. */
+  accountFingerprint?: string;
   state: PositionState;
   amount: number;
   entryPrice: number | null;
@@ -211,6 +221,8 @@ export interface PositionSnapshot {
   recycleCycleCount?: number;
   /** Bounded ledger of fill events already atomically included in position_state.json. */
   appliedFillEventIds?: string[];
+  /** Authoritative per-order fill watermark persisted with the position mutation. */
+  durableFillWatermarks?: Record<string, { volume: number; fee: number; funds?: number; initialApplied: boolean }>;
   // Cooldown
   cooldownUntil: number;
   cooldownReason?: string;

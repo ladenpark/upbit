@@ -62,6 +62,22 @@ export class UpbitClient {
 
   constructor() {}
 
+  /** Every REST request has a finite deadline. A POST timeout is intentionally
+   * thrown so OrderManager treats it as an unknown submission and reconciles
+   * by identifier instead of misclassifying it as an exchange rejection. */
+  private async fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = 6000): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } catch (error: any) {
+      if (error?.name === 'AbortError') throw new Error(`REQUEST_TIMEOUT after ${timeoutMs}ms`);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   public static formatMarket(rawSymbol: string): string {
     if (rawSymbol.startsWith('KRW-')) return rawSymbol.toUpperCase();
     if (rawSymbol.includes('/')) {
@@ -87,7 +103,7 @@ export class UpbitClient {
     }
 
     try {
-      const res = await fetch(url);
+      const res = await this.fetchWithTimeout(url);
       if (!res.ok) {
         throw new Error(`Upbit API HTTP error: ${res.statusText}`);
       }
@@ -192,7 +208,7 @@ export class UpbitClient {
   public async fetchTicker(market: string): Promise<UpbitTickerData | null> {
     const formattedMarket = UpbitClient.formatMarket(market);
     try {
-      const res = await fetch(`https://api.upbit.com/v1/ticker?markets=${formattedMarket}`);
+      const res = await this.fetchWithTimeout(`https://api.upbit.com/v1/ticker?markets=${formattedMarket}`);
       if (!res.ok) return null;
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
@@ -285,7 +301,7 @@ export class UpbitClient {
 
     try {
       const token = this.generateAuthToken(accessKey, secretKey, params);
-      const res = await fetch('https://api.upbit.com/v1/orders', {
+      const res = await this.fetchWithTimeout('https://api.upbit.com/v1/orders', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -324,17 +340,12 @@ export class UpbitClient {
     }
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000);
-
       const token = this.generateAuthToken(accessKey, secretKey);
-      const res = await fetch('https://api.upbit.com/v1/accounts', {
+      const res = await this.fetchWithTimeout('https://api.upbit.com/v1/accounts', {
         headers: {
           Authorization: `Bearer ${token}`
-        },
-        signal: controller.signal
+        }
       });
-      clearTimeout(timeoutId);
 
       const data = await res.json();
 
@@ -362,7 +373,7 @@ export class UpbitClient {
 
       return { success: true, balances: balanceMap, lockedBalances: lockedMap, avgBuyPrices: avgPriceMap };
     } catch (err: any) {
-      if (err.name === 'AbortError') {
+      if (err.message?.includes('REQUEST_TIMEOUT')) {
         return { success: false, error: 'Upbit API 응답 시간 초과 (6초). 네트워크 연결을 확인하세요.' };
       }
       return { success: false, error: err.message || 'Upbit API 통신 실패' };
@@ -381,7 +392,7 @@ export class UpbitClient {
     try {
       const token = this.generateAuthToken(accessKey, secretKey, params);
       const url = `https://api.upbit.com/v1/order?uuid=${uuid}`;
-      const res = await fetch(url, {
+      const res = await this.fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -406,7 +417,7 @@ export class UpbitClient {
     try {
       const token = this.generateAuthToken(accessKey, secretKey, params);
       const url = `https://api.upbit.com/v1/order?identifier=${encodeURIComponent(identifier)}`;
-      const res = await fetch(url, {
+      const res = await this.fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -430,7 +441,7 @@ export class UpbitClient {
     try {
       const token = this.generateAuthToken(accessKey, secretKey, params);
       const url = `https://api.upbit.com/v1/orders?market=${formatted}&state=wait`;
-      const res = await fetch(url, {
+      const res = await this.fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -456,7 +467,7 @@ export class UpbitClient {
     try {
       const token = this.generateAuthToken(accessKey, secretKey, params);
       const url = `https://api.upbit.com/v1/order?uuid=${uuid}`;
-      const res = await fetch(url, {
+      const res = await this.fetchWithTimeout(url, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       });

@@ -26,6 +26,7 @@ export class MarketDataManager {
   public lastReceivedAt = 0;
   private watchdogTimer: NodeJS.Timeout | null = null;
   private staleThresholdMs = 20000; // 20 seconds without tick = STALE (relaxed for low volatility)
+  private marketGeneration = 0;
 
   // Layers
   // 1. Tick Layer (High frequency)
@@ -64,6 +65,7 @@ export class MarketDataManager {
 
   public setSymbol(exchange: ExchangeType, symbol: string) {
     if (this.exchange !== exchange || this.symbol !== symbol) {
+      this.marketGeneration += 1;
       this.exchange = exchange;
       this.symbol = symbol;
       this.recentTicks = [];
@@ -72,15 +74,22 @@ export class MarketDataManager {
   }
 
   public startStream() {
+    const generation = this.marketGeneration;
+    const symbol = this.symbol;
     this.upbitClient.unsubscribe();
     this.setMarketState('RECONNECTING');
 
-    this.upbitClient.subscribeTicker(this.symbol, (ticker: UpbitTickerData) => {
+    this.upbitClient.subscribeTicker(symbol, (ticker: UpbitTickerData) => {
+      if (generation !== this.marketGeneration || ticker.symbol !== UpbitClient.formatMarket(this.symbol)) return;
       this.handleTick(ticker.price, ticker.timestamp);
     });
   }
 
   public handleTick(price: number, timestamp: number) {
+    if (!Number.isFinite(price) || price <= 0) return;
+    // REST fallbacks and old sockets can arrive out of order. A late price
+    // must never rewind strategy time or overwrite the newest market state.
+    if (timestamp && timestamp < this.lastReceivedAt) return;
     this.currentPrice = price;
     this.lastReceivedAt = timestamp || Date.now();
 
@@ -124,8 +133,10 @@ export class MarketDataManager {
       // 1. If no WebSocket tick received for >8s, poll REST ticker as fallback heartbeat
       if (elapsed > 8000) {
         try {
-          const restTicker = await this.upbitClient.fetchTicker(this.symbol);
-          if (restTicker) {
+          const generation = this.marketGeneration;
+          const symbol = this.symbol;
+          const restTicker = await this.upbitClient.fetchTicker(symbol);
+          if (generation === this.marketGeneration && symbol === this.symbol && restTicker?.symbol === UpbitClient.formatMarket(symbol)) {
             this.handleTick(restTicker.price, restTicker.timestamp);
           }
         } catch {}

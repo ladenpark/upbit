@@ -25,9 +25,11 @@ export class OrderManager {
   private watchingOrderIds: Set<string> = new Set();
   private watcherContextGeneration = 0;
   private watcherContextGuard: () => boolean = () => true;
-  private isStrategyFillDurablyApplied?: (eventId: string) => boolean;
+  private getStrategyFillDurabilityWatermark?: (clientOrderId: string) => { volume: number; fee: number; funds?: number; initialApplied: boolean } | undefined;
+  private restoreStrategyFillDurabilityFunds?: (clientOrderId: string, funds: number) => void;
   private onDurabilityFailure?: (error: unknown) => void;
   private durabilityFailure = false;
+  private persistenceLoadFailure: Error | null = null;
 
   constructor(
     riskGovernor?: GlobalRiskGovernor,
@@ -60,13 +62,26 @@ export class OrderManager {
     this.watcherContextGuard = guard;
   }
 
-  /** Reads the position-state fill ledger during restart recovery. */
-  public setStrategyFillDurabilityLookup(lookup: (eventId: string) => boolean) {
-    this.isStrategyFillDurablyApplied = lookup;
+  /** Reads the position-state cumulative fill ledger during restart recovery. */
+  public setStrategyFillDurabilityLookup(
+    lookup: (clientOrderId: string) => { volume: number; fee: number; funds?: number; initialApplied: boolean } | undefined,
+    restoreFunds?: (clientOrderId: string, funds: number) => void
+  ) {
+    this.getStrategyFillDurabilityWatermark = lookup;
+    this.restoreStrategyFillDurabilityFunds = restoreFunds;
   }
 
   public setDurabilityFailureHandler(handler: (error: unknown) => void) {
     this.onDurabilityFailure = handler;
+  }
+
+  /** A corrupted/unreadable local ledger is never safe to start trading from. */
+  public hasPersistenceLoadFailure(): boolean {
+    return this.persistenceLoadFailure !== null;
+  }
+
+  public getPersistenceLoadFailure(): Error | null {
+    return this.persistenceLoadFailure;
   }
 
   private captureWatcherContext() {
@@ -100,6 +115,53 @@ export class OrderManager {
     return this.getPendingOrders().length;
   }
 
+  /**
+   * Serialises a full protective exit with every live order for the same
+   * symbol.  In particular, a resting BUY must never be allowed to fill after
+   * an emergency exit, and a lower-priority limit SELL must release its locked
+   * volume before a market full exit is submitted.
+   */
+  public async cancelPendingOrdersForProtectiveExit(apiKeys: ApiKeys, symbol: string): Promise<void> {
+    if (!apiKeys.upbitAccessKey || !apiKeys.upbitSecretKey) {
+      throw new Error('Cannot coordinate protective exit without exchange credentials.');
+    }
+    const active = Array.from(this.orders.values()).filter((order) =>
+      order.symbol === symbol && [
+        'ORDER_SUBMITTING', 'ORDER_SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'UNKNOWN_PENDING_RECONCILIATION'
+      ].includes(order.status)
+    );
+
+    for (const order of active) {
+      // An order whose exchange identity is unknown cannot safely coexist
+      // with a full exit. Reconcile it first; fail closed if it remains
+      // unknown instead of selling a quantity that may still be locked.
+      if (!order.exchangeOrderId) {
+        const reconciled = await this.reconcileUpbitOrder(
+          order.clientOrderId, undefined, order.symbol, order.side,
+          apiKeys.upbitAccessKey, apiKeys.upbitSecretKey
+        );
+        if (!reconciled.found || !reconciled.order) {
+          throw new Error(`Cannot reconcile pending order ${order.clientOrderId} before protective exit.`);
+        }
+        this.applyUpbitOrderState(order, reconciled.order, () => {}, () => {}, 'WATCHER');
+      }
+      if (['OPEN', 'PARTIALLY_FILLED', 'ORDER_SUBMITTED', 'ORDER_SUBMITTING', 'UNKNOWN_PENDING_RECONCILIATION'].includes(order.status)) {
+        if (!order.exchangeOrderId) {
+          throw new Error(`Pending order ${order.clientOrderId} has no exchange UUID after reconciliation.`);
+        }
+        const cancelled = await this.upbitClient.cancelOrder(apiKeys.upbitAccessKey, apiKeys.upbitSecretKey, order.exchangeOrderId);
+        if (!cancelled.success || !cancelled.order) {
+          throw new Error(`Failed to cancel pending order ${order.clientOrderId} before protective exit: ${cancelled.error || 'unknown error'}`);
+        }
+        this.applyUpbitOrderState(order, cancelled.order, () => {}, () => {}, 'WATCHER');
+      }
+    }
+
+    if (this.getPendingOrders().some((order) => order.symbol === symbol)) {
+      throw new Error('Protective exit cancelled orders but reconciliation still reports a live order.');
+    }
+  }
+
   public hasSignalBeenProcessed(signalId: string): boolean {
     return this.processedSignalIds.has(signalId);
   }
@@ -125,6 +187,7 @@ export class OrderManager {
       }
     } catch (e) {
       console.error('[OrderManager] Failed to load processed signal IDs:', e);
+      this.persistenceLoadFailure = e instanceof Error ? e : new Error(String(e));
     }
   }
 
@@ -159,18 +222,21 @@ export class OrderManager {
     return 'UNKNOWN';
   }
 
-  private extractUpbitFillData(order: UpbitOrderResponse): { executedVolume: number; avgFillPrice: number; totalFee: number } {
+  private extractUpbitFillData(order: UpbitOrderResponse): { executedVolume: number; avgFillPrice: number; totalFee: number; totalFunds: number } {
     const executedVolume = parseFloat(order.executed_volume) || 0;
     const totalFee = parseFloat(order.paid_fee) || 0;
 
     let avgFillPrice = 0;
+    let totalFunds = 0;
     if (order.trades && order.trades.length > 0) {
-      let totalFunds = 0;
       let totalVol = 0;
       for (const t of order.trades) {
         const tv = parseFloat(t.volume) || 0;
+        // Upbit supplies `funds` per trade. Prefer it to price × volume so
+        // the persisted cumulative notional matches the exchange exactly.
+        const tradeFunds = parseFloat(t.funds);
         const tp = parseFloat(t.price) || 0;
-        totalFunds += tv * tp;
+        totalFunds += Number.isFinite(tradeFunds) && tradeFunds >= 0 ? tradeFunds : tv * tp;
         totalVol += tv;
       }
       avgFillPrice = totalVol > 0 ? totalFunds / totalVol : 0;
@@ -179,9 +245,34 @@ export class OrderManager {
       const locked = parseFloat(order.locked) || 0;
       const spent = reserved > 0 ? reserved : locked;
       avgFillPrice = executedVolume > 0 && spent > 0 ? spent / executedVolume : 0;
+      totalFunds = avgFillPrice * executedVolume;
     }
 
-    return { executedVolume, avgFillPrice, totalFee };
+    // Some older/API edge responses have no trades and no usable locked
+    // amount. Retain a deterministic fallback rather than emitting NaN.
+    if (totalFunds <= 0 && executedVolume > 0) totalFunds = avgFillPrice * executedVolume;
+    return { executedVolume, avgFillPrice, totalFee, totalFunds };
+  }
+
+  /** Returns exchange-trade notional for exactly the first cumulative volume. */
+  private extractCumulativeFundsForVolume(order: UpbitOrderResponse, cumulativeVolume: number): number | undefined {
+    if (cumulativeVolume <= 0) return 0;
+    if (!order.trades?.length) return undefined;
+
+    let remaining = cumulativeVolume;
+    let funds = 0;
+    for (const trade of order.trades) {
+      const tradeVolume = parseFloat(trade.volume) || 0;
+      const tradeFunds = parseFloat(trade.funds);
+      const tradePrice = parseFloat(trade.price) || 0;
+      if (tradeVolume <= 0) continue;
+      const usableFunds = Number.isFinite(tradeFunds) && tradeFunds >= 0 ? tradeFunds : tradeVolume * tradePrice;
+      const usedVolume = Math.min(remaining, tradeVolume);
+      funds += usableFunds * (usedVolume / tradeVolume);
+      remaining -= usedVolume;
+      if (remaining <= 1e-8) return Number(funds.toFixed(8));
+    }
+    return undefined;
   }
 
   // ──────────────────────────────────────────────────────────
@@ -283,6 +374,9 @@ export class OrderManager {
     if (this.durabilityFailure) {
       throw new Error('Durability failure is active. Restart and complete exchange reconciliation before submitting any order.');
     }
+    if (!req.signalType) {
+      throw new Error('Strategy-managed orders require a signalType; refusing an unrecoverable exchange order.');
+    }
     if (this.processedSignalIds.has(req.signalId)) {
       throw new Error(`[OrderManager] Signal ID ${req.signalId} has already been processed (Duplicate prevented).`);
     }
@@ -309,10 +403,12 @@ export class OrderManager {
       fills: [],
       strategyAppliedFilledVolume: 0,
       strategyAppliedFee: 0,
+      strategyAppliedFunds: 0,
       strategyInitialFillApplied: false
     };
 
     this.orders.set(record.id, record);
+    let exchangeStatusObserved = false;
     try {
       this.saveOrdersToFile();
     } catch (e) {
@@ -384,12 +480,14 @@ export class OrderManager {
 
         const confirmedOrder = await this.pollUpbitOrderStatus(accessKey, secretKey, submitResponse.orderId);
         if (confirmedOrder) {
+          exchangeStatusObserved = true;
           this.applyUpbitOrderState(record, confirmedOrder, onFilled, onError, 'SUBMIT_FLOW');
         } else {
           const reconcileRes = await this.reconcileUpbitOrder(
             req.clientOrderId, submitResponse.orderId, req.symbol, req.side, accessKey, secretKey
           );
           if (reconcileRes.found && reconcileRes.order) {
+            exchangeStatusObserved = true;
             this.applyUpbitOrderState(record, reconcileRes.order, onFilled, onError, 'SUBMIT_FLOW');
           } else {
             record.status = 'UNKNOWN_PENDING_RECONCILIATION';
@@ -409,6 +507,19 @@ export class OrderManager {
         onError(record.error);
       }
     } catch (err: any) {
+      // An exchange-confirmed state is authoritative.  A later local
+      // persistence/strategy failure must never rewrite FILLED/CANCELLED into
+      // REJECTED, because restart reconciliation needs that execution proof.
+      if (exchangeStatusObserved || record.exchangeOrderId &&
+        ['OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED'].includes(record.status)) {
+        record.error = `Local post-confirmation processing failed: ${err.message}`;
+        record.updatedAt = Date.now();
+        this.durabilityFailure = true;
+        this.onDurabilityFailure?.(err);
+        try { this.saveOrdersToFile(); } catch { /* durability handler already halted the engine */ }
+        onError(record.error);
+        return record;
+      }
       record.status = 'REJECTED';
       record.error = err.message;
       record.updatedAt = Date.now();
@@ -433,7 +544,7 @@ export class OrderManager {
     source: 'SUBMIT_FLOW' | 'WATCHER' = 'SUBMIT_FLOW'
   ) {
     record.exchangeOrderId = exchangeOrder.uuid;
-    const { executedVolume, avgFillPrice, totalFee } = this.extractUpbitFillData(exchangeOrder);
+    const { executedVolume, avgFillPrice, totalFee, totalFunds } = this.extractUpbitFillData(exchangeOrder);
     const remainingVolume = parseFloat(exchangeOrder.remaining_volume) || 0;
     const status = this.mapUpbitState(exchangeOrder.state, executedVolume, remainingVolume);
 
@@ -451,10 +562,52 @@ export class OrderManager {
       throw e;
     }
 
-    const appliedVolume = record.strategyAppliedFilledVolume || 0;
-    const appliedFee = record.strategyAppliedFee || 0;
-    const unappliedVolume = Math.max(0, executedVolume - appliedVolume);
-    const unappliedFee = Math.max(0, totalFee - appliedFee);
+    const orderAppliedVolume = record.strategyAppliedFilledVolume || 0;
+    const orderAppliedFee = record.strategyAppliedFee || 0;
+    let orderAppliedFunds = record.strategyAppliedFunds;
+    let durableWatermark = this.getStrategyFillDurabilityWatermark?.(record.clientOrderId);
+    try {
+      const orderFundsMissing = orderAppliedVolume > 0 && (record.strategyAppliedFundsRecoveryRequired || !Number.isFinite(orderAppliedFunds));
+      const durableFundsMissing = Boolean(durableWatermark && durableWatermark.volume > 0 && !Number.isFinite(durableWatermark.funds));
+      if (orderFundsMissing || durableFundsMissing) {
+        const orderRecoveredFunds = orderFundsMissing ? this.extractCumulativeFundsForVolume(exchangeOrder, orderAppliedVolume) : undefined;
+        const durableRecoveredFunds = durableFundsMissing ? this.extractCumulativeFundsForVolume(exchangeOrder, durableWatermark!.volume) : undefined;
+        if ((orderFundsMissing && orderRecoveredFunds === undefined) || (durableFundsMissing && durableRecoveredFunds === undefined)) {
+          throw new Error(`Cannot safely recover legacy cumulative fill notional for ${record.clientOrderId}: exchange trades are unavailable.`);
+        }
+        if (orderRecoveredFunds !== undefined) {
+          record.strategyAppliedFunds = orderRecoveredFunds;
+          record.strategyAppliedFundsRecoveryRequired = false;
+          orderAppliedFunds = orderRecoveredFunds;
+        }
+        if (durableRecoveredFunds !== undefined) {
+          if (!this.restoreStrategyFillDurabilityFunds) {
+            throw new Error(`Cannot safely persist legacy durable fill notional for ${record.clientOrderId}.`);
+          }
+          this.restoreStrategyFillDurabilityFunds(record.clientOrderId, durableRecoveredFunds);
+          durableWatermark = this.getStrategyFillDurabilityWatermark?.(record.clientOrderId);
+        }
+        this.saveOrdersToFile();
+      }
+    } catch (e) {
+      this.durabilityFailure = true;
+      this.onDurabilityFailure?.(e);
+      throw e;
+    }
+    const normalizedOrderAppliedFunds = orderAppliedFunds || 0;
+    // The position file can be ahead when its final fill commit succeeded but
+    // the subsequent order watermark write failed. Never replay that volume.
+    const effectiveAppliedVolume = Math.max(orderAppliedVolume, durableWatermark?.volume || 0);
+    const effectiveAppliedFee = Math.max(orderAppliedFee, durableWatermark?.fee || 0);
+    const durableFunds = durableWatermark?.funds || 0;
+    const effectiveAppliedFunds = durableWatermark && durableWatermark.volume > orderAppliedVolume
+      ? durableFunds
+      : orderAppliedVolume > (durableWatermark?.volume || 0)
+        ? normalizedOrderAppliedFunds
+        : Math.max(normalizedOrderAppliedFunds, durableFunds);
+    const unappliedVolume = Math.max(0, executedVolume - effectiveAppliedVolume);
+    const unappliedFee = Math.max(0, totalFee - effectiveAppliedFee);
+    const unappliedFunds = Math.max(0, totalFunds - effectiveAppliedFunds);
 
     console.log(`[OrderManager] 📊 Upbit confirmed (${source}): uuid=${exchangeOrder.uuid}, state=${exchangeOrder.state}, executed=${executedVolume}, avgPrice=₩${Math.round(avgFillPrice).toLocaleString()}`);
 
@@ -463,17 +616,17 @@ export class OrderManager {
         this.riskGovernor.commitExposure(record.clientOrderId);
       }
       this.watchingOrderIds.delete(record.id);
-      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, source, onFilled);
+      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, unappliedFunds, effectiveAppliedVolume, effectiveAppliedFee, effectiveAppliedFunds, Boolean(durableWatermark?.initialApplied), source, onFilled);
     } else if (status === 'OPEN' || status === 'PARTIALLY_FILLED') {
       // Every live exchange order must be watched. OPEN orders are especially
       // important for protective limit sells: waiting for a partial fill before
       // registering them can leave an unfilled stop unmanaged indefinitely.
       this.watchingOrderIds.add(record.id);
-      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, source, onFilled);
+      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, unappliedFunds, effectiveAppliedVolume, effectiveAppliedFee, effectiveAppliedFunds, Boolean(durableWatermark?.initialApplied), source, onFilled);
     } else if (status === 'CANCELLED' || status === 'REJECTED') {
       // Apply any partial execution before releasing the remaining BUY
       // reservation.  A CANCELLED order is terminal, not a full fill.
-      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, source, onFilled);
+      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, unappliedFunds, effectiveAppliedVolume, effectiveAppliedFee, effectiveAppliedFunds, Boolean(durableWatermark?.initialApplied), source, onFilled);
       if (record.side === 'BUY' && this.riskGovernor) {
         this.riskGovernor.releaseExposure(record.clientOrderId);
       }
@@ -495,26 +648,54 @@ export class OrderManager {
     record: OrderRecord,
     volume: number,
     fee: number,
+    funds: number,
+    effectiveAppliedVolume: number,
+    effectiveAppliedFee: number,
+    effectiveAppliedFunds: number,
+    durableInitialApplied: boolean,
     source: 'SUBMIT_FLOW' | 'WATCHER',
     onFilled: (record: OrderRecord) => void
   ) {
-    if (volume <= 0) return;
+    if (volume <= 0) {
+      // Repair a stale order watermark from the position's durable cumulative
+      // record even when the exchange has no further execution to deliver.
+      if (effectiveAppliedVolume > (record.strategyAppliedFilledVolume || 0) || effectiveAppliedFee > (record.strategyAppliedFee || 0) || effectiveAppliedFunds > (record.strategyAppliedFunds || 0)) {
+        record.strategyAppliedFilledVolume = effectiveAppliedVolume;
+        record.strategyAppliedFee = effectiveAppliedFee;
+        record.strategyAppliedFunds = effectiveAppliedFunds;
+        record.strategyInitialFillApplied = record.strategyInitialFillApplied || durableInitialApplied || effectiveAppliedVolume > 0;
+        record.updatedAt = Date.now();
+        try {
+          this.saveOrdersToFile();
+        } catch (e) {
+          this.durabilityFailure = true;
+          this.onDurabilityFailure?.(e);
+          throw e;
+        }
+      }
+      return;
+    }
 
-    const isInitial = !record.strategyInitialFillApplied;
-    const cumulativeAppliedVolume = Number(((record.strategyAppliedFilledVolume || 0) + volume).toFixed(8));
+    const isInitial = !record.strategyInitialFillApplied && !durableInitialApplied && effectiveAppliedVolume <= 0;
+    const cumulativeAppliedVolume = Number((effectiveAppliedVolume + volume).toFixed(8));
+    const cumulativeAppliedFee = Number((effectiveAppliedFee + fee).toFixed(8));
+    const cumulativeAppliedFunds = Number((effectiveAppliedFunds + funds).toFixed(8));
+    const incrementalFillPrice = volume > 0 && funds > 0 ? funds / volume : record.avgFillPrice;
     const fillEventId = `${record.clientOrderId}:${cumulativeAppliedVolume.toFixed(8)}`;
     const strategyRecord: OrderRecord = {
       ...record,
       filledVolume: volume,
       fee,
+      avgFillPrice: incrementalFillPrice,
       strategyFillKind: isInitial ? 'INITIAL' : 'INCREMENTAL',
-      strategyFillEventId: fillEventId
+      strategyFillEventId: fillEventId,
+      strategyFillCumulativeVolume: cumulativeAppliedVolume,
+      strategyFillCumulativeFee: cumulativeAppliedFee,
+      strategyFillCumulativeFunds: cumulativeAppliedFunds
     };
 
     try {
-      if (this.isStrategyFillDurablyApplied?.(fillEventId)) {
-        console.warn(`[OrderManager] Recovering durable position fill without replay: ${fillEventId}`);
-      } else if (source === 'WATCHER') {
+      if (source === 'WATCHER') {
         this.onOrderUpdated?.(strategyRecord, volume);
       } else {
         onFilled(strategyRecord);
@@ -526,7 +707,8 @@ export class OrderManager {
     }
 
     record.strategyAppliedFilledVolume = cumulativeAppliedVolume;
-    record.strategyAppliedFee = Number(((record.strategyAppliedFee || 0) + fee).toFixed(8));
+    record.strategyAppliedFee = cumulativeAppliedFee;
+    record.strategyAppliedFunds = cumulativeAppliedFunds;
     if (isInitial) {
       record.strategyInitialFillApplied = true;
       record.strategyInitialFillAppliedAt = Date.now();
@@ -554,7 +736,24 @@ export class OrderManager {
     this.lastApiKeys = apiKeys;
     let reconciledCount = 0;
 
-    const pending = this.getPendingOrders();
+    // Do not use getPendingOrders() here: it intentionally returns shallow
+    // copies for external callers. Reconciliation must mutate the canonical
+    // ledger records so its repaired watermarks are actually persisted.
+    const pending = Array.from(this.orders.values()).filter((order) =>
+      order.status === 'ORDER_SUBMITTING' ||
+      order.status === 'ORDER_SUBMITTED' ||
+      order.status === 'OPEN' ||
+      order.status === 'PARTIALLY_FILLED' ||
+      order.status === 'UNKNOWN_PENDING_RECONCILIATION' ||
+      // A crash after exchange confirmation but before durable position
+      // application leaves a terminal order with an unapplied delta. Terminal
+      // records are therefore reconciliation candidates too.
+      ((order.status === 'FILLED' || order.status === 'CANCELLED') &&
+        order.filledVolume > Math.max(
+          order.strategyAppliedFilledVolume || 0,
+          this.getStrategyFillDurabilityWatermark?.(order.clientOrderId)?.volume || 0
+        ))
+    );
     for (const ord of pending) {
       try {
         if (apiKeys.upbitAccessKey && apiKeys.upbitSecretKey) {
@@ -581,6 +780,10 @@ export class OrderManager {
         }
       } catch (e) {
         console.error(`[OrderManager] Failed to reconcile pending order ${ord.clientOrderId} on startup:`, e);
+        // A persistence failure means the local durable ledger can no longer
+        // prove exactly-once delivery. Startup must fail closed rather than
+        // silently continue into READY with a potentially stale watermark.
+        if (this.durabilityFailure) throw e;
       }
     }
 
@@ -687,7 +890,20 @@ export class OrderManager {
           if (ord.strategyAppliedFilledVolume === undefined) {
             ord.strategyAppliedFilledVolume = ord.filledVolume || 0;
             ord.strategyAppliedFee = ord.fee || 0;
+            if ((ord.strategyAppliedFilledVolume || 0) > 0) {
+              ord.strategyAppliedFundsRecoveryRequired = true;
+            } else {
+              ord.strategyAppliedFunds = 0;
+            }
             ord.strategyInitialFillApplied = (ord.filledVolume || 0) > 0;
+            migrated = true;
+          }
+          if ((ord.strategyAppliedFilledVolume || 0) > 0 && (ord.strategyAppliedFunds === undefined || ord.strategyAppliedFundsRecoveryRequired)) {
+            ord.strategyAppliedFunds = undefined;
+            ord.strategyAppliedFundsRecoveryRequired = true;
+            migrated = true;
+          } else if (ord.strategyAppliedFunds === undefined) {
+            ord.strategyAppliedFunds = 0;
             migrated = true;
           }
           this.orders.set(ord.id, ord);
@@ -703,6 +919,7 @@ export class OrderManager {
       }
     } catch (e) {
       console.error('[OrderManager] Failed to load order history:', e);
+      this.persistenceLoadFailure = e instanceof Error ? e : new Error(String(e));
     }
   }
 

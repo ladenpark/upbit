@@ -37,7 +37,7 @@ function validateConfig(payload: unknown): Partial<BotParams> {
   const config = payload as Record<string, unknown>;
   const numericLimits: Record<string, [number, number]> = {
     atrMultiplier: [0.1, 20], orderRatio: [0, 100], stopLossMultiplier: [0.1, 20],
-    maxExposurePercent: [1, 100], maxSafetyOrders: [0, 10], safetyOrderStepPercent: [0.1, 50],
+    maxExposurePercent: [1, 100], maxSafetyOrders: [3, 3], safetyOrderStepPercent: [0.1, 50],
     safetyOrderVolumeScale: [0.1, 10], trailingCallbackPercent: [0.1, 20],
     maxPyramidingOrders: [0, 2], pyramidingStepPercent: [0.1, 50], partialLossCutPercent: [1, 100],
     partialLossCutThreshold: [0.1, 100], trendDropSpeedThreshold: [0.1, 100],
@@ -52,7 +52,9 @@ function validateConfig(payload: unknown): Partial<BotParams> {
     throw new Error('Invalid Upbit KRW market symbol.');
   }
   if ('exchange' in config && config.exchange !== 'UPBIT') throw new Error('Unsupported exchange.');
-  const experimentKeys = [
+  const booleanKeys = [
+    'isBotActive', 'dcaEnabled', 'trailingStopEnabled', 'pyramidingEnabled', 'partialLossCutEnabled',
+    'trendAwareCutEnabled', 'autoPilotEnabled', 'breakoutEntryEnabled', 'dryRunMode',
     'experimentDca2RsiRecoveryEnabled',
     'experimentDca2VolumeConfirmationEnabled',
     'experimentPyramidRsiGuardEnabled',
@@ -61,7 +63,11 @@ function validateConfig(payload: unknown): Partial<BotParams> {
     'experimentScalpReentryCooldownEnabled',
     'experimentTrendTrailingArmingEnabled'
   ];
-  for (const key of experimentKeys) {
+  const allowedKeys = new Set([...Object.keys(numericLimits), 'symbol', 'exchange', ...booleanKeys]);
+  for (const key of Object.keys(config)) {
+    if (!allowedKeys.has(key)) throw new Error(`Unknown configuration key: ${key}.`);
+  }
+  for (const key of booleanKeys) {
     if (key in config && typeof config[key] !== 'boolean') throw new Error(`Invalid ${key}. Expected a boolean.`);
   }
   return config as Partial<BotParams>;
@@ -88,7 +94,7 @@ app.use((req, res, next) => {
   if (origin && ALLOWED_ORIGIN && origin !== ALLOWED_ORIGIN) return res.sendStatus(403);
   if (origin && !ALLOWED_ORIGIN && !isLoopback(req.socket.remoteAddress)) return res.sendStatus(403);
   if (origin) res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN || origin);
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -173,10 +179,9 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
           const uSec = (upbitSecretKey || currentKeys.upbitSecretKey || '').trim();
           const client = new UpbitClient();
           const res = await client.getAccountBalance(uAcc, uSec);
-          if (res.success && res.balances) {
-            engine.realBalances = res.balances;
-            engine.notifyClients();
-          }
+          // Credential tests must never replace the live engine's account
+          // state. Only SAVE_API_KEYS followed by full reconciliation may do
+          // that.
           ws.send(JSON.stringify({ type: 'TEST_API_KEYS_RESULT', payload: res }));
           break;
         }

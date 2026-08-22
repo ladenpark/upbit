@@ -223,10 +223,10 @@ async function runAllTests() {
 
   posManager.onInitialEntryFilled(2850000, 1.0, 3000000, 50000, 3.0, 2.0);
   const snapshotAfterEntry = posManager.getSnapshot();
-  assert(snapshotAfterEntry.initialStopPrice === 2750000, `Static Stop Loss locked at exact ₩${snapshotAfterEntry.initialStopPrice}`);
+  assert(snapshotAfterEntry.initialStopPrice === 2679000, `Absolute stop is fixed at entry -6% (₩${snapshotAfterEntry.initialStopPrice})`);
 
   const snapshotLater = posManager.getSnapshot();
-  assert(snapshotLater.initialStopPrice === 2750000, 'Stop Loss did NOT drift with market volatility');
+  assert(snapshotLater.initialStopPrice === 2679000, 'Absolute stop does NOT drift with market volatility');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 4: DCA & Partial Cut Loop Prevention
@@ -305,6 +305,7 @@ async function runAllTests() {
       {
         clientOrderId: `ORD_DUP_TEST_${Date.now()}`,
         signalId: testSignalId,
+        signalType: 'ENTRY_BUY',
         symbol: 'KRW-ETH',
         side: 'BUY',
         requestedAmountKrw: 50000,
@@ -325,6 +326,7 @@ async function runAllTests() {
       {
         clientOrderId: `ORD_DUP_TEST2_${Date.now()}`,
         signalId: testSignalId, // SAME signalId
+        signalType: 'ENTRY_BUY',
         symbol: 'KRW-ETH',
         side: 'BUY',
         requestedAmountKrw: 50000,
@@ -946,6 +948,7 @@ async function runAllTests() {
   nonEntryPosManager.onDcaFilled(1, 2600000, 0.3);
   const snapAfterDca1 = nonEntryPosManager.getSnapshot();
   assert(snapAfterDca1.amount === 1.3, '[DCA Partial Fill] Position amount is 1.3 ETH after 1st partial fill');
+  assert(snapAfterDca1.initialStopPrice === 2538000, '[DCA Partial Fill] DCA preserves the original fixed -6% absolute stop');
   assert(snapAfterDca1.dcaSlots[0].status === 'FILLED' && snapAfterDca1.dcaSlots[0].filledVolume === 0.3, '[DCA Partial Fill] Slot 1 filled with 0.3 ETH');
   assert(snapAfterDca1.dcaSlots[1].status === 'AVAILABLE', '[DCA Partial Fill] Slot 2 is still AVAILABLE');
 
@@ -1605,21 +1608,23 @@ async function runAllTests() {
   // ──────────────────────────────────────────────────────
   console.log('\n▶ TEST GROUP 19: Research Recorder Isolation');
   const researchRecorder = new ResearchRecorder();
-  researchRecorder.recordTick('KRW-ETH', 3000000, 1700000000000);
-  researchRecorder.recordTick('KRW-ETH', 3000000, 1700000000100); // duplicate ticker noise
-  researchRecorder.recordTick('KRW-ETH', 3001000, 1700000000200);
+  const researchStatsBefore = researchRecorder.getStats();
+  const researchTimestamp = Date.now();
+  researchRecorder.recordTick('KRW-ETH', 3000000, researchTimestamp);
+  researchRecorder.recordTick('KRW-ETH', 3000000, researchTimestamp + 100); // duplicate ticker noise
+  researchRecorder.recordTick('KRW-ETH', 3001000, researchTimestamp + 200);
   researchRecorder.recordCompletedCandles('KRW-ETH', [{
     market: 'KRW-ETH', candle_date_time_utc: '2023-11-14T00:00:00', opening_price: 3000000,
-    high_price: 3010000, low_price: 2990000, trade_price: 3001000, timestamp: 1700000000000,
+    high_price: 3010000, low_price: 2990000, trade_price: 3001000, timestamp: researchTimestamp,
     candle_acc_trade_volume: 12.34
   }]);
-  researchRecorder.recordShadowDifference(1700000000000, 'KRW-ETH', 3001000, { rsi: 40, volumeMultiplier: 1.2 }, {
+  researchRecorder.recordShadowDifference(researchTimestamp, 'KRW-ETH', 3001000, { rsi: 40, volumeMultiplier: 1.2 }, {
     baseline: { type: 'DCA_BUY', dcaExecution: 'RECOVERY_PREBUY' },
     dca2Rsi: { type: null }
   });
   const researchStats = researchRecorder.getStats();
-  assert(researchStats.ticksRecorded === 2, '[Research] Duplicate ticker noise is not written repeatedly');
-  assert(researchStats.candlesRecorded === 1 && researchStats.shadowDifferences === 1, '[Research] Completed candle and shadow difference are recorded independently');
+  assert(researchStats.ticksRecorded === researchStatsBefore.ticksRecorded + 2, '[Research] Duplicate ticker noise is not written repeatedly');
+  assert(researchStats.candlesRecorded === researchStatsBefore.candlesRecorded + 1 && researchStats.shadowDifferences === researchStatsBefore.shadowDifferences + 1, '[Research] Completed candle and shadow difference are recorded independently');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 20: Single-Use Re-entry Lock
@@ -1640,7 +1645,7 @@ async function runAllTests() {
   reentryManager.rebaseReconciledPosition(2700000, 30000, 3, 2);
   const rebasedSnapshot = reentryManager.getSnapshot();
   assert(rebasedSnapshot.partialCutCount === 0 && rebasedSnapshot.trailingActive === false && rebasedSnapshot.state === 'ENTRY_FILLED', '[Rebase] Defensive and trailing state are reset from the reconciled position');
-  assert(rebasedSnapshot.initialStopPrice === Math.max(2700000 - (30000 * 3) - (30000 * 2), rebasedSnapshot.entryPrice! * 0.94), '[Rebase] Static stop is rebuilt from current baseline, ATR, and exchange average');
+  assert(rebasedSnapshot.initialStopPrice === rebasedSnapshot.entryPrice! * 0.94, '[Rebase] Absolute stop is rebuilt as fixed -6% of the reconciled average');
   const reentryPendingRisk = new GlobalRiskGovernor(defaultParams).evaluateSignal(
     { ...bullBuySignal, type: 'REENTRY_BUY' }, 'RUNNING', 'LIVE', 5000000,
     { ...labPyramidPosition, state: 'REENTRY_PENDING' }, 2750000, [], 0
@@ -1719,6 +1724,173 @@ async function runAllTests() {
   }
   assert(pendingOrderSwitchRejected && pendingOrderSwitchEngine.params.exchange === 'UPBIT', '[Symbol switch] Pending order rejects exchange change without mutating params');
 
+  // A corrupt local ledger must never be silently replaced with an empty
+  // in-memory ledger and allowed through the startup barrier.
+  const savedOrderHistory = fs.existsSync(orderFile) ? fs.readFileSync(orderFile, 'utf-8') : null;
+  fs.writeFileSync(orderFile, '{not-valid-json', 'utf-8');
+  const corruptedOrderEngine = new ATREngine(undefined, { backtest: true });
+  if (savedOrderHistory === null) fs.unlinkSync(orderFile); else fs.writeFileSync(orderFile, savedOrderHistory, 'utf-8');
+  (corruptedOrderEngine as any).startupReady = false;
+  corruptedOrderEngine.botState = 'STARTING';
+  (corruptedOrderEngine as any).refreshAtrFromExchange = async () => true;
+  await (corruptedOrderEngine as any).startStartupBarrier();
+  assert(corruptedOrderEngine.orderManager.hasPersistenceLoadFailure() && (corruptedOrderEngine as any).startupReady === false && (corruptedOrderEngine.botState as string) === 'PAUSED', '[Persistence load] Corrupted order_history blocks startup READY and new trading');
+
+  const savedPositionState = fs.existsSync(posFile) ? fs.readFileSync(posFile, 'utf-8') : null;
+  fs.writeFileSync(posFile, '{not-valid-json', 'utf-8');
+  const corruptedPositionEngine = new ATREngine(undefined, { backtest: true });
+  if (savedPositionState === null) fs.unlinkSync(posFile); else fs.writeFileSync(posFile, savedPositionState, 'utf-8');
+  (corruptedPositionEngine as any).startupReady = false;
+  corruptedPositionEngine.botState = 'STARTING';
+  (corruptedPositionEngine as any).refreshAtrFromExchange = async () => true;
+  await (corruptedPositionEngine as any).startStartupBarrier();
+  assert(corruptedPositionEngine.positionManager.hasPersistenceLoadFailure() && (corruptedPositionEngine as any).startupReady === false && (corruptedPositionEngine.botState as string) === 'PAUSED', '[Persistence load] Corrupted position_state blocks startup READY despite an in-memory FLAT fallback');
+
+  // JSON syntax alone is not proof of a valid position ledger. Validate the
+  // semantic shape before accepting it as persisted state.
+  const savedSemanticPositionState = fs.existsSync(posFile) ? fs.readFileSync(posFile, 'utf-8') : null;
+  const semanticSeed = new PositionManager(defaultParams);
+  semanticSeed.onInitialEntryFilled(2700000, 1, 2700000, 10000, 2, 3);
+  const validSemanticState: any = semanticSeed.getSnapshot();
+  fs.writeFileSync(posFile, '{}', 'utf-8');
+  const emptySemanticState = new PositionManager(defaultParams);
+  assert(emptySemanticState.hasPersistenceLoadFailure() && !emptySemanticState.hasPersistedState(), '[Position schema] Empty JSON object is rejected rather than bypassing missing-position protection');
+  const incompleteOpenState = JSON.parse(JSON.stringify(validSemanticState));
+  delete incompleteOpenState.initialStopPrice;
+  fs.writeFileSync(posFile, JSON.stringify(incompleteOpenState), 'utf-8');
+  const incompleteOpenPosition = new PositionManager(defaultParams);
+  assert(incompleteOpenPosition.hasPersistenceLoadFailure(), '[Position schema] Open position without complete protective state is rejected');
+  const malformedSlotsState = JSON.parse(JSON.stringify(validSemanticState));
+  malformedSlotsState.dcaSlots = null;
+  fs.writeFileSync(posFile, JSON.stringify(malformedSlotsState), 'utf-8');
+  const malformedSlotsPosition = new PositionManager(defaultParams);
+  assert(malformedSlotsPosition.hasPersistenceLoadFailure(), '[Position schema] Malformed DCA slots are rejected');
+  const malformedWatermarkState = JSON.parse(JSON.stringify(validSemanticState));
+  malformedWatermarkState.durableFillWatermarks = { BAD: { volume: 0.4, fee: 0, initialApplied: 'yes' } };
+  fs.writeFileSync(posFile, JSON.stringify(malformedWatermarkState), 'utf-8');
+  const malformedWatermarkPosition = new PositionManager(defaultParams);
+  assert(malformedWatermarkPosition.hasPersistenceLoadFailure(), '[Position schema] Malformed durable watermark is rejected');
+  for (const protectiveField of ['entryPrice', 'positionEntryAtr', 'initialStopPrice', 'initialBaseline', 'initialBand']) {
+    const zeroProtectiveState = JSON.parse(JSON.stringify(validSemanticState));
+    zeroProtectiveState[protectiveField] = 0;
+    fs.writeFileSync(posFile, JSON.stringify(zeroProtectiveState), 'utf-8');
+    const zeroProtectivePosition = new PositionManager(defaultParams);
+    assert(zeroProtectivePosition.hasPersistenceLoadFailure(), `[Position schema] Open position with ${protectiveField}=0 fails closed`);
+  }
+  const legacySemanticState = JSON.parse(JSON.stringify(validSemanticState));
+  delete legacySemanticState.boxPyramidCount;
+  delete legacySemanticState.partialCutCount;
+  delete legacySemanticState.trailingExitCount;
+  delete legacySemanticState.profitLockPrice;
+  delete legacySemanticState.lastRegimeRebalanceAt;
+  delete legacySemanticState.recycleCycleCount;
+  delete legacySemanticState.appliedFillEventIds;
+  delete legacySemanticState.durableFillWatermarks;
+  fs.writeFileSync(posFile, JSON.stringify(legacySemanticState), 'utf-8');
+  const migratedLegacyPosition = new PositionManager(defaultParams);
+  assert(!migratedLegacyPosition.hasPersistenceLoadFailure() && migratedLegacyPosition.hasPersistedState() && Array.isArray(migratedLegacyPosition.getSnapshot().dcaSlots) && Array.isArray(migratedLegacyPosition.getSnapshot().appliedFillEventIds), '[Position schema] Known additive legacy state migrates and validates before use');
+  if (savedSemanticPositionState === null) {
+    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  } else fs.writeFileSync(posFile, savedSemanticPositionState, 'utf-8');
+
+  // The persisted symbol of an open position is authoritative at restart.
+  // A default ETH engine must bootstrap to BTC before choosing balance coinKey.
+  const savedBootstrapPositionState = fs.existsSync(posFile) ? fs.readFileSync(posFile, 'utf-8') : null;
+  const persistedBtcPosition = JSON.parse(JSON.stringify(validSemanticState));
+  persistedBtcPosition.symbol = 'KRW-BTC';
+  fs.writeFileSync(posFile, JSON.stringify(persistedBtcPosition), 'utf-8');
+  const symbolBootstrapEngine = new ATREngine(undefined, { backtest: true });
+  if (savedBootstrapPositionState === null) {
+    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  } else fs.writeFileSync(posFile, savedBootstrapPositionState, 'utf-8');
+  (symbolBootstrapEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (symbolBootstrapEngine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+  (symbolBootstrapEngine.orderManager as any).reconcilePendingOrdersOnStartup = async () => 0;
+  (symbolBootstrapEngine as any).upbitClient.getAccountBalance = async () => ({ success: true, balances: { KRW: 1000000, ETH: 0, BTC: 1 }, lockedBalances: {}, avgBuyPrices: { BTC: 2700000 } });
+  (symbolBootstrapEngine as any).upbitClient.getOpenOrders = async () => ({ success: true, orders: [] });
+  assert(symbolBootstrapEngine.params.symbol === 'KRW-BTC' && await symbolBootstrapEngine.reconcileOnStartup() === true && symbolBootstrapEngine.positionManager.getSnapshot().symbol === 'KRW-BTC' && symbolBootstrapEngine.positionManager.getSnapshot().amount === 1, '[Restart symbol] Persisted KRW-BTC position bootstraps engine before balance reconciliation, never reconciling it as ETH');
+
+  const flatSymbolConsistencyPosition = new PositionManager(defaultParams);
+  flatSymbolConsistencyPosition.onPositionClosed(0, 'symbol consistency test');
+  flatSymbolConsistencyPosition.setParams({ ...defaultParams, symbol: 'KRW-BTC' });
+  assert(flatSymbolConsistencyPosition.getSnapshot().symbol === 'KRW-BTC', '[Position params] Flat position symbol follows updated strategy symbol');
+  if (savedSemanticPositionState === null) {
+    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  } else fs.writeFileSync(posFile, savedSemanticPositionState, 'utf-8');
+
+  // A missing file is normal only for a truly empty first-run account. When
+  // the exchange already holds the coin, amount/average alone are not enough
+  // to reconstruct durable fills, DCA slots, trailing or cooldown state.
+  const savedMissingPositionState = fs.existsSync(posFile) ? fs.readFileSync(posFile, 'utf-8') : null;
+  if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  const missingPositionWithCoinEngine = new ATREngine(undefined, { backtest: true });
+  const missingPositionEmptyAccountEngine = new ATREngine(undefined, { backtest: true });
+  if (savedMissingPositionState === null) {
+    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  } else fs.writeFileSync(posFile, savedMissingPositionState, 'utf-8');
+  for (const engine of [missingPositionWithCoinEngine, missingPositionEmptyAccountEngine]) {
+    (engine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+    (engine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+    (engine.orderManager as any).reconcilePendingOrdersOnStartup = async () => 0;
+    (engine as any).upbitClient.getOpenOrders = async () => ({ success: true, orders: [] });
+  }
+  (missingPositionWithCoinEngine as any).upbitClient.getAccountBalance = async () => ({
+    success: true, balances: { KRW: 1000000, ETH: 1 }, lockedBalances: {}, avgBuyPrices: { ETH: 2700000 }
+  });
+  (missingPositionEmptyAccountEngine as any).upbitClient.getAccountBalance = async () => ({
+    success: true, balances: { KRW: 1000000 }, lockedBalances: {}, avgBuyPrices: {}
+  });
+  assert(await missingPositionWithCoinEngine.reconcileOnStartup() === false && !missingPositionWithCoinEngine.positionManager.hasPersistedState() && missingPositionWithCoinEngine.positionManager.getSnapshot().amount === 0, '[Missing position state] Existing exchange coin blocks startup without silently adopting a partial local position');
+  assert(await missingPositionEmptyAccountEngine.reconcileOnStartup() === true && !missingPositionEmptyAccountEngine.positionManager.hasPersistedState(), '[Missing position state] Empty exchange account remains a valid first-run startup');
+
+  // A first runtime fill creates the ledger, so subsequent background balance
+  // reconciliation must no longer be treated as a missing-state recovery.
+  const savedRuntimePositionState = fs.existsSync(posFile) ? fs.readFileSync(posFile, 'utf-8') : null;
+  if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  const firstFillEngine = new ATREngine(undefined, { backtest: true });
+  firstFillEngine.positionManager.onInitialEntryFilled(2700000, 1, 2700000, 10000, 2, 3);
+  (firstFillEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (firstFillEngine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+  (firstFillEngine as any).upbitClient.getAccountBalance = async () => ({ success: true, balances: { KRW: 1000000, ETH: 1 }, lockedBalances: {}, avgBuyPrices: { ETH: 2700000 } });
+  assert(firstFillEngine.positionManager.hasPersistedState() && await firstFillEngine.fetchRealAccountBalance() === true && firstFillEngine.positionManager.getSnapshot().amount === 1, '[Missing position state] First fill creates persisted state and allows later balance reconciliation');
+
+  // Manual rebase is another runtime writer. Once it commits the rebuilt
+  // state, a new startup barrier in the same process may safely pass.
+  if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  const rebaseMissingStateEngine = new ATREngine(undefined, { backtest: true });
+  ((rebaseMissingStateEngine.orderManager as any).orders as Map<string, OrderRecord>).clear();
+  rebaseMissingStateEngine.params.isBotActive = false;
+  rebaseMissingStateEngine.botState = 'PAUSED';
+  rebaseMissingStateEngine.currentPrice = 2700000;
+  rebaseMissingStateEngine.baselineValue = 2700000;
+  rebaseMissingStateEngine.atrValue = 10000;
+  (rebaseMissingStateEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (rebaseMissingStateEngine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+  (rebaseMissingStateEngine as any).upbitClient.getAccountBalance = async () => ({ success: true, balances: { KRW: 1000000, ETH: 1 }, lockedBalances: {}, avgBuyPrices: { ETH: 2700000 } });
+  (rebaseMissingStateEngine as any).upbitClient.getOpenOrders = async () => ({ success: true, orders: [] });
+  (rebaseMissingStateEngine.orderManager as any).reconcilePendingOrdersOnStartup = async () => 0;
+  (rebaseMissingStateEngine as any).refreshAtrFromExchange = async () => true;
+  await rebaseMissingStateEngine.rebaseCurrentPosition();
+  (rebaseMissingStateEngine as any).startupReady = false;
+  rebaseMissingStateEngine.botState = 'STARTING';
+  await (rebaseMissingStateEngine as any).startStartupBarrier();
+  clearInterval((rebaseMissingStateEngine as any).balanceRefreshTimer);
+  clearInterval((rebaseMissingStateEngine as any).atrRefreshTimer);
+  assert(rebaseMissingStateEngine.positionManager.hasPersistedState() && (rebaseMissingStateEngine as any).startupReady === true && (rebaseMissingStateEngine.botState as string) === 'PAUSED', '[Missing position state] Manual rebase persists recovery and permits startup without a restart');
+  if (savedRuntimePositionState === null) {
+    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  } else fs.writeFileSync(posFile, savedRuntimePositionState, 'utf-8');
+
+  // A live exchange order not represented in the local pending ledger is an
+  // ownership ambiguity: do not start a strategy that could submit against it.
+  const unknownExchangeOrderEngine = new ATREngine(undefined, { backtest: true });
+  ((unknownExchangeOrderEngine.orderManager as any).orders as Map<string, OrderRecord>).clear();
+  (unknownExchangeOrderEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (unknownExchangeOrderEngine.orderManager as any).reconcilePendingOrdersOnStartup = async () => 0;
+  unknownExchangeOrderEngine.fetchRealAccountBalance = async () => true;
+  (unknownExchangeOrderEngine as any).upbitClient.getOpenOrders = async () => ({ success: true, orders: [{ uuid: 'UNKNOWN_EXCHANGE_OPEN_UUID', identifier: 'UNKNOWN_EXCHANGE_OPEN_CLIENT' }] });
+  assert(await unknownExchangeOrderEngine.reconcileOnStartup() === false, '[Startup invariant] Unknown exchange OPEN order blocks startup reconciliation');
+
   // ──────────────────────────────────────────────────────
   // TEST GROUP 22: Durable Fill Recovery / Failure Injection
   // ──────────────────────────────────────────────────────
@@ -1726,7 +1898,7 @@ async function runAllTests() {
   const durableClientOrderId = `CLIENT_DURABLE_${Date.now()}`;
   const durableEventId = `${durableClientOrderId}:1.00000000`;
   const durablePosition = new PositionManager(defaultParams);
-  assert(durablePosition.beginDurableFillEvent(durableEventId) === true, '[Durability] New fill event can start an atomic position transition');
+  assert(durablePosition.beginDurableFillEvent(durableEventId, durableClientOrderId, 1, 1350, true, 2700000) === true, '[Durability] New fill event can start an atomic position transition');
   durablePosition.onInitialEntryFilled(2700000, 1, 2700000, 10000, 2, 3);
   assert(durablePosition.completeDurableFillEvent(durableEventId) === true, '[Durability] Position transition and fill-event ID persist together');
 
@@ -1767,7 +1939,7 @@ async function runAllTests() {
   // must update only the order watermark, never call the strategy again.
   const restartedPosition = new PositionManager(defaultParams);
   const restartedOrderManager = new OrderManager();
-  restartedOrderManager.setStrategyFillDurabilityLookup((eventId) => restartedPosition.hasDurablyAppliedFillEvent(eventId));
+  restartedOrderManager.setStrategyFillDurabilityLookup((clientOrderId) => restartedPosition.getDurableFillWatermark(clientOrderId));
   const restartedOrder = restartedOrderManager.getAllOrders().find((order) => order.clientOrderId === durableClientOrderId)!;
   let replayedStrategyCalls = 0;
   restartedOrderManager.applyUpbitOrderState(
@@ -1779,6 +1951,242 @@ async function runAllTests() {
   );
   assert(restartedPosition.hasDurablyAppliedFillEvent(durableEventId), '[Durability] Restart restores the position fill-event ledger');
   assert(replayedStrategyCalls === 0 && restartedOrder.strategyAppliedFilledVolume === 1, '[Durability] Restart repairs only the watermark without replaying the position transition');
+
+  // A durable partial fill can be followed by additional exchange execution
+  // while the order watermark is unavailable. Recovery must apply only the
+  // new cumulative delta, preserving the original INITIAL transition.
+  const partialDurableClientId = `CLIENT_DURABLE_PARTIAL_${Date.now()}`;
+  const partialDurablePosition = new PositionManager(defaultParams);
+  const partialDurableEvent = `${partialDurableClientId}:0.40000000`;
+  partialDurablePosition.beginDurableFillEvent(partialDurableEvent, partialDurableClientId, 0.4, 50, true, 1080000);
+  partialDurablePosition.onInitialEntryFilled(2700000, 0.4, 2700000, 10000, 2, 3);
+  partialDurablePosition.completeDurableFillEvent(partialDurableEvent);
+  const preCrashOrderManager = new OrderManager();
+  const preCrashOrder: OrderRecord = {
+    id: `ORD_DURABLE_PARTIAL_${Date.now()}`, clientOrderId: partialDurableClientId,
+    signalId: `SIG_DURABLE_PARTIAL_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'OPEN', requestedBudgetOrVolume: 1000000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'partial durable watermark failure', fills: [],
+    strategyAppliedFilledVolume: 0, strategyAppliedFee: 0, strategyInitialFillApplied: false
+  };
+  (preCrashOrderManager as any).orders.set(preCrashOrder.id, preCrashOrder);
+  (preCrashOrderManager as any).saveOrdersToFile(); // persisted state before the failed watermark write
+  const partialRestartPosition = new PositionManager(defaultParams);
+  const partialRestartOrderManager = new OrderManager();
+  partialRestartOrderManager.setStrategyFillDurabilityLookup((clientOrderId) => partialRestartPosition.getDurableFillWatermark(clientOrderId));
+  const partialRestartOrder = partialRestartOrderManager.getAllOrders().find((order) => order.clientOrderId === partialDurableClientId)!;
+  let recoveredIncrement = 0;
+  let recoveredFee = 0;
+  let recoveredKind = '';
+  partialRestartOrderManager.setOnOrderUpdated((record, incrementalVolume) => {
+    recoveredIncrement = incrementalVolume;
+    recoveredFee = record.fee;
+    recoveredKind = record.strategyFillKind || '';
+    partialRestartPosition.beginDurableFillEvent(record.strategyFillEventId!, record.clientOrderId, record.strategyFillCumulativeVolume, record.strategyFillCumulativeFee, record.strategyFillKind === 'INITIAL', record.strategyFillCumulativeFunds);
+    partialRestartPosition.addAdditionalEntryFilled(record.avgFillPrice, incrementalVolume);
+    partialRestartPosition.completeDurableFillEvent(record.strategyFillEventId!);
+  });
+  partialRestartOrderManager.applyUpbitOrderState(
+    partialRestartOrder,
+    { ...responseA, uuid: 'mock-durable-partial-final', identifier: partialDurableClientId, paid_fee: '125', executed_volume: '1.0', volume: '1.0', remaining_volume: '0' },
+    () => {},
+    () => {},
+    'WATCHER'
+  );
+  assert(recoveredIncrement === 0.6 && recoveredKind === 'INCREMENTAL' && recoveredFee === 75, '[Durability] Partial durable watermark recovers only the 0.6 incremental volume and fee');
+  assert(partialRestartPosition.getSnapshot().amount === 1 && partialRestartOrder.strategyAppliedFilledVolume === 1 && partialRestartOrder.strategyAppliedFee === 125, '[Durability] Partial durable restart reaches final 1.0 position without INITIAL replay');
+
+  // The exchange response's avg fill price is cumulative. Strategy callbacks
+  // must instead receive the price of only this newly applied fill delta.
+  const pricePartialClientId = `CLIENT_PRICE_PARTIAL_${Date.now()}`;
+  const pricePartialOrder: OrderRecord = {
+    id: `ORD_PRICE_PARTIAL_${Date.now()}`, clientOrderId: pricePartialClientId,
+    signalId: `SIG_PRICE_PARTIAL_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'OPEN', requestedBudgetOrVolume: 2800000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'mixed-price partial fill', fills: []
+  };
+  const pricePartialOrderManager = new OrderManager();
+  const pricePartialPosition = new PositionManager(defaultParams);
+  const callbackPrices: Array<{ volume: number; price: number; kind: string }> = [];
+  pricePartialOrderManager.setOnOrderUpdated((record, incrementalVolume) => {
+    callbackPrices.push({ volume: incrementalVolume, price: record.avgFillPrice, kind: record.strategyFillKind || '' });
+    if (record.strategyFillKind === 'INITIAL') {
+      pricePartialPosition.onInitialEntryFilled(record.avgFillPrice, incrementalVolume, 2700000, 10000, 2, 3);
+    } else {
+      pricePartialPosition.addAdditionalEntryFilled(record.avgFillPrice, incrementalVolume);
+    }
+  });
+  const pricePartialFirst = {
+    ...responseA, uuid: 'mock-price-partial-first', identifier: pricePartialClientId, state: 'wait' as const,
+    volume: '1.0', remaining_volume: '0.6', executed_volume: '0.4', paid_fee: '54', trades_count: 1,
+    trades: [{ market: 'KRW-ETH', uuid: 'price-t-1', price: '2700000', volume: '0.4', funds: '1080000', created_at: new Date().toISOString(), side: 'bid' }]
+  };
+  const pricePartialFinal = {
+    ...pricePartialFirst, uuid: 'mock-price-partial-final', state: 'done' as const,
+    remaining_volume: '0', executed_volume: '1.0', paid_fee: '138', trades_count: 2,
+    trades: [
+      { market: 'KRW-ETH', uuid: 'price-t-1', price: '2700000', volume: '0.4', funds: '1080000', created_at: new Date().toISOString(), side: 'bid' },
+      { market: 'KRW-ETH', uuid: 'price-t-2', price: '2800000', volume: '0.6', funds: '1680000', created_at: new Date().toISOString(), side: 'bid' }
+    ]
+  };
+  (pricePartialOrderManager as any).orders.set(pricePartialOrder.id, pricePartialOrder);
+  pricePartialOrderManager.applyUpbitOrderState(pricePartialOrder, pricePartialFirst as any, () => {}, () => {}, 'WATCHER');
+  pricePartialOrderManager.applyUpbitOrderState(pricePartialOrder, pricePartialFinal as any, () => {}, () => {}, 'WATCHER');
+  assert(callbackPrices.length === 2 && callbackPrices[1].volume === 0.6 && callbackPrices[1].price === 2800000 && callbackPrices[1].kind === 'INCREMENTAL', '[Durability] Mixed-price partial fill delivers only 0.6 ETH at its actual ₩2.8M delta price');
+  assert(pricePartialPosition.getSnapshot().amount === 1 && pricePartialPosition.getSnapshot().entryPrice === 2760000 && pricePartialOrder.strategyAppliedFunds === 2760000, '[Durability] 0.4@₩2.7M + 0.6@₩2.8M produces the correct ₩2.76M position average and order notional watermark');
+
+  // Repeat the same mixed-price sequence across a restart boundary: the
+  // durable position watermark owns the first 0.4/₩1.08M when the order
+  // watermark was never written, so reconciliation applies only 0.6/₩1.68M.
+  const priceRestartClientId = `CLIENT_PRICE_RESTART_${Date.now()}`;
+  const priceRestartPositionBeforeCrash = new PositionManager(defaultParams);
+  const priceRestartEvent = `${priceRestartClientId}:0.40000000`;
+  priceRestartPositionBeforeCrash.beginDurableFillEvent(priceRestartEvent, priceRestartClientId, 0.4, 54, true, 1080000);
+  priceRestartPositionBeforeCrash.onInitialEntryFilled(2700000, 0.4, 2700000, 10000, 2, 3);
+  priceRestartPositionBeforeCrash.completeDurableFillEvent(priceRestartEvent);
+  const priceRestartPreCrashOrderManager = new OrderManager();
+  const priceRestartPreCrashOrder: OrderRecord = {
+    id: `ORD_PRICE_RESTART_${Date.now()}`, clientOrderId: priceRestartClientId,
+    signalId: `SIG_PRICE_RESTART_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'OPEN', requestedBudgetOrVolume: 2800000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'mixed-price durable restart', fills: [],
+    strategyAppliedFilledVolume: 0, strategyAppliedFee: 0, strategyAppliedFunds: 0, strategyInitialFillApplied: false
+  };
+  (priceRestartPreCrashOrderManager as any).orders.set(priceRestartPreCrashOrder.id, priceRestartPreCrashOrder);
+  (priceRestartPreCrashOrderManager as any).saveOrdersToFile();
+  const priceRestartPosition = new PositionManager(defaultParams);
+  const priceRestartOrderManager = new OrderManager();
+  priceRestartOrderManager.setStrategyFillDurabilityLookup((clientOrderId) => priceRestartPosition.getDurableFillWatermark(clientOrderId));
+  const priceRestartOrder = priceRestartOrderManager.getAllOrders().find((order) => order.clientOrderId === priceRestartClientId)!;
+  let restartDeltaVolume = 0;
+  let restartDeltaPrice = 0;
+  let restartDeltaKind = '';
+  priceRestartOrderManager.setOnOrderUpdated((record, incrementalVolume) => {
+    restartDeltaVolume = incrementalVolume;
+    restartDeltaPrice = record.avgFillPrice;
+    restartDeltaKind = record.strategyFillKind || '';
+    priceRestartPosition.beginDurableFillEvent(record.strategyFillEventId!, record.clientOrderId, record.strategyFillCumulativeVolume, record.strategyFillCumulativeFee, record.strategyFillKind === 'INITIAL', record.strategyFillCumulativeFunds);
+    priceRestartPosition.addAdditionalEntryFilled(record.avgFillPrice, incrementalVolume);
+    priceRestartPosition.completeDurableFillEvent(record.strategyFillEventId!);
+  });
+  priceRestartOrderManager.applyUpbitOrderState(
+    priceRestartOrder,
+    { ...pricePartialFinal, uuid: 'mock-price-restart-final', identifier: priceRestartClientId } as any,
+    () => {}, () => {}, 'WATCHER'
+  );
+  const priceRestartWatermark = priceRestartPosition.getDurableFillWatermark(priceRestartClientId);
+  assert(restartDeltaVolume === 0.6 && restartDeltaPrice === 2800000 && restartDeltaKind === 'INCREMENTAL', '[Durability] Restart recovery sends only the new 0.6 ETH at ₩2.8M, never the cumulative ₩2.76M price');
+  assert(priceRestartPosition.getSnapshot().amount === 1 && priceRestartPosition.getSnapshot().entryPrice === 2760000 && priceRestartOrder.strategyAppliedFunds === 2760000 && priceRestartWatermark?.funds === 2760000, '[Durability] Mixed-price restart recovers final 1.0 ETH at ₩2.76M with matching durable funds watermarks');
+
+  // Upgrade an old partial-order/position schema which has volume and fee
+  // watermarks but no cumulative notional. It must use authoritative trades,
+  // never silently assume zero funds (which would corrupt the next delta's
+  // average price).
+  const legacyFundsClientId = `CLIENT_LEGACY_FUNDS_${Date.now()}`;
+  const legacyFundsSeedPosition = new PositionManager(defaultParams);
+  const legacyFundsEvent = `${legacyFundsClientId}:0.40000000`;
+  legacyFundsSeedPosition.beginDurableFillEvent(legacyFundsEvent, legacyFundsClientId, 0.4, 54, true);
+  legacyFundsSeedPosition.onInitialEntryFilled(2700000, 0.4, 2700000, 10000, 2, 3);
+  legacyFundsSeedPosition.completeDurableFillEvent(legacyFundsEvent);
+  const oldSchemaPosition: any = legacyFundsSeedPosition.getSnapshot();
+  delete oldSchemaPosition.durableFillWatermarks[legacyFundsClientId].funds;
+  fs.writeFileSync(posFile, JSON.stringify(oldSchemaPosition, null, 2), 'utf-8');
+  const oldSchemaOrder: OrderRecord = {
+    id: `ORD_LEGACY_FUNDS_${Date.now()}`, clientOrderId: legacyFundsClientId,
+    signalId: `SIG_LEGACY_FUNDS_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'PARTIALLY_FILLED', requestedBudgetOrVolume: 2800000, filledVolume: 0.4, avgFillPrice: 2700000, fee: 54,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'old schema funds upgrade', fills: [],
+    strategyAppliedFilledVolume: 0.4, strategyAppliedFee: 54, strategyInitialFillApplied: true
+  };
+  fs.writeFileSync(orderFile, JSON.stringify([oldSchemaOrder], null, 2), 'utf-8');
+  const legacyFundsPosition = new PositionManager(defaultParams);
+  const legacyFundsOrderManager = new OrderManager();
+  legacyFundsOrderManager.setStrategyFillDurabilityLookup(
+    (clientOrderId) => legacyFundsPosition.getDurableFillWatermark(clientOrderId),
+    (clientOrderId, funds) => legacyFundsPosition.restoreDurableFillWatermarkFunds(clientOrderId, funds)
+  );
+  const legacyFundsOrder = legacyFundsOrderManager.getAllOrders().find((order) => order.clientOrderId === legacyFundsClientId)!;
+  let legacyDeltaPrice = 0;
+  legacyFundsOrderManager.setOnOrderUpdated((record, incrementalVolume) => {
+    legacyDeltaPrice = record.avgFillPrice;
+    legacyFundsPosition.beginDurableFillEvent(record.strategyFillEventId!, record.clientOrderId, record.strategyFillCumulativeVolume, record.strategyFillCumulativeFee, false, record.strategyFillCumulativeFunds);
+    legacyFundsPosition.addAdditionalEntryFilled(record.avgFillPrice, incrementalVolume);
+    legacyFundsPosition.completeDurableFillEvent(record.strategyFillEventId!);
+  });
+  (legacyFundsOrderManager as any).reconcileUpbitOrder = async () => ({ found: true, order: { ...pricePartialFinal, uuid: 'mock-legacy-funds-final', identifier: legacyFundsClientId } });
+  assert(await legacyFundsOrderManager.reconcilePendingOrdersOnStartup({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' }) === 1, '[Durability] Old-schema partial order upgrades its missing notional from exchange trades during startup');
+  const legacyOrderFunds = legacyFundsOrder.strategyAppliedFunds || 0;
+  const legacyPositionFunds = legacyFundsPosition.getDurableFillWatermark(legacyFundsClientId)?.funds || 0;
+  assert(Math.abs(legacyOrderFunds - 2760000) < 0.01 && Math.abs(legacyPositionFunds - 2760000) < 0.01, `[Durability] Legacy order/position funds recovery persists the reconstructed ₩2.76M cumulative notional (order=${legacyOrderFunds}, position=${legacyPositionFunds})`);
+  assert(legacyDeltaPrice === 2800000, '[Durability] Legacy funds recovery preserves the correct ₩2.8M incremental price');
+
+  const unavailableLegacyFundsManager = new OrderManager();
+  ((unavailableLegacyFundsManager as any).orders as Map<string, OrderRecord>).clear();
+  const unavailableLegacyFundsOrder: OrderRecord = {
+    ...oldSchemaOrder,
+    id: `ORD_LEGACY_NO_TRADES_${Date.now()}`,
+    clientOrderId: `CLIENT_LEGACY_NO_TRADES_${Date.now()}`,
+    strategyAppliedFunds: undefined,
+    strategyAppliedFundsRecoveryRequired: true
+  };
+  (unavailableLegacyFundsManager as any).orders.set(unavailableLegacyFundsOrder.id, unavailableLegacyFundsOrder);
+  (unavailableLegacyFundsManager as any).reconcileUpbitOrder = async () => ({ found: true, order: { ...pricePartialFinal, uuid: 'mock-legacy-no-trades', identifier: unavailableLegacyFundsOrder.clientOrderId, trades: [] } });
+  let unavailableLegacyFundsRejected = false;
+  try {
+    await unavailableLegacyFundsManager.reconcilePendingOrdersOnStartup({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  } catch {
+    unavailableLegacyFundsRejected = true;
+  }
+  assert(unavailableLegacyFundsRejected, '[Durability] Legacy applied volume without exchange trades fails closed instead of assuming zero notional');
+
+  // Watermark-only repair (no new volume to deliver) is still a durable
+  // commit. Its save failure must escape startup reconciliation and keep the
+  // engine behind the startup barrier.
+  const repairFailureOrderManager = new OrderManager();
+  ((repairFailureOrderManager as any).orders as Map<string, OrderRecord>).clear();
+  ((repairFailureOrderManager as any).watchingOrderIds as Set<string>).clear();
+  const repairFailureOrder: OrderRecord = {
+    id: `ORD_REPAIR_FAILURE_${Date.now()}`, clientOrderId: `CLIENT_REPAIR_FAILURE_${Date.now()}`,
+    signalId: `SIG_REPAIR_FAILURE_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'OPEN', requestedBudgetOrVolume: 1080000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'watermark repair write failure', fills: [],
+    strategyAppliedFilledVolume: 0, strategyAppliedFee: 0, strategyAppliedFunds: 0, strategyInitialFillApplied: false
+  };
+  (repairFailureOrderManager as any).orders.set(repairFailureOrder.id, repairFailureOrder);
+  repairFailureOrderManager.setStrategyFillDurabilityLookup(() => ({ volume: 0.4, fee: 54, funds: 1080000, initialApplied: true }));
+  let repairSaveCalls = 0;
+  const repairRealSave = (repairFailureOrderManager as any).saveOrdersToFile.bind(repairFailureOrderManager);
+  (repairFailureOrderManager as any).saveOrdersToFile = () => {
+    repairSaveCalls++;
+    if (repairSaveCalls === 2) throw new Error('injected watermark-only repair write failure');
+    return repairRealSave();
+  };
+  (repairFailureOrderManager as any).reconcileUpbitOrder = async () => ({ found: true, order: { ...pricePartialFirst, uuid: 'mock-repair-failure', identifier: repairFailureOrder.clientOrderId } });
+  let repairReconcileRejected = false;
+  try {
+    await repairFailureOrderManager.reconcilePendingOrdersOnStartup({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  } catch {
+    repairReconcileRejected = true;
+  }
+  assert(repairReconcileRejected, '[Durability] Watermark-only repair save failure is not swallowed by startup reconciliation');
+  // Recreate the same pre-repair persistent state as a fresh process would
+  // see, then make the startup barrier consume that failing reconciliation.
+  repairFailureOrder.strategyAppliedFilledVolume = 0;
+  repairFailureOrder.strategyAppliedFee = 0;
+  repairFailureOrder.strategyAppliedFunds = 0;
+  repairFailureOrder.strategyInitialFillApplied = false;
+  repairFailureOrder.status = 'OPEN';
+  repairSaveCalls = 0;
+  (repairFailureOrderManager as any).durabilityFailure = false;
+  const repairFailureEngine = new ATREngine(undefined, { backtest: true });
+  (repairFailureEngine as any).startupReady = false;
+  (repairFailureEngine as any).refreshAtrFromExchange = async () => true;
+  (repairFailureEngine as any).reconcileOnStartup = async () => {
+    await repairFailureOrderManager.reconcilePendingOrdersOnStartup({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+    return true;
+  };
+  await (repairFailureEngine as any).startStartupBarrier();
+  assert((repairFailureEngine as any).startupReady === false && repairFailureEngine.botState === 'PAUSED', '[Durability] A startup watermark repair write failure can never pass startupReady');
 
   const failingPosition = new PositionManager(defaultParams);
   const failingEventId = `CLIENT_POSITION_WRITE_FAIL_${Date.now()}:0.40000000`;

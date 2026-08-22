@@ -162,7 +162,7 @@ export default function App() {
   const [experimentScalpTrendExpansionEnabled, setExperimentScalpTrendExpansionEnabled] = useState(false);
   const [experimentScalpReentryCooldownEnabled, setExperimentScalpReentryCooldownEnabled] = useState(false);
   const [experimentTrendTrailingArmingEnabled, setExperimentTrendTrailingArmingEnabled] = useState(false);
-  const [researchStats, setResearchStats] = useState({ enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, startedAt: 0 });
+  const [researchStats, setResearchStats] = useState({ enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, totalTicksRecorded: 0, totalCandlesRecorded: 0, totalShadowDifferences: 0, startedAt: 0 });
   const [rebaseStatus, setRebaseStatus] = useState<string | null>(null);
 
   // API Credentials State (Upbit Exclusive)
@@ -228,6 +228,12 @@ export default function App() {
   const [dropSpeed, setDropSpeed] = useState<number>(0);
   const [activeRadarTab, setActiveRadarTab] = useState<'BUY' | 'SELL' | 'ALL'>('ALL');
   const [radarExpanded, setRadarExpanded] = useState<boolean>(true);
+  const [selectedRadarCondition, setSelectedRadarCondition] = useState<{
+    title: string;
+    summary: string;
+    status: string;
+    metrics: { label: string; value: string }[];
+  } | null>(null);
 
   // Price & Indicators State
   const [currentPrice, setCurrentPrice] = useState<number>(2650000.0);
@@ -806,6 +812,16 @@ export default function App() {
     ? realTotalEquity
     : (balance + positionAmount * currentPrice);
 
+  const marketSituationLabel = marketRegime === 'BULL'
+    ? '상승 국면'
+    : marketRegime === 'BEAR'
+      ? '하락 국면'
+      : adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK'
+        ? '상승 조정 국면'
+        : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE'
+          ? '하락 정체 국면'
+          : '중립 박스 국면';
+
   const totalReturnPercent = initialBalance > 0
     ? ((currentEquity - initialBalance) / initialBalance) * 100
     : 0;
@@ -1182,9 +1198,7 @@ export default function App() {
                     <div>
                       <div className="flex items-center gap-1.5">
                         <span className="text-xs font-extrabold">
-                          {marketRegime === 'BULL' && '상승 국면'}
-                          {marketRegime === 'BEAR' && '하락 국면'}
-                          {marketRegime === 'SIDEWAYS' && (adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK' ? '상승 조정 국면' : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE' ? '하락 정체 국면' : '중립 박스 국면')}
+                          {marketSituationLabel}
                         </span>
                         <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-white/20 font-bold uppercase">
                           Auto-Pilot {autoPilotEnabled ? 'ON' : 'OFF'}
@@ -1246,7 +1260,7 @@ export default function App() {
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">전략 상태 · 다음 행동</p>
-                        <p className="mt-0.5 truncate text-sm font-bold text-slate-900">{headline}</p>
+                        <p className="mt-0.5 truncate text-xs font-semibold text-slate-900">{headline}</p>
                       </div>
                       <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-bold ${
                         isCoolingDown ? 'bg-amber-100 text-amber-800' : isDefensive ? 'bg-rose-100 text-rose-700' : 'bg-indigo-100 text-indigo-700'
@@ -1257,11 +1271,11 @@ export default function App() {
                     <div className="mt-2 flex items-end justify-between gap-3 border-t border-slate-100 pt-2">
                       <div className="min-w-0">
                         <p className="text-slate-400">다음 행동</p>
-                        <p className="mt-0.5 truncate text-sm font-bold text-slate-800">{next.type}</p>
+                        <p className="mt-0.5 truncate text-xs font-semibold text-slate-800">{next.type}</p>
                         <p className="mt-0.5 truncate text-[10px] text-slate-500">{next.targetPriceLabel}</p>
                       </div>
                       <div className="shrink-0 text-right">
-                        <p className={`text-sm font-extrabold mono ${isExit ? 'text-emerald-600' : 'text-indigo-600'}`}>{formatPrice(next.budgetKrw || 0)}</p>
+                        <p className={`text-xs font-bold mono ${isExit ? 'text-emerald-600' : 'text-indigo-600'}`}>{formatPrice(next.budgetKrw || 0)}</p>
                         <p className="mt-0.5 text-[10px] text-slate-400">조건 레이더 보기 →</p>
                       </div>
                     </div>
@@ -1317,13 +1331,11 @@ export default function App() {
                     </div>
 
                     {positionAmount > 0 ? (
-                      <div className="mt-1.5">
-                        <div className="text-[15px] font-extrabold mono text-indigo-700 tracking-tight">
-                            {formatPrice(entryPrice || currentPrice)}
-                        </div>
-                        <div className="text-[10px] text-slate-500 font-medium mt-1">
-                          {positionAmount.toFixed(4)} {selectedCoin.replace('KRW-', '')}
-                        </div>
+                      <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1.5 text-[10px]">
+                        <div><p className="text-slate-400">총 매수</p><p className="mt-0.5 font-bold mono text-slate-800">{formatPrice(positionAmount * (entryPrice || currentPrice))}</p></div>
+                        <div><p className="text-slate-400">총 평가</p><p className="mt-0.5 font-bold mono text-indigo-700">{formatPrice(positionAmount * currentPrice)}</p></div>
+                        <div><p className="text-slate-400">평단가</p><p className="mt-0.5 font-bold mono text-slate-800">{formatPrice(entryPrice || currentPrice)}</p></div>
+                        <div><p className="text-slate-400">수량</p><p className="mt-0.5 font-bold mono text-slate-800">{positionAmount.toFixed(4)} {selectedCoin.replace('KRW-', '')}</p></div>
                       </div>
                     ) : (
                       <div className="mt-1">
@@ -1336,7 +1348,7 @@ export default function App() {
                   <div className={`text-[10px] font-semibold mt-2 pt-2 border-t border-slate-100 flex items-center justify-between ${
                     unrealizedPnl >= 0 ? 'text-emerald-600' : 'text-rose-600'
                   }`}>
-                    <span className="text-slate-400 font-medium">평가</span>
+                    <span className="text-slate-400 font-medium">수익률</span>
                     <span className="mono">
                       {positionAmount > 0 ? (
                         `${unrealizedPnl >= 0 ? '+' : ''}${formatPrice(unrealizedPnl)} (${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}%)`
@@ -1686,7 +1698,7 @@ export default function App() {
                         <div>
                           <p className="text-[10px] font-semibold tracking-wide text-slate-400">CONDITION RADAR</p>
                           <h2 className="mt-0.5 text-sm font-bold">지금 봐야 할 조건만</h2>
-                          <p className="mt-1 text-[11px] text-slate-300">{hasPosition ? `평가 ${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}% · ${marketRegime}` : `무포지션 · ${marketRegime}`}</p>
+                          <p className="mt-1 text-[11px] text-slate-300">{hasPosition ? `평가 ${unrealizedPnlPercent >= 0 ? '+' : ''}${unrealizedPnlPercent.toFixed(2)}% · ${marketSituationLabel}` : `무포지션 · ${marketSituationLabel}`}</p>
                         </div>
                         <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-right text-[10px] text-slate-300">
                           <span>RSI <b className="text-white">{rsiValue.toFixed(0)}</b></span>
@@ -1708,14 +1720,33 @@ export default function App() {
                       </div>
                       <div className="divide-y divide-slate-100">
                         {visibleRows.map((row) => (
-                          <div key={row.label} className="flex items-center gap-3 px-4 py-3">
+                          <button
+                            key={row.label}
+                            type="button"
+                            onClick={() => setSelectedRadarCondition({
+                              title: row.label,
+                              summary: row.detail,
+                              status: ('statusOverride' in row ? row.statusOverride : undefined) || status(row.active, row.enabled),
+                              metrics: [
+                                { label: '현재가', value: formatPrice(currentPrice) },
+                                { label: '시장 상황', value: marketSituationLabel },
+                                { label: '평단가', value: hasPosition ? formatPrice(entry) : '무포지션' },
+                                { label: '기준선', value: formatPrice(baselineValue) },
+                                { label: '하단 밴드', value: formatPrice(lowerBand) },
+                                { label: 'RSI / 거래량', value: `${rsiValue.toFixed(1)} / ${volumeMultiplier.toFixed(2)}x` },
+                                { label: '기울기', value: `${(adaptiveIndicators?.slope || 0) >= 0 ? '+' : ''}${(adaptiveIndicators?.slope || 0).toFixed(2)}%` }
+                              ]
+                            })}
+                            className="flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-slate-50 active:bg-slate-100"
+                            aria-label={`${row.label} 조건 상세 보기`}
+                          >
                             <span className={`grid h-7 w-7 place-items-center rounded-full text-xs font-bold ${row.active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{row.icon}</span>
                             <div className="min-w-0 flex-1">
                               <div className="text-xs font-semibold text-slate-800">{row.label}</div>
                               <div className="mt-0.5 truncate text-[11px] text-slate-500">{row.detail}</div>
                             </div>
                             <span className={`rounded-full border px-2 py-1 text-[10px] font-bold ${tone(row.active, row.enabled)}`}>{('statusOverride' in row ? row.statusOverride : undefined) || status(row.active, row.enabled)}</span>
-                          </div>
+                          </button>
                         ))}
                       </div>
                     </section>
@@ -2806,17 +2837,18 @@ export default function App() {
 
               <div className="grid grid-cols-3 gap-2">
                 {[
-                  ['틱 기록', researchStats.ticksRecorded],
-                  ['완결 1분봉', researchStats.candlesRecorded],
-                  ['규칙 차이', researchStats.shadowDifferences]
-                ].map(([label, value]) => (
+                  ['틱 기록', researchStats.ticksRecorded, researchStats.totalTicksRecorded],
+                  ['완결 1분봉', researchStats.candlesRecorded, researchStats.totalCandlesRecorded],
+                  ['규칙 차이', researchStats.shadowDifferences, researchStats.totalShadowDifferences]
+                ].map(([label, todayValue, totalValue]) => (
                   <div key={String(label)} className="rounded-xl border border-violet-100 bg-violet-50 p-2 text-center">
                     <div className="text-[9px] text-violet-600 font-bold">{label}</div>
-                    <div className="mono text-sm font-extrabold text-violet-900 mt-0.5">{Number(value).toLocaleString()}</div>
+                    <div className="mono text-sm font-extrabold text-violet-900 mt-0.5">{Number(todayValue).toLocaleString()}</div>
+                    <div className="mt-0.5 text-[8.5px] text-violet-500">오늘 · 전체 {Number(totalValue).toLocaleString()}</div>
                   </div>
                 ))}
               </div>
-              <p className="px-1 text-[9.5px] text-slate-500">{researchStats.enabled ? '● 수집 중 — 실제 주문 없이 기본 규칙과 각 후보의 신호 차이만 기록합니다.' : '서버 재시작 후 연구 수집기가 시작됩니다.'}</p>
+              <p className="px-1 text-[9.5px] text-slate-500">{researchStats.enabled ? '● 수집 중 — 오늘은 한국시간 기준이며, 전체는 재시작·날짜 변경 후에도 누적됩니다.' : '서버 재시작 후 연구 수집기가 시작됩니다.'}</p>
 
               <div className="bg-white p-3 rounded-2xl border border-amber-200 shadow-2xs space-y-2">
                 <div className="text-xs font-extrabold text-slate-900">포지션 안전 보정</div>
@@ -3238,6 +3270,37 @@ export default function App() {
             <span className="text-[9.5px]">내 계좌</span>
           </button>
         </nav>
+
+        {/* Condition Radar Detail Popup */}
+        {selectedRadarCondition && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4 backdrop-blur-xs animate-in fade-in duration-150" onClick={() => setSelectedRadarCondition(null)}>
+            <div className="w-full max-w-sm overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl animate-in zoom-in-95 duration-150" onClick={(event) => event.stopPropagation()}>
+              <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-5 py-4">
+                <div>
+                  <p className="text-[10px] font-bold tracking-wide text-indigo-600">CONDITION DETAIL</p>
+                  <h3 className="mt-0.5 text-sm font-bold text-slate-900">{selectedRadarCondition.title}</h3>
+                </div>
+                <button onClick={() => setSelectedRadarCondition(null)} className="grid h-7 w-7 place-items-center rounded-full bg-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-300">✕</button>
+              </div>
+              <div className="space-y-4 p-5">
+                <div className="rounded-2xl border border-indigo-100 bg-indigo-50 p-3">
+                  <p className="text-[10px] font-semibold text-indigo-600">현재 판정 · {selectedRadarCondition.status}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-700">{selectedRadarCondition.summary}</p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {selectedRadarCondition.metrics.map((metric) => (
+                    <div key={metric.label} className="rounded-xl border border-slate-100 bg-slate-50 p-2.5">
+                      <p className="text-[10px] font-medium text-slate-400">{metric.label}</p>
+                      <p className="mt-0.5 truncate text-[11px] font-bold text-slate-800 mono">{metric.value}</p>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[10px] leading-4 text-slate-400">표시는 현재 계산값입니다. 실제 주문은 거래소 체결 상태와 위험관리 승인을 다시 확인한 뒤에만 실행됩니다.</p>
+                <button onClick={() => setSelectedRadarCondition(null)} className="w-full rounded-2xl bg-indigo-600 py-3 text-xs font-bold text-white hover:bg-indigo-700">확인</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Log Detail Popup Modal */}
         {selectedLog && (

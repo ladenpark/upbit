@@ -18,6 +18,7 @@ import { OrderManager } from '../orders/orderManager';
 import { UpbitClient, UpbitCandle } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
 import { roundDownToTick } from '../utils/priceUtils';
+import crypto from 'crypto';
 import { ResearchRecorder, ResearchDecision } from '../research/researchRecorder';
 import { DCA2_RECOVERY_PREBUY_FRACTION, FIXED_DCA_DROP_PERCENTS, FIXED_DCA_UNIT_SCALES } from './strategyRuleConstants';
 
@@ -109,6 +110,8 @@ export class ATREngine {
   private startupFailureReason: string | null = null;
   private startupGeneration = 0;
   private accountContextGeneration = 0;
+  private lastExchangeCoinQuantity = 0;
+  private rebaseRequired = false;
 
   private captureAsyncContext() {
     return {
@@ -124,6 +127,30 @@ export class ATREngine {
       context.accountContextGeneration === this.accountContextGeneration;
   }
 
+  private accountFingerprint(keys: ApiKeys): string | null {
+    if (!keys.upbitAccessKey || !keys.upbitSecretKey) return null;
+    return crypto.createHash('sha256').update(`${keys.upbitAccessKey}:${keys.upbitSecretKey}`).digest('hex');
+  }
+
+  private assertOrBindAccountFingerprint(keys: ApiKeys) {
+    const fingerprint = this.accountFingerprint(keys);
+    if (!fingerprint) return;
+    const position = this.positionManager.getSnapshot();
+    const persisted = position.accountFingerprint;
+    if (persisted && persisted !== fingerprint) {
+      throw new Error('저장된 포지션/주문 원장이 현재 API 계좌와 다릅니다. 수동 복구가 필요합니다.');
+    }
+    if (!persisted) {
+      // A truly fresh FLAT account has no position file by design. Do not
+      // create one merely to store an account fingerprint.
+      if (!this.positionManager.hasPersistedState()) return;
+      // One-time migration for legacy ledgers predating account fingerprints.
+      // Subsequent restarts are strictly compared; callers with a legacy
+      // position should verify their configured account before this upgrade.
+      this.positionManager.setAccountFingerprint(fingerprint);
+    }
+  }
+
   constructor(broadcastCallback?: (payload: any) => void, options: { backtest?: boolean } = {}) {
     this.broadcastCallback = broadcastCallback;
     this.secretManager = SecretManager.getInstance();
@@ -135,7 +162,28 @@ export class ATREngine {
 
     this.strategyCore = new ATRStrategyCore();
     this.riskGovernor = new GlobalRiskGovernor(this.params);
+    this.riskGovernor.setPersistenceFailureHandler((error) => {
+      this.durabilityFailure = true;
+      this.params.isBotActive = false;
+      this.botState = 'HALTED';
+      this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `🚨 [위험 원장 안전 정지] ${error instanceof Error ? error.message : String(error)}` });
+      this.notifyClients();
+    });
     this.positionManager = new PositionManager(this.params);
+    const restoredPosition = this.positionManager.getSnapshot();
+    if (
+      this.positionManager.hasPersistedState() &&
+      restoredPosition.amount > 1e-8 &&
+      restoredPosition.symbol !== this.params.symbol
+    ) {
+      // A persisted open position owns exactly one asset. On restart its
+      // symbol is authoritative; using the default/UI symbol here could
+      // reconcile BTC state with ETH balances before any user action.
+      console.warn(`[ATREngine] Bootstrapping active symbol from persisted position: ${this.params.symbol} → ${restoredPosition.symbol}`);
+      this.params = { ...this.params, symbol: restoredPosition.symbol };
+      this.riskGovernor.setParams(this.params);
+      this.positionManager.setParams(this.params);
+    }
     this.orderManager = new OrderManager(
       this.riskGovernor,
       (record, incrementalFilledVolume) => {
@@ -150,7 +198,10 @@ export class ATREngine {
     // this guard before any previous async watcher response can commit.
     const initialWatcherContext = this.captureAsyncContext();
     this.orderManager.setWatcherContextGuard(() => this.isAsyncContextCurrent(initialWatcherContext));
-    this.orderManager.setStrategyFillDurabilityLookup((eventId) => this.positionManager.hasDurablyAppliedFillEvent(eventId));
+    this.orderManager.setStrategyFillDurabilityLookup(
+      (clientOrderId) => this.positionManager.getDurableFillWatermark(clientOrderId),
+      (clientOrderId, funds) => this.positionManager.restoreDurableFillWatermarkFunds(clientOrderId, funds)
+    );
     this.orderManager.setDurabilityFailureHandler(() => {
       this.durabilityFailure = true;
       this.botState = 'HALTED';
@@ -251,11 +302,18 @@ export class ATREngine {
     this.notifyClients();
     this.startupPromise = (async () => {
       try {
+        const orderLoadFailure = this.orderManager.getPersistenceLoadFailure();
+        const positionLoadFailure = this.positionManager.getPersistenceLoadFailure();
+        const riskLoadFailure = this.riskGovernor.getPersistenceFailure();
+        if (orderLoadFailure || positionLoadFailure || riskLoadFailure) {
+          throw new Error(`로컬 거래 상태를 안전하게 읽지 못했습니다: ${(orderLoadFailure || positionLoadFailure || riskLoadFailure)!.message}`);
+        }
         const indicatorsReady = await this.refreshAtrFromExchange();
         if (!indicatorsReady) throw new Error('완성된 1분/15분 캔들로 지표를 준비하지 못했습니다.');
 
         const reconciled = await this.reconcileOnStartup();
         if (!reconciled) throw new Error('거래소 주문 또는 잔고 동기화에 실패했습니다.');
+        if (this.rebaseRequired) throw new Error('거래소 잔고가 로컬 체결 원장과 다릅니다. 포지션 보정이 필요합니다.');
 
         if (generation !== this.startupGeneration) return;
         this.startupReady = true;
@@ -268,7 +326,7 @@ export class ATREngine {
         this.startupFailureReason = e.message || 'startup synchronization failed';
         // Fail closed: a bot cannot become RUNNING from incomplete startup data.
         this.params.isBotActive = false;
-        this.botState = 'PAUSED';
+        this.botState = this.durabilityFailure ? 'HALTED' : 'PAUSED';
         this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `⚠️ [시작 장벽 유지] ${this.startupFailureReason} — 자동 주문 차단` });
       } finally {
         if (generation === this.startupGeneration) {
@@ -315,6 +373,12 @@ export class ATREngine {
     const context = this.captureAsyncContext();
     const symbol = context.symbol;
     try {
+      const orderLoadFailure = this.orderManager.getPersistenceLoadFailure();
+      const positionLoadFailure = this.positionManager.getPersistenceLoadFailure();
+      const riskLoadFailure = this.riskGovernor.getPersistenceFailure();
+      if (orderLoadFailure || positionLoadFailure || riskLoadFailure) {
+        throw new Error(`Local trading state could not be loaded safely: ${(orderLoadFailure || positionLoadFailure || riskLoadFailure)!.message}`);
+      }
       const keys = this.secretManager.getKeys();
       if (keys.upbitAccessKey && keys.upbitSecretKey) {
         // 1. Reconcile Pending Orders from disk against Upbit Exchange
@@ -338,11 +402,26 @@ export class ATREngine {
         // 2. Sync Real Account Balances
         const balanceSynced = await this.fetchRealAccountBalance();
         if (!this.isAsyncContextCurrent(context) || !balanceSynced) return false;
+        if (!this.positionManager.hasPersistedState() && this.lastExchangeCoinQuantity > 1e-8) {
+          throw new Error('거래소 보유 포지션은 있으나 로컬 position_state.json이 없습니다. 봇을 정지한 채 포지션 보정을 실행해야 합니다.');
+        }
+        this.assertOrBindAccountFingerprint(keys);
 
         // 3. Query Open Orders on Exchange
         const openRes = await this.upbitClient.getOpenOrders(keys.upbitAccessKey, keys.upbitSecretKey, symbol);
         if (!this.isAsyncContextCurrent(context)) return false;
         if (!openRes.success || !Array.isArray(openRes.orders)) return false;
+        const knownPendingOrders = this.orderManager.getPendingOrders();
+        const knownExchangeOrderIds = new Set(knownPendingOrders.map((order) => order.exchangeOrderId).filter(Boolean));
+        const knownClientOrderIds = new Set(knownPendingOrders.map((order) => order.clientOrderId));
+        const unknownExchangeOrders = openRes.orders.filter((order: any) =>
+          !knownExchangeOrderIds.has(order.uuid) &&
+          !knownClientOrderIds.has(order.identifier)
+        );
+        if (unknownExchangeOrders.length > 0) {
+          console.error(`[ATREngine] Startup blocked: ${unknownExchangeOrders.length} exchange open order(s) are absent from the local ledger.`);
+          return false;
+        }
         console.log(`[ATREngine] 📋 Exchange active open orders: ${openRes.orders.length}`);
 
         // 4. Position reconciled automatically via fetchRealAccountBalance
@@ -366,6 +445,9 @@ export class ATREngine {
   /** Seeds the chart only with completed exchange candles; never synthetic data. */
   private seedPriceHistoryFromCompletedCandles(candles: UpbitCandle[], baseline: number, atr: number) {
     const effectiveAtr = Math.max(atr, 5000);
+    // When holding a position the chart must show the actual persisted fixed
+    // stop, never an obsolete ATR-derived historical proxy.
+    const persistedStop = this.positionManager.getSnapshot().initialStopPrice;
     this.priceHistory = candles.slice(-40).map((candle) => {
       const date = new Date(candle.timestamp);
       const timeLabel = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
@@ -376,7 +458,7 @@ export class ATREngine {
         baseline,
         upperBand: baseline + (effectiveAtr * this.params.atrMultiplier),
         lowerBand: baseline - (effectiveAtr * this.params.atrMultiplier),
-        stopLoss: baseline - (effectiveAtr * (this.params.atrMultiplier + this.params.stopLossMultiplier))
+        stopLoss: persistedStop || baseline - (effectiveAtr * (this.params.atrMultiplier + this.params.stopLossMultiplier))
       };
     });
   }
@@ -444,6 +526,14 @@ export class ATREngine {
   public async handleMarketTick(price: number, timestamp: number) {
     this.currentPrice = price;
     this.researchRecorder?.recordTick(this.params.symbol, price, timestamp);
+
+    // A durability halt may still update the dashboard price, but it must not
+    // arm trailing/re-entry state or mutate the PositionManager before a
+    // restart and authoritative reconciliation.
+    if (this.durabilityFailure || this.botState === 'HALTED' && !this.riskGovernor.getDailyLossStatus().circuitBroken) {
+      this.notifyClients();
+      return;
+    }
 
     // Ticks are retained by MarketDataManager while startup runs, but no
     // indicator evaluation, protective-state mutation, signal or order can
@@ -541,7 +631,7 @@ export class ATREngine {
     }
 
     // 1. Generate Strategy Signals (evaluateAdaptiveParams is called again inside with identical inputs — same result)
-    const position = this.positionManager.getSnapshot();
+    let position = this.positionManager.getSnapshot();
     const candidateSignals = this.strategyCore.generateSignals(
       price,
       this.baselineValue,
@@ -567,6 +657,25 @@ export class ATREngine {
       // Sort by priority ascending (1 = Absolute Stop Loss, 2 = Emergency Cut, etc.)
       candidateSignals.sort((a, b) => a.priority - b.priority);
       const topSignal = candidateSignals[0];
+
+      // A full protective exit owns the symbol exclusively. First cancel and
+      // reconcile any BUY or lower-priority SELL, then refresh the account so
+      // the market exit is sized from currently unlocked exchange quantity.
+      if (!this.params.dryRunMode && (topSignal.type === 'ABSOLUTE_STOP_EXIT' || topSignal.type === 'EMERGENCY_FULL_EXIT')) {
+        try {
+          await this.orderManager.cancelPendingOrdersForProtectiveExit(this.secretManager.getKeys(), this.params.symbol);
+          const synchronized = await this.fetchRealAccountBalance();
+          if (!synchronized) throw new Error('Could not refresh exchange balance after protective-order cancellation.');
+          position = this.positionManager.getSnapshot();
+        } catch (e: any) {
+          this.durabilityFailure = true;
+          this.params.isBotActive = false;
+          this.botState = 'HALTED';
+          this.addLog({ type: 'SYSTEM', price, reason: `🚨 [보호청산 안전 정지] ${e.message}` });
+          this.notifyClients();
+          return;
+        }
+      }
 
       const riskResult = this.riskGovernor.evaluateSignal(
         topSignal,
@@ -683,7 +792,14 @@ export class ATREngine {
     // Persist the position mutation and its fill-event identity together. If
     // the order watermark write fails afterwards, restart recovery advances
     // only the watermark and never applies this position transition twice.
-    if (!this.positionManager.beginDurableFillEvent(fillEventId)) return;
+    if (!this.positionManager.beginDurableFillEvent(
+      fillEventId,
+      record.clientOrderId,
+      record.strategyFillCumulativeVolume,
+      record.strategyFillCumulativeFee,
+      record.strategyFillKind === 'INITIAL',
+      record.strategyFillCumulativeFunds
+    )) return;
     try {
       this.applyOrderFillToPosition(signalType, record, tickPrice, overrideVolume);
     } finally {
@@ -1093,8 +1209,11 @@ export class ATREngine {
     if (side !== 'BUY' && side !== 'SELL') {
       throw new Error('Unsupported manual order side.');
     }
-    if (this.botState === 'HALTED' || this.riskGovernor.getDailyLossStatus().circuitBroken) {
-      throw new Error('Manual order blocked: circuit breaker is active.');
+    const circuitBroken = this.riskGovernor.getDailyLossStatus().circuitBroken;
+    // A daily-loss halt blocks new risk, not the user's ability to flatten.
+    // A durability halt remains terminal: we cannot safely mutate local state.
+    if ((this.botState === 'HALTED' && !circuitBroken) || (circuitBroken && side === 'BUY')) {
+      throw new Error('Manual buy blocked: circuit breaker or durability halt is active. Emergency sell remains available only for the daily-loss circuit breaker.');
     }
     if (!this.startupReady) {
       throw new Error('Manual order blocked: startup synchronization is incomplete.');
@@ -1141,6 +1260,7 @@ export class ATREngine {
       const req = {
         clientOrderId: `ORD_MANUAL_${signalType}_${Date.now()}`,
         signalId: `SIG_MANUAL_${Date.now()}`,
+        signalType: signalType as 'MANUAL_ADD_BUY' | 'ENTRY_BUY',
         symbol: this.params.symbol,
         side: 'BUY' as const,
         requestedAmountKrw: budget,
@@ -1163,6 +1283,7 @@ export class ATREngine {
       const req = {
         clientOrderId: `ORD_MANUAL_SELL_${Date.now()}`,
         signalId: `SIG_MANUAL_${Date.now()}`,
+        signalType: 'EMERGENCY_FULL_EXIT' as const,
         symbol: this.params.symbol,
         side: 'SELL' as const,
         requestedVolume: position.amount,
@@ -1182,7 +1303,7 @@ export class ATREngine {
   /**
    * Authoritative balance fetch & reconciliation with exchange
    */
-  public async fetchRealAccountBalance(): Promise<boolean> {
+  public async fetchRealAccountBalance(allowMissingPositionStateRecovery = false): Promise<boolean> {
     const context = this.captureAsyncContext();
     const symbol = context.symbol;
     try {
@@ -1206,8 +1327,25 @@ export class ATREngine {
           if (!this.isAsyncContextCurrent(context)) return false;
           this.realBalances = balances;
           this.actualKrwBalance = krw;
-          // Reconcile position state with actual coin quantity and exchange authoritative avg buy price
-          this.positionManager.reconcileWithExchange(realCoinQty, authoritativeAvgPrice, this.currentPrice);
+          this.lastExchangeCoinQuantity = realCoinQty;
+          // A missing local position ledger cannot safely be recreated from
+          // amount/average alone: DCA, trailing, cooldown and durable fill
+          // state would be invented. Only explicit manual rebase may adopt it.
+          const local = this.positionManager.getSnapshot();
+          const quantityMismatch = Math.abs(local.amount - realCoinQty) > 1e-8;
+          const averageMismatch = realCoinQty > 1e-8 && Boolean(authoritativeAvgPrice && Math.abs((local.entryPrice || 0) - authoritativeAvgPrice) > 1);
+          if (!allowMissingPositionStateRecovery && this.positionManager.hasPersistedState() && (quantityMismatch || averageMismatch)) {
+            // An external transfer/manual trade cannot safely inherit DCA,
+            // trailing and durable-fill state. Preserve the local ledger and
+            // require the explicit paused rebase path instead of guessing.
+            this.rebaseRequired = true;
+            this.params.isBotActive = false;
+            this.botState = 'PAUSED';
+            this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '⚠️ [포지션 보정 필요] 거래소 수량 또는 평단이 로컬 체결 원장과 다릅니다. 자동 전략을 정지했습니다.' });
+          } else if (this.positionManager.hasPersistedState() || realCoinQty <= 1e-8 || allowMissingPositionStateRecovery) {
+            this.positionManager.reconcileWithExchange(realCoinQty, authoritativeAvgPrice, this.currentPrice);
+            if (allowMissingPositionStateRecovery) this.rebaseRequired = false;
+          }
 
           if (this.initialBalance === 0 && (krw > 0 || realCoinQty > 0)) {
             this.initialBalance = krw + (realCoinQty * this.currentPrice);
@@ -1231,8 +1369,22 @@ export class ATREngine {
     if (this.orderManager.getPendingOrdersCount() > 0) {
       throw new Error('미체결 주문이 있어 포지션 보정을 실행할 수 없습니다.');
     }
-    await this.refreshAtrFromExchange();
-    const synchronized = await this.fetchRealAccountBalance();
+    const indicatorsReady = await this.refreshAtrFromExchange();
+    if (!indicatorsReady) {
+      throw new Error('완성된 1분/15분 지표를 준비하지 못해 포지션 보정을 중단했습니다.');
+    }
+    const keys = this.secretManager.getKeys();
+    if (!keys.upbitAccessKey || !keys.upbitSecretKey) {
+      throw new Error('거래소 API 키가 없어 포지션 보정을 실행할 수 없습니다.');
+    }
+    const openOrders = await this.upbitClient.getOpenOrders(keys.upbitAccessKey, keys.upbitSecretKey, this.params.symbol);
+    if (!openOrders.success || !Array.isArray(openOrders.orders)) {
+      throw new Error('거래소 미체결 주문을 확인하지 못해 포지션 보정을 중단했습니다.');
+    }
+    if (openOrders.orders.length > 0) {
+      throw new Error('거래소 미체결 주문이 있어 포지션 보정을 실행할 수 없습니다. 먼저 주문을 정리하세요.');
+    }
+    const synchronized = await this.fetchRealAccountBalance(true);
     if (!synchronized) {
       throw new Error('거래소 잔고 동기화에 실패해 포지션 보정을 중단했습니다.');
     }
@@ -1249,6 +1401,7 @@ export class ATREngine {
     this.positionManager.rebaseReconciledPosition(
       this.baselineValue, this.atrValue, atrMultiplier, this.params.stopLossMultiplier
     );
+    this.rebaseRequired = false;
     const repaired = this.positionManager.getSnapshot();
     this.addLog({
       type: 'SYSTEM',
@@ -1264,6 +1417,15 @@ export class ATREngine {
 
     if (newParams.isBotActive === true && this.durabilityFailure) {
       throw new Error('저장 안전 정지 상태입니다. 서버를 재시작하고 거래소 동기화가 완료되기 전에는 봇을 다시 가동할 수 없습니다.');
+    }
+    if (newParams.isBotActive === true && this.riskGovernor.getDailyLossStatus().circuitBroken) {
+      throw new Error('당일 손실 서킷 브레이커가 활성화되어 있습니다. 신규 매수는 다음 KST 일자 초기화 전까지 재개할 수 없습니다. 보호 매도만 허용됩니다.');
+    }
+    if (newParams.dryRunMode !== undefined && newParams.dryRunMode !== this.params.dryRunMode) {
+      const position = this.positionManager.getSnapshot();
+      if (this.botState !== 'PAUSED' || position.state !== 'FLAT' || this.orderManager.getPendingOrdersCount() > 0) {
+        throw new Error('Dry-run 전환은 봇 정지(PAUSED)·무포지션(FLAT)·미체결 주문 0건일 때만 가능합니다.');
+      }
     }
 
     // PositionManager models exactly one asset. Switching its market while a
@@ -1304,6 +1466,10 @@ export class ATREngine {
   }
 
   public setApiKeys(keys: ApiKeys) {
+    const position = this.positionManager.getSnapshot();
+    if (position.state !== 'FLAT' || this.orderManager.getPendingOrdersCount() > 0) {
+      throw new Error('보유 포지션 또는 미체결 주문이 있어 API 키/계좌를 변경할 수 없습니다. 전량 청산 및 주문 정리 후 다시 시도하세요.');
+    }
     this.secretManager.saveKeys(keys);
     this.orderManager.setApiKeysForWatcher(keys);
     // A key change can mean a different account. Reconcile orders and balance
@@ -1674,7 +1840,8 @@ export class ATREngine {
       botState: this.botState,
       startup: {
         ready: this.startupReady,
-        failureReason: this.startupFailureReason
+        failureReason: this.startupFailureReason,
+        rebaseRequired: this.rebaseRequired
       },
       marketState: this.marketManager ? this.marketManager.marketState : 'DISCONNECTED',
       marketRegime: this.marketRegime,
@@ -1683,7 +1850,7 @@ export class ATREngine {
       rsi: this.rsiValue,
       volumeMultiplier: this.volumeMultiplier,
       volumeMa: this.volumeMa,
-      research: this.researchRecorder?.getStats() || { enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, startedAt: 0 },
+      research: this.researchRecorder?.getStats() || { enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, totalTicksRecorded: 0, totalCandlesRecorded: 0, totalShadowDifferences: 0, startedAt: 0 },
       currentPrice: this.currentPrice,
       atrValue: this.atrValue,
       baselineValue: this.baselineValue,

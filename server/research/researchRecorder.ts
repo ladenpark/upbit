@@ -12,9 +12,14 @@ export interface ResearchDecision {
 
 export interface ResearchStats {
   enabled: boolean;
+  /** Today (KST) only. */
   ticksRecorded: number;
   candlesRecorded: number;
   shadowDifferences: number;
+  /** Append-only archive totals, retained across KST date changes/restarts. */
+  totalTicksRecorded: number;
+  totalCandlesRecorded: number;
+  totalShadowDifferences: number;
   startedAt: number;
 }
 
@@ -34,6 +39,9 @@ export class ResearchRecorder {
     ticksRecorded: 0,
     candlesRecorded: 0,
     shadowDifferences: 0,
+    totalTicksRecorded: 0,
+    totalCandlesRecorded: 0,
+    totalShadowDifferences: 0,
     startedAt: Date.now()
   };
 
@@ -54,15 +62,61 @@ export class ResearchRecorder {
     }
   }
 
+  private listResearchFiles(kind: 'ticks' | 'candles' | 'shadow'): string[] {
+    const directory = path.join(RESEARCH_DIR, kind);
+    try {
+      return fs.readdirSync(directory)
+        .filter((name) => name.endsWith('.ndjson'))
+        .map((name) => path.join(directory, name));
+    } catch {
+      return [];
+    }
+  }
+
+  private candleTimestampsFromFile(filePath: string): number[] {
+    try {
+      return fs.readFileSync(filePath, 'utf-8').split('\n').flatMap((line) => {
+        try {
+          const timestamp = JSON.parse(line).timestamp;
+          return typeof timestamp === 'number' && Number.isFinite(timestamp) ? [timestamp] : [];
+        } catch {
+          return [];
+        }
+      });
+    } catch {
+      return [];
+    }
+  }
+
   private initCountsFromDisk() {
     const today = this.dateKey(Date.now());
     this.stats.ticksRecorded = this.countLines(path.join(RESEARCH_DIR, 'ticks', `${today}.ndjson`));
-    this.stats.candlesRecorded = this.countLines(path.join(RESEARCH_DIR, 'candles', `${today}.ndjson`));
+    const candleFiles = this.listResearchFiles('candles');
+    const allCandleTimestamps = new Set<number>();
+    const todayCandleTimestamps = new Set<number>();
+    for (const file of candleFiles) {
+      for (const timestamp of this.candleTimestampsFromFile(file)) {
+        allCandleTimestamps.add(timestamp);
+        if (this.dateKey(timestamp) === today) todayCandleTimestamps.add(timestamp);
+      }
+    }
+    // Preload existing timestamps so a process restart cannot append the same
+    // completed candle again when the exchange returns its recent lookback.
+    this.recordedCandleTimes = allCandleTimestamps;
+    this.stats.candlesRecorded = todayCandleTimestamps.size;
     this.stats.shadowDifferences = this.countLines(path.join(RESEARCH_DIR, 'shadow', `${today}.ndjson`));
+    this.stats.totalTicksRecorded = this.listResearchFiles('ticks').reduce((total, file) => total + this.countLines(file), 0);
+    this.stats.totalCandlesRecorded = allCandleTimestamps.size;
+    this.stats.totalShadowDifferences = this.listResearchFiles('shadow').reduce((total, file) => total + this.countLines(file), 0);
   }
 
   private dateKey(timestamp: number) {
-    return new Date(timestamp).toISOString().slice(0, 10);
+    // All user-facing research days are Korea Standard Time, not UTC.
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(new Date(timestamp));
+    const value = (type: string) => parts.find((part) => part.type === type)?.value;
+    return `${value('year')}-${value('month')}-${value('day')}`;
   }
 
   private append(kind: 'ticks' | 'candles' | 'shadow', timestamp: number, value: Record<string, unknown>) {
@@ -77,7 +131,8 @@ export class ResearchRecorder {
     this.lastTickPrice = price;
     this.lastTickTimestamp = timestamp;
     this.append('ticks', timestamp, { timestamp, symbol, price });
-    this.stats.ticksRecorded++;
+    if (this.dateKey(timestamp) === this.dateKey(Date.now())) this.stats.ticksRecorded++;
+    this.stats.totalTicksRecorded++;
   }
 
   /** Only completed candles are persisted; the current forming candle is excluded by the caller. */
@@ -99,7 +154,8 @@ export class ResearchRecorder {
         closePrice: candle.trade_price,
         volume: candle.candle_acc_trade_volume
       });
-      this.stats.candlesRecorded++;
+      if (this.dateKey(candle.timestamp) === this.dateKey(Date.now())) this.stats.candlesRecorded++;
+      this.stats.totalCandlesRecorded++;
     }
   }
 
@@ -119,7 +175,8 @@ export class ResearchRecorder {
     this.lastShadowSignature = signature;
     this.lastShadowTimestamp = timestamp;
     this.append('shadow', timestamp, { timestamp, symbol, price, indicators, decisions });
-    this.stats.shadowDifferences++;
+    if (this.dateKey(timestamp) === this.dateKey(Date.now())) this.stats.shadowDifferences++;
+    this.stats.totalShadowDifferences++;
   }
 
   public getStats(): ResearchStats {

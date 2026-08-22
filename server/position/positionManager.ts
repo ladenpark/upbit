@@ -7,11 +7,21 @@ const TRADE_LOGS_FILE = path.join(DATA_DIR, 'trade_logs.json');
 
 const POSITION_FILE = path.join(DATA_DIR, 'position_state.json');
 
+const POSITION_STATES = new Set<PositionState>([
+  'FLAT', 'ENTRY_PENDING', 'ENTRY_FILLED', 'DCA_MODE', 'DEFENSIVE', 'DEFENSIVE_1', 'DEFENSIVE_2',
+  'EMERGENCY_EXIT', 'COOLDOWN', 'REENTRY_WAIT', 'REENTRY_ALLOWED', 'REENTRY_PENDING', 'TAKE_PROFIT',
+  'CLOSED', 'ERROR', 'HALTED'
+]);
+const DCA_SLOT_STATUSES = new Set(['AVAILABLE', 'RESERVED', 'ORDER_PENDING', 'PARTIALLY_FILLED', 'FILLED', 'DISABLED']);
+
 export class PositionManager {
   private position: PositionSnapshot;
   private params: BotParams;
   private activeFillEventId: string | null = null;
   private activeFillDirty = false;
+  private activeFillWatermark: { clientOrderId: string; volume: number; fee: number; funds: number; initialApplied: boolean } | null = null;
+  private persistenceLoadFailure: Error | null = null;
+  private persistedStateFound = false;
 
   constructor(params: BotParams) {
     this.params = params;
@@ -76,6 +86,7 @@ export class PositionManager {
       lastRegimeRebalanceAt: 0,
       recycleCycleCount: 0,
       appliedFillEventIds: [],
+      durableFillWatermarks: {},
       cooldownUntil: 0
     };
   }
@@ -84,8 +95,30 @@ export class PositionManager {
     return {
       ...this.position,
       dcaSlots: this.position.dcaSlots.map((s) => ({ ...s })),
-      appliedFillEventIds: [...(this.position.appliedFillEventIds || [])]
+      appliedFillEventIds: [...(this.position.appliedFillEventIds || [])],
+      durableFillWatermarks: { ...(this.position.durableFillWatermarks || {}) }
     };
+  }
+
+  public setAccountFingerprint(fingerprint: string) {
+    if (this.position.accountFingerprint === fingerprint) return;
+    this.position.accountFingerprint = fingerprint;
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+  }
+
+  /** A default FLAT snapshot must not mask an unreadable persisted position. */
+  public hasPersistenceLoadFailure(): boolean {
+    return this.persistenceLoadFailure !== null;
+  }
+
+  public getPersistenceLoadFailure(): Error | null {
+    return this.persistenceLoadFailure;
+  }
+
+  /** True only when a valid position_state.json existed when this process started. */
+  public hasPersistedState(): boolean {
+    return this.persistedStateFound;
   }
 
   /**
@@ -93,10 +126,18 @@ export class PositionManager {
    * The marker and changed position are stored in the same atomic rename, so
    * a later order-ledger write failure can be recovered without replaying it.
    */
-  public beginDurableFillEvent(eventId: string): boolean {
-    if ((this.position.appliedFillEventIds || []).includes(eventId)) return false;
+  public beginDurableFillEvent(eventId: string, clientOrderId?: string, cumulativeVolume?: number, cumulativeFee?: number, initialApplied = true, cumulativeFunds?: number): boolean {
+    const existing = clientOrderId ? this.getDurableFillWatermark(clientOrderId) : undefined;
+    if ((this.position.appliedFillEventIds || []).includes(eventId) || (existing && (cumulativeVolume || 0) <= existing.volume)) return false;
     this.activeFillEventId = eventId;
     this.activeFillDirty = false;
+    this.activeFillWatermark = clientOrderId ? {
+      clientOrderId,
+      volume: Number((cumulativeVolume || 0).toFixed(8)),
+      fee: Number((cumulativeFee || 0).toFixed(8)),
+      funds: Number((cumulativeFunds || 0).toFixed(8)),
+      initialApplied
+    } : null;
     return true;
   }
 
@@ -104,6 +145,7 @@ export class PositionManager {
     if (this.activeFillEventId !== eventId || !this.activeFillDirty) {
       this.activeFillEventId = null;
       this.activeFillDirty = false;
+      this.activeFillWatermark = null;
       return false;
     }
     try {
@@ -116,6 +158,7 @@ export class PositionManager {
     } finally {
       this.activeFillEventId = null;
       this.activeFillDirty = false;
+      this.activeFillWatermark = null;
     }
   }
 
@@ -123,7 +166,38 @@ export class PositionManager {
     return (this.position.appliedFillEventIds || []).includes(eventId);
   }
 
+  public getDurableFillWatermark(clientOrderId: string) {
+    return this.position.durableFillWatermarks?.[clientOrderId];
+  }
+
+  /**
+   * Upgrades a legacy durable watermark once OrderManager has reconstructed
+   * its cumulative notional from authoritative exchange trades. This is a
+   * standalone atomic commit: without that notional a later delta price
+   * cannot be calculated safely.
+   */
+  public restoreDurableFillWatermarkFunds(clientOrderId: string, funds: number): void {
+    const watermark = this.position.durableFillWatermarks?.[clientOrderId];
+    if (!watermark || watermark.volume <= 0 || Number.isFinite(watermark.funds)) return;
+    this.position.durableFillWatermarks = {
+      ...(this.position.durableFillWatermarks || {}),
+      [clientOrderId]: { ...watermark, funds: Number(funds.toFixed(8)) }
+    };
+    this.commitStateToFile();
+  }
+
   public setParams(newParams: BotParams) {
+    if (this.position.symbol !== newParams.symbol) {
+      // ATREngine rejects symbol changes while a position is open. Keep this
+      // defensive check here as well because PositionManager owns a single
+      // asset state machine and must never silently relabel an open asset.
+      if (this.position.state !== 'FLAT') {
+        throw new Error('Cannot change PositionManager symbol while a position is open.');
+      }
+      this.position.symbol = newParams.symbol;
+      this.position.lastUpdatedAt = Date.now();
+      this.saveStateToFile();
+    }
     this.params = newParams;
     this.syncDcaSlotsCapacity(newParams.maxSafetyOrders);
   }
@@ -152,13 +226,10 @@ export class PositionManager {
     stopLossMultiplier: number
   ) {
     const lowerBand = baseline - (atr * atrMultiplier);
-    const dynamicStopLossPrice = lowerBand - (atr * stopLossMultiplier);
-    // Absolute Stop-Loss Floor: 마지노선 손절선 -6.0% (중간 단계는 -1.0% 30% 덜어내기, -2.0% DCA 1차, -3.2% 50% 덜어내기, -4.5% DCA 2차로 방어)
-    const MIN_STOP_LOSS_DROP_PERCENT = 6.0;
-    const floorStopLossPrice = fillPrice * (1 - MIN_STOP_LOSS_DROP_PERCENT / 100);
-    // The absolute floor is a maximum permitted loss, so never select a
-    // stop below it when ATR expands.
-    const staticStopLossPrice = Math.max(dynamicStopLossPrice, floorStopLossPrice);
+    // Absolute stop is deliberately independent from the dynamic ATR band.
+    // It is the fixed final guard of this position cycle, leaving the
+    // -1/-2/-3.2/-4.2/-5.5% defensive and DCA stages room to operate.
+    const staticStopLossPrice = fillPrice * 0.94;
 
     this.position.id = `POS_${Date.now()}`;
     this.position.state = 'ENTRY_FILLED';
@@ -230,8 +301,6 @@ export class PositionManager {
     const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
     const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
     const lowerBand = baseline - (atr * atrMultiplier);
-    const dynamicStopLossPrice = lowerBand - (atr * stopLossMultiplier);
-    const floorStopLossPrice = newWeightedAvgPrice * 0.94;
 
     this.position.state = 'ENTRY_FILLED';
     this.position.amount = newTotalQty;
@@ -239,7 +308,9 @@ export class PositionManager {
     this.position.positionEntryAtr = atr;
     this.position.initialBaseline = baseline;
     this.position.initialBand = lowerBand;
-    this.position.initialStopPrice = Number((Math.max(dynamicStopLossPrice, floorStopLossPrice)).toFixed(2));
+    // A manual add explicitly re-bases the position, but its new final stop
+    // remains a fixed -6% of that rebased average—not an ATR-derived value.
+    this.position.initialStopPrice = Number((newWeightedAvgPrice * 0.94).toFixed(2));
     this.position.totalCostKrw += fillPrice * fillVolume;
     this.position.partialCutCount = 0;
     this.position.trailingActive = false;
@@ -275,7 +346,8 @@ export class PositionManager {
     this.position.entryPrice = newWeightedAvgPrice;
     this.position.totalCostKrw += fillPrice * fillVolume;
     this.position.partialCutCount = 0; // Reset recycling cut gates on newly lowered weighted avg
-    this.position.initialStopPrice = Number((newWeightedAvgPrice * 0.94).toFixed(2)); // Floor stop loss locked at -6.0% of new average
+    // DCA must not move the final stop.  Otherwise each lower fill extends
+    // the loss boundary and makes the original maximum-loss guard drift.
     this.position.lastUpdatedAt = Date.now();
 
     const slot = this.position.dcaSlots.find((s) => s.slotNumber === slotNumber);
@@ -305,7 +377,8 @@ export class PositionManager {
     this.position.entryPrice = newWeightedAvgPrice;
     this.position.totalCostKrw += fillPrice * fillVolume;
     this.position.partialCutCount = 0;
-    this.position.initialStopPrice = Number((newWeightedAvgPrice * 0.94).toFixed(2));
+    // The DCA2 recovery fragment belongs to the same position cycle and
+    // therefore preserves the original fixed absolute stop.
     this.position.lastUpdatedAt = Date.now();
 
     const slot = this.position.dcaSlots.find((s) => s.slotNumber === slotNumber);
@@ -631,14 +704,13 @@ export class PositionManager {
       throw new Error('Cannot rebase without a confirmed open position and current indicators.');
     }
     const lowerBand = baseline - (atr * atrMultiplier);
-    const dynamicStop = lowerBand - (atr * stopLossMultiplier);
     const absoluteFloor = this.position.entryPrice * 0.94;
 
     this.position.state = 'ENTRY_FILLED';
     this.position.positionEntryAtr = atr;
     this.position.initialBaseline = baseline;
     this.position.initialBand = lowerBand;
-    this.position.initialStopPrice = Number(Math.max(dynamicStop, absoluteFloor).toFixed(2));
+    this.position.initialStopPrice = Number(absoluteFloor.toFixed(2));
     this.position.totalCostKrw = this.position.amount * this.position.entryPrice;
     this.position.partialCutCount = 0;
     this.position.trailingActive = false;
@@ -756,7 +828,9 @@ export class PositionManager {
       stateChanged = true;
     }
 
-    if (realCoinQuantity < 0.0001) {
+    // Quantity alone is not a valid dust policy: 0.00009 BTC can still have
+    // material KRW value. Only an effectively zero exchange balance is FLAT.
+    if (realCoinQuantity <= 1e-8) {
       if (this.position.state !== 'FLAT' || this.position.entryPrice !== null) {
         this.position.state = 'FLAT';
         this.position.entryPrice = null;
@@ -795,13 +869,136 @@ export class PositionManager {
     try {
       if (fs.existsSync(POSITION_FILE)) {
         const raw = fs.readFileSync(POSITION_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        this.position = { ...this.position, ...parsed };
+        const { state, migrated } = this.migrateAndValidatePersistedState(JSON.parse(raw));
+        this.position = state;
+        // A known older schema is upgraded before it is trusted. This keeps
+        // future restarts on one validated shape instead of repeatedly
+        // relying on implicit defaults.
+        if (migrated) this.commitStateToFile();
+        this.persistedStateFound = true;
         console.log('[PositionManager] Saved Position State restored from file.');
       }
     } catch (e) {
       console.error('[PositionManager] Failed to load position state from file:', e);
+      this.persistenceLoadFailure = e instanceof Error ? e : new Error(String(e));
     }
+  }
+
+  /** Migrates only known additive legacy fields, then validates business invariants. */
+  private migrateAndValidatePersistedState(raw: unknown): { state: PositionSnapshot; migrated: boolean } {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('position_state.json must contain a position object.');
+    }
+    const source = raw as Record<string, unknown>;
+    const required = [
+      'id', 'symbol', 'state', 'amount', 'entryPrice', 'positionEntryAtr', 'initialStopPrice', 'initialBaseline',
+      'initialBand', 'totalCostKrw', 'realizedPnl', 'unrealizedPnl', 'unrealizedPnlPercent', 'openedAt',
+      'lastUpdatedAt', 'dcaSlots', 'pyramidingCount', 'maxPyramidingOrders', 'trailingActive', 'trailingPeakPrice',
+      'cooldownUntil'
+    ];
+    const missing = required.filter((key) => !(key in source));
+    if (missing.length > 0) throw new Error(`position_state.json is incomplete (missing: ${missing.join(', ')}).`);
+
+    const defaults = this.createDefaultPosition();
+    const legacyDefaults: Partial<PositionSnapshot> = {
+      boxPyramidCount: defaults.boxPyramidCount,
+      partialCutCount: defaults.partialCutCount,
+      trailingExitCount: defaults.trailingExitCount,
+      profitLockPrice: defaults.profitLockPrice,
+      lastRegimeRebalanceAt: defaults.lastRegimeRebalanceAt,
+      recycleCycleCount: defaults.recycleCycleCount,
+      appliedFillEventIds: [],
+      durableFillWatermarks: {},
+      cooldownReason: undefined
+    };
+    let migrated = false;
+    const candidate: Record<string, unknown> = { ...source };
+    for (const [key, value] of Object.entries(legacyDefaults)) {
+      if (!(key in candidate)) {
+        candidate[key] = value;
+        migrated = true;
+      }
+    }
+
+    const finite = (value: unknown, label: string, min = -Infinity) => {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < min) throw new Error(`Invalid position field: ${label}.`);
+    };
+    const nullableFinite = (value: unknown, label: string, min = -Infinity) => {
+      if (value !== null) finite(value, label, min);
+    };
+    if (typeof candidate.id !== 'string' || !candidate.id) throw new Error('Invalid position field: id.');
+    if (typeof candidate.symbol !== 'string' || !candidate.symbol) throw new Error('Invalid position field: symbol.');
+    if (typeof candidate.state !== 'string' || !POSITION_STATES.has(candidate.state as PositionState)) throw new Error('Invalid position field: state.');
+    finite(candidate.amount, 'amount', 0);
+    nullableFinite(candidate.entryPrice, 'entryPrice', 0);
+    nullableFinite(candidate.positionEntryAtr, 'positionEntryAtr', 0);
+    nullableFinite(candidate.initialStopPrice, 'initialStopPrice', 0);
+    nullableFinite(candidate.initialBaseline, 'initialBaseline');
+    nullableFinite(candidate.initialBand, 'initialBand');
+    finite(candidate.totalCostKrw, 'totalCostKrw', 0);
+    finite(candidate.realizedPnl, 'realizedPnl');
+    finite(candidate.unrealizedPnl, 'unrealizedPnl');
+    finite(candidate.unrealizedPnlPercent, 'unrealizedPnlPercent');
+    nullableFinite(candidate.openedAt, 'openedAt', 0);
+    finite(candidate.lastUpdatedAt, 'lastUpdatedAt', 0);
+    finite(candidate.pyramidingCount, 'pyramidingCount', 0);
+    finite(candidate.maxPyramidingOrders, 'maxPyramidingOrders', 0);
+    finite(candidate.boxPyramidCount, 'boxPyramidCount', 0);
+    finite(candidate.partialCutCount, 'partialCutCount', 0);
+    finite(candidate.trailingExitCount, 'trailingExitCount', 0);
+    nullableFinite(candidate.profitLockPrice, 'profitLockPrice', 0);
+    finite(candidate.lastRegimeRebalanceAt, 'lastRegimeRebalanceAt', 0);
+    finite(candidate.recycleCycleCount, 'recycleCycleCount', 0);
+    finite(candidate.cooldownUntil, 'cooldownUntil', 0);
+    if (typeof candidate.trailingActive !== 'boolean') throw new Error('Invalid position field: trailingActive.');
+    nullableFinite(candidate.trailingPeakPrice, 'trailingPeakPrice', 0);
+
+    if (!Array.isArray(candidate.dcaSlots) || candidate.dcaSlots.length === 0) throw new Error('Invalid position field: dcaSlots.');
+    const slotNumbers = new Set<number>();
+    for (const slot of candidate.dcaSlots) {
+      if (!slot || typeof slot !== 'object') throw new Error('Invalid DCA slot.');
+      const value = slot as Record<string, unknown>;
+      if (typeof value.slotNumber !== 'number' || !Number.isInteger(value.slotNumber) || value.slotNumber < 1 || slotNumbers.has(value.slotNumber)) throw new Error('Invalid DCA slot number.');
+      if (typeof value.status !== 'string' || !DCA_SLOT_STATUSES.has(value.status)) throw new Error('Invalid DCA slot status.');
+      if (value.filledPrice !== undefined) finite(value.filledPrice, 'dcaSlots.filledPrice', 0);
+      if (value.filledVolume !== undefined) finite(value.filledVolume, 'dcaSlots.filledVolume', 0);
+      if (value.filledAt !== undefined) finite(value.filledAt, 'dcaSlots.filledAt', 0);
+      if (value.plannedTargetPrice !== undefined) finite(value.plannedTargetPrice, 'dcaSlots.plannedTargetPrice', 0);
+      slotNumbers.add(value.slotNumber);
+    }
+    if (!Array.isArray(candidate.appliedFillEventIds) || !candidate.appliedFillEventIds.every((id) => typeof id === 'string')) throw new Error('Invalid position fill-event ledger.');
+    if (!candidate.durableFillWatermarks || typeof candidate.durableFillWatermarks !== 'object' || Array.isArray(candidate.durableFillWatermarks)) throw new Error('Invalid durable fill watermark ledger.');
+    for (const [clientOrderId, watermark] of Object.entries(candidate.durableFillWatermarks as Record<string, unknown>)) {
+      if (!clientOrderId || !watermark || typeof watermark !== 'object' || Array.isArray(watermark)) throw new Error('Invalid durable fill watermark.');
+      const value = watermark as Record<string, unknown>;
+      finite(value.volume, 'durableFillWatermarks.volume', 0);
+      finite(value.fee, 'durableFillWatermarks.fee', 0);
+      if (value.funds !== undefined) finite(value.funds, 'durableFillWatermarks.funds', 0);
+      if (typeof value.initialApplied !== 'boolean') throw new Error('Invalid durable fill watermark initialApplied flag.');
+    }
+
+    const amount = candidate.amount as number;
+    const state = candidate.state as PositionState;
+    if (amount > 1e-8) {
+      const requiredPositiveProtectiveFields = ['entryPrice', 'positionEntryAtr', 'initialStopPrice', 'initialBaseline', 'initialBand'];
+      const hasInvalidProtectiveNumber = requiredPositiveProtectiveFields.some((field) =>
+        typeof candidate[field] !== 'number' || !Number.isFinite(candidate[field]) || (candidate[field] as number) <= 0
+      );
+      if (state === 'FLAT' || state === 'CLOSED' || hasInvalidProtectiveNumber) {
+        throw new Error('Open position is missing required protective state.');
+      }
+      // Upgrade positions persisted by the former ATR/Math.max stop policy.
+      // Their stop may sit just below the entry price and pre-empt every DCA
+      // stage. The fixed -6% stop is the current safety-policy invariant.
+      const exactAbsoluteStop = Number(((candidate.entryPrice as number) * 0.94).toFixed(2));
+      if (Math.abs((candidate.initialStopPrice as number) - exactAbsoluteStop) > 0.01) {
+        candidate.initialStopPrice = exactAbsoluteStop;
+        migrated = true;
+      }
+    } else if (state === 'FLAT' && candidate.entryPrice !== null) {
+      throw new Error('FLAT position cannot retain an entry price.');
+    }
+    return { state: candidate as unknown as PositionSnapshot, migrated };
   }
 
   private saveStateToFile() {
@@ -816,6 +1013,8 @@ export class PositionManager {
   /** Performs the physical atomic rename. Durable fill transactions call this once at commit. */
   private commitStateToFile() {
     let addedActiveEvent = false;
+    const activeWatermark = this.activeFillWatermark;
+    const previousWatermark = activeWatermark ? this.position.durableFillWatermarks?.[activeWatermark.clientOrderId] : undefined;
     try {
       const dir = path.dirname(POSITION_FILE);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -823,12 +1022,32 @@ export class PositionManager {
         this.position.appliedFillEventIds = [...(this.position.appliedFillEventIds || []), this.activeFillEventId].slice(-500);
         addedActiveEvent = true;
       }
+      if (activeWatermark) {
+        this.position.durableFillWatermarks = {
+          ...(this.position.durableFillWatermarks || {}),
+          [activeWatermark.clientOrderId]: {
+            volume: activeWatermark.volume,
+            fee: activeWatermark.fee,
+            funds: activeWatermark.funds,
+            initialApplied: activeWatermark.initialApplied
+          }
+        };
+      }
       const tmpFile = POSITION_FILE + '.tmp';
       fs.writeFileSync(tmpFile, JSON.stringify(this.position, null, 2), 'utf-8');
       fs.renameSync(tmpFile, POSITION_FILE);
+      // The first successful runtime commit is authoritative persisted state
+      // too; do not keep treating this process as a missing-ledger startup.
+      this.persistedStateFound = true;
     } catch (e) {
       if (addedActiveEvent && this.activeFillEventId) {
         this.position.appliedFillEventIds = (this.position.appliedFillEventIds || []).filter((id) => id !== this.activeFillEventId);
+      }
+      if (activeWatermark) {
+        const watermarks = { ...(this.position.durableFillWatermarks || {}) };
+        if (previousWatermark) watermarks[activeWatermark.clientOrderId] = previousWatermark;
+        else delete watermarks[activeWatermark.clientOrderId];
+        this.position.durableFillWatermarks = watermarks;
       }
       console.error('[PositionManager] Failed to save position state to file:', e);
       throw e;
