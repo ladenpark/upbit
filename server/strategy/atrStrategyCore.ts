@@ -23,13 +23,13 @@ export class ATRStrategyCore {
     baselineValue: number,
     atrValue: number,
     params: BotParams,
-    priceHistory: number[],
+    completed1mCloses: number[],
     higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number },
     rsi: number = 50.0,
     volumeMultiplier: number = 1.0,
     volumeMa: number = 0.0
   ) {
-    if (priceHistory.length < 15) {
+    if (completed1mCloses.length < 15) {
       return {
         dynamicAtr: params.atrMultiplier,
         dynamicOrderRatio: params.orderRatio,
@@ -46,8 +46,8 @@ export class ATRStrategyCore {
       };
     }
 
-    const shortPeriod = priceHistory.slice(-5);
-    const midPeriod = priceHistory.slice(-15);
+    const shortPeriod = completed1mCloses.slice(-5);
+    const midPeriod = completed1mCloses.slice(-15);
     const shortMa = shortPeriod.reduce((a, b) => a + b, 0) / shortPeriod.length;
     const midMa = midPeriod.reduce((a, b) => a + b, 0) / midPeriod.length;
 
@@ -154,18 +154,20 @@ export class ATRStrategyCore {
     params: BotParams,
     position: PositionSnapshot,
     dropSpeed: number,
-    priceHistory: number[],
+    completed1mCloses: number[],
     higherTfTrend?: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number },
     rsi: number = 50.0,
     volumeMultiplier: number = 1.0,
     volumeMa: number = 0.0,
-    microPriceHistory: number[] = priceHistory,
+    // Direct-core callers may omit raw ticks for legacy tests. The live
+    // engine always supplies its independent raw micro tick buffer.
+    microPriceHistory: number[] = completed1mCloses,
     exposureContext?: StrategyExposureContext
   ): Signal[] {
     const signals: Signal[] = [];
     const now = Date.now();
 
-    const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, priceHistory, higherTfTrend, rsi, volumeMultiplier, volumeMa);
+    const adaptive = this.evaluateAdaptiveParams(currentPrice, baselineValue, atrValue, params, completed1mCloses, higherTfTrend, rsi, volumeMultiplier, volumeMa);
     const effectiveAtrMultiplier = params.autoPilotEnabled ? adaptive.dynamicAtr : params.atrMultiplier;
 
     // Minimum ATR Floor to prevent tick-size quantization trap (minimum 0.25% of price or 5,000 KRW)
@@ -295,7 +297,7 @@ export class ATRStrategyCore {
     // for participating in an established trend, not for chasing a breakout.
     // The stricter momentum/volume gates are reserved for the 65% → 70%
     // extension, leaving a meaningful cash reserve for adverse moves.
-    const recentBullPrices = priceHistory.slice(-15);
+    const recentBullPrices = microPriceHistory.slice(-20);
     const recentBullHigh = recentBullPrices.length ? Math.max(...recentBullPrices) : currentPrice;
     const pullbackFromRecentHigh = recentBullHigh > 0 ? ((recentBullHigh - currentPrice) / recentBullHigh) * 100 : 0;
     const recentMicroPrices = microPriceHistory.slice(-20);
@@ -365,11 +367,11 @@ export class ATRStrategyCore {
       !position.trailingActive &&
       pnlPercent >= scalpTpTargetPercent
     ) {
-      // Strategy Lab: a volume-backed upward expansion is not treated as a
-      // normal box-range exit. Realize half, then protect the remaining half
-      // at breakeven-plus-fees so it can participate in a regime transition.
+      // A volume-backed upward expansion is not treated as a normal box-range
+      // exit. Realize half, then protect the remaining half at
+      // breakeven-plus-fees so it can participate in a regime transition.
       const isTrendExpansion = adaptive.volumeMultiplier >= 1.5 && adaptive.slope >= 0.05;
-      if (params.experimentScalpTrendExpansionEnabled && isTrendExpansion) {
+      if (isTrendExpansion) {
         signals.push({
           id: `SIG_SCALP_PARTIAL_TP_${now}`,
           timestamp: now,
@@ -716,9 +718,9 @@ export class ATRStrategyCore {
       position.state === 'FLAT' &&
       params.autoPilotEnabled &&
       isNeutralRange &&
-      priceHistory.length >= SCALP_BOUNCE_LOOKBACK
+      microPriceHistory.length >= SCALP_BOUNCE_LOOKBACK
     ) {
-      const lookbackSlice = priceHistory.slice(-SCALP_BOUNCE_LOOKBACK);
+      const lookbackSlice = microPriceHistory.slice(-SCALP_BOUNCE_LOOKBACK);
       const recentLow = Math.min(...lookbackSlice);
 
       // 그 저점이 실제로 기준선보다 낮았을 때만 유효한 "눌림"으로 인정 (노이즈성 미세 등락 배제)

@@ -115,7 +115,11 @@ export class ATREngine {
 
   // Higher Timeframe (15m) Trend State for Whipsaw Filtering
   private higherTfTrend: { trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number } = { trend: 'SIDEWAYS', htfSlope: 0 };
+  /** Completed 1-minute closes only. Regime/slope/RSI never use chart samples. */
   private recent1mCloses: number[] = [];
+  /** Raw valid ticks for short-horizon rebound and microstructure rules only. */
+  private microPriceHistory: number[] = [];
+  private readonly maxMicroPriceHistory = 100;
 
   // Live Metrics
   public currentPrice = 2650000.0;
@@ -135,6 +139,8 @@ export class ATREngine {
   public initialBalance = 0;
 
   public priceHistory: PricePoint[] = [];
+  /** UI chart sampling clock; deliberately independent from the latest point time. */
+  private lastChartSampleAt = 0;
   public logs: TradeLog[] = [];
 
   private broadcastCallback?: (payload: any) => void;
@@ -416,7 +422,9 @@ export class ATREngine {
     this.startupFailureReason = null;
     this.botState = 'STARTING';
     this.recent1mCloses = [];
+    this.microPriceHistory = [];
     this.priceHistory = [];
+    this.lastChartSampleAt = 0;
     this.higherTfTrend = { trend: 'SIDEWAYS', htfSlope: 0 };
 
     const watcherContext = this.captureAsyncContext();
@@ -555,7 +563,8 @@ export class ATREngine {
     price: number,
     position: PositionSnapshot,
     dropSpeed: number,
-    historyPrices: number[],
+    completed1mHistory: number[],
+    microPriceHistory: number[],
     activeSignals: Signal[],
     currentExposurePercent: number
   ) {
@@ -567,8 +576,8 @@ export class ATREngine {
     };
     const evaluate = (params: BotParams) => summarize(this.strategyCore.generateSignals(
       price, this.baselineValue, this.atrValue, params, position, dropSpeed,
-      historyPrices, this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa,
-      historyPrices, { currentExposurePercent }
+      completed1mHistory, this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa,
+      microPriceHistory, { currentExposurePercent }
     ));
     const baselineParams: BotParams = {
       ...this.params,
@@ -608,7 +617,12 @@ export class ATREngine {
    * Main Market Tick Dispatcher & Deterministic Decision Loop
    */
   public async handleMarketTick(price: number, timestamp: number) {
+    if (!Number.isFinite(price) || price <= 0) return;
     this.currentPrice = price;
+    // Keep every valid incoming tick for short-horizon rebound detection. This
+    // is intentionally independent from the chart's 2-second/₩1,000 sampler.
+    this.microPriceHistory.push(price);
+    if (this.microPriceHistory.length > this.maxMicroPriceHistory) this.microPriceHistory.shift();
     this.researchRecorder?.recordTick(this.params.symbol, price, timestamp);
 
     // A durability halt may still update the dashboard price, but it must not
@@ -635,17 +649,14 @@ export class ATREngine {
       return;
     }
 
-    // Candle closes drive regime/slope/scalp decisions; raw ticks remain for
-    // DCA rebound and short-term microstructure checks.
-    const tickHistoryPrices = [...this.priceHistory.map((p) => p.price), price];
-    const historyPrices = this.recent1mCloses.length >= 15
-      ? [...this.recent1mCloses.slice(-19), price]
-      : tickHistoryPrices;
+    // Completed 1m closes plus the current price drive regime/slope/RSI.
+    // Chart samples are presentation-only and never enter a strategy input.
+    const completed1mHistory = [...this.recent1mCloses.slice(-19), price];
 
     // Real-time 1m RSI(14) calculation: base 1m candles + latest tick price
     const rsiCloses = this.recent1mCloses.length >= 14
       ? [...this.recent1mCloses.slice(-14), price]
-      : historyPrices;
+      : completed1mHistory;
 
     if (rsiCloses.length >= 15) {
       const slice = rsiCloses.slice(-15);
@@ -673,7 +684,7 @@ export class ATREngine {
       this.baselineValue,
       this.atrValue,
       this.params,
-      historyPrices,
+      completed1mHistory,
       this.higherTfTrend,
       this.rsiValue,
       this.volumeMultiplier,
@@ -740,15 +751,15 @@ export class ATREngine {
       this.params,
       position,
       dropSpeed,
-      historyPrices,
+      completed1mHistory,
       this.higherTfTrend,
       this.rsiValue,
       this.volumeMultiplier,
       this.volumeMa,
-      tickHistoryPrices,
+      this.microPriceHistory,
       { currentExposurePercent }
     );
-    this.captureShadowDecisions(timestamp, price, position, dropSpeed, historyPrices, candidateSignals, currentExposurePercent);
+    this.captureShadowDecisions(timestamp, price, position, dropSpeed, completed1mHistory, this.microPriceHistory, candidateSignals, currentExposurePercent);
 
     if (candidateSignals.length > 0) {
       console.log(`[ATREngine] 🎯 Signals Generated (${candidateSignals.length}):`, candidateSignals.map((s) => `[${s.type}] ${s.reason}`));
@@ -860,7 +871,11 @@ export class ATREngine {
 
     // Update Live Rolling Price History Chart Series (50 streaming points)
     const lastPoint = this.priceHistory.length > 0 ? this.priceHistory[this.priceHistory.length - 1] : null;
-    const shouldPushNewPoint = !lastPoint || (timestamp - lastPoint.time >= 2000) || (Math.abs(price - lastPoint.price) >= 1000);
+    // Do not update the sampling clock while refreshing the displayed latest
+    // point. Otherwise a busy stream can postpone the next chart sample
+    // forever. This clock is UI-only and never influences micro tick logic.
+    const shouldPushNewPoint = !lastPoint || this.lastChartSampleAt === 0 ||
+      (timestamp - this.lastChartSampleAt >= 2000) || (Math.abs(price - lastPoint.price) >= 1000);
     const d = new Date(timestamp);
     const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 
@@ -877,14 +892,13 @@ export class ATREngine {
       if (this.priceHistory.length > 50) {
         this.priceHistory.shift();
       }
+      this.lastChartSampleAt = timestamp;
     } else if (lastPoint) {
       lastPoint.price = price;
       lastPoint.baseline = this.baselineValue;
       lastPoint.upperBand = upperBand;
       lastPoint.lowerBand = lowerBand;
       lastPoint.stopLoss = staticStopPrice;
-      lastPoint.time = timestamp;
-      lastPoint.timeLabel = timeLabel;
     }
 
     this.notifyClients();
@@ -1098,7 +1112,7 @@ export class ATREngine {
         reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]`
       });
     } else if (signalType === 'REGIME_REBALANCE_BUY') {
-      const adaptive = this.strategyCore.evaluateAdaptiveParams(fillPrice, this.baselineValue, this.atrValue, this.params, this.priceHistory.map((point) => point.price), this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa);
+      const adaptive = this.strategyCore.evaluateAdaptiveParams(fillPrice, this.baselineValue, this.atrValue, this.params, [...this.recent1mCloses.slice(-19), fillPrice], this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa);
       this.positionManager.onRegimeRebalanceBuyFilled(fillPrice, effectiveVolume, this.baselineValue, Math.max(this.atrValue, 5000), adaptive.dynamicAtr, this.params.stopLossMultiplier);
       if (!isIncremental) this.totalTrades += 1;
       this.addLog({ type: 'BUY', price: fillPrice, amount: effectiveVolume, exchange: this.params.exchange, reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]` });
@@ -1374,8 +1388,9 @@ export class ATREngine {
       this.higherTfTrend = { trend: htfTrend, htfSlope };
 
       const lastClose = closes[closes.length - 1] || calculatedBaseline;
+      const adaptiveCurrentPrice = this.currentPrice > 0 ? this.currentPrice : lastClose;
       const initialAdaptive = this.strategyCore.evaluateAdaptiveParams(
-        lastClose,
+        adaptiveCurrentPrice,
         calculatedBaseline,
         calculatedAtr,
         this.params,
@@ -1642,7 +1657,7 @@ export class ATREngine {
     }
     const adaptive = this.strategyCore.evaluateAdaptiveParams(
       this.currentPrice, this.baselineValue, this.atrValue, this.params,
-      this.priceHistory.map((point) => point.price), this.higherTfTrend,
+      [...this.recent1mCloses.slice(-19), this.currentPrice], this.higherTfTrend,
       this.rsiValue, this.volumeMultiplier, this.volumeMa
     );
     const atrMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
@@ -1864,14 +1879,13 @@ export class ATREngine {
     );
 
     // Evaluate dynamic adaptive indicators for UI visualization
-    const historyPrices = this.priceHistory.map((p) => p.price);
-    historyPrices.push(this.currentPrice);
+    const completed1mHistory = [...this.recent1mCloses.slice(-19), this.currentPrice];
     const adaptive = this.strategyCore.evaluateAdaptiveParams(
       this.currentPrice,
       this.baselineValue,
       this.atrValue,
       this.params,
-      historyPrices,
+      completed1mHistory,
       this.higherTfTrend,
       this.rsiValue,
       this.volumeMultiplier,

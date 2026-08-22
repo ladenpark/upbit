@@ -1657,17 +1657,17 @@ async function runAllTests() {
     dcaSlots: [{ slotNumber: 1, status: 'FILLED' }, { slotNumber: 2, status: 'FILLED' }, { slotNumber: 3, status: 'FILLED' }]
   };
   const expansionHistory = [99.9, 100, 100, 100.1, 100.2, 100.2, 100.3, 100.4, 100.4, 100.5, 100.5, 100.6, 100.6, 100.6, 100.6];
-  const normalScalpSignals = strategyCore.generateSignals(100.6, 100.7, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'SIDEWAYS', htfSlope: 0 }, 60, 1.6);
-  assert(normalScalpSignals[0]?.type === 'SCALP_TAKE_PROFIT', '[Lab] Box scalp remains a full exit while trend-expansion experiment is OFF');
-  const expansionScalpSignals = strategyCore.generateSignals(100.6, 100.7, 1, { ...defaultParams, experimentScalpTrendExpansionEnabled: true }, scalpExpansionPosition, 0, expansionHistory, { trend: 'SIDEWAYS', htfSlope: 0 }, 60, 1.6);
-  assert(expansionScalpSignals[0]?.type === 'SCALP_PARTIAL_TAKE_PROFIT', '[Lab] Trend expansion experiment converts box scalp exit to a 50% partial exit');
+  const expansionScalpSignals = strategyCore.generateSignals(100.6, 100.7, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'SIDEWAYS', htfSlope: 0 }, 60, 1.6);
+  assert(expansionScalpSignals[0]?.type === 'SCALP_PARTIAL_TAKE_PROFIT', '[Box expansion] Volume-backed expansion converts the box exit to a 50% partial exit by default');
+  const normalScalpSignals = strategyCore.generateSignals(100.6, 100.7, 1, defaultParams, scalpExpansionPosition, 0, expansionHistory, { trend: 'SIDEWAYS', htfSlope: 0 }, 60, 1.49);
+  assert(normalScalpSignals[0]?.type === 'SCALP_TAKE_PROFIT', '[Box expansion] Ordinary box conditions remain a full exit below the 1.5x volume threshold');
   const partialScalpEval = riskGovernor.evaluateSignal(expansionScalpSignals[0], 'RUNNING', 'LIVE', 1_000_000, scalpExpansionPosition, 0, [], 0);
-  assert(partialScalpEval.approved === true && partialScalpEval.calculatedVolume === 0.5, '[Lab] Trend expansion partial exit sells exactly 50% of the position');
+  assert(partialScalpEval.approved === true && partialScalpEval.calculatedVolume === 0.5, '[Box expansion] Trend expansion partial exit sells exactly 50% of the position');
   const scalpPartialManager = new PositionManager(defaultParams);
   scalpPartialManager.onInitialEntryFilled(100, 1, 90, 1, 1, 1);
   scalpPartialManager.onScalpPartialTakeProfitFilled(0.5, 100.6, 0.3);
   const scalpPartialSnapshot = scalpPartialManager.getSnapshot();
-  assert(scalpPartialSnapshot.amount === 0.5 && scalpPartialSnapshot.profitLockPrice === 100.2, '[Lab] Partial scalp exit leaves 50% with a +0.2% breakeven protection floor');
+  assert(scalpPartialSnapshot.amount === 0.5 && scalpPartialSnapshot.profitLockPrice === 100.2, '[Box expansion] Partial scalp exit leaves 50% with a +0.2% breakeven protection floor');
   scalpPartialManager.setScalpReentryCooldown(180);
   assert(scalpPartialManager.isUnderCooldown() && scalpPartialManager.getSnapshot().cooldownReason === 'SCALP_TAKE_PROFIT_REENTRY_GUARD', '[Lab] Scalp re-entry guard persists a 3-minute cooldown');
 
@@ -2533,6 +2533,43 @@ async function runAllTests() {
   await new Promise((resolve) => setTimeout(resolve, 6_500));
   firstTickFeedManager.destroy();
   assert(firstTickFeedManager.lastAnyPriceReceivedAt > 0 && firstTickReconnects === 1, '[Market feed] Zero first WS ticks triggers REST fallback and one cooldown-limited reconnect');
+
+  // Chart sampling must never become a hidden strategy input. Thirty tightly
+  // spaced raw ticks may collapse into a few chart points, while the engine
+  // retains the raw micro path for rebound rules.
+  const microSeparationEngine = new ATREngine(undefined, { backtest: true });
+  microSeparationEngine.params.isBotActive = false;
+  microSeparationEngine.baselineValue = 2_700_000;
+  microSeparationEngine.atrValue = 10_000;
+  (microSeparationEngine as any).recent1mCloses = Array.from({ length: 20 }, () => 2_700_000);
+  const microStart = Date.now();
+  for (let i = 0; i < 30; i++) {
+    // Every delta is below ₩1,000, so chart sampling is allowed to coalesce.
+    await microSeparationEngine.handleMarketTick(2_700_000 + (i % 2 === 0 ? 400 : 800), microStart + (i * 100));
+  }
+  assert((microSeparationEngine as any).microPriceHistory.length >= 20 && microSeparationEngine.priceHistory.length >= 2 && microSeparationEngine.priceHistory.length < 10, '[Micro history] Raw 100ms ticks remain available while the UI adds real 2-second chart samples');
+
+  const completed1mForMicro = Array.from({ length: 20 }, () => 2_700_000);
+  const reboundMicroTicks = [2_700_000, 2_700_000, 2_700_000, 2_700_000, 2_698_000, 2_695_000, 2_690_000, 2_692_000, 2_694_000, 2_695_000];
+  const flatMicroTicks = Array.from({ length: reboundMicroTicks.length }, () => 2_695_000);
+  const microBouncePosition: PositionSnapshot = { ...cleanFlatPos, symbol: 'KRW-ETH', state: 'FLAT', amount: 0, entryPrice: null, totalCostKrw: 0 };
+  const rawMicroBounceSignals = strategyCore.generateSignals(2_695_000, 2_700_000, 10_000, defaultParams, microBouncePosition, 0, completed1mForMicro, { trend: 'SIDEWAYS', htfSlope: 0 }, 50, 1, 0, reboundMicroTicks);
+  const flatMicroBounceSignals = strategyCore.generateSignals(2_695_000, 2_700_000, 10_000, defaultParams, microBouncePosition, 0, completed1mForMicro, { trend: 'SIDEWAYS', htfSlope: 0 }, 50, 1, 0, flatMicroTicks);
+  assert(rawMicroBounceSignals.some((signal) => signal.id.startsWith('SIG_SCALP_BOUNCE_')) && !flatMicroBounceSignals.some((signal) => signal.id.startsWith('SIG_SCALP_BOUNCE_')), '[Micro history] Recent low and +0.15% rebound are calculated from raw ticks, not completed candles or chart points');
+
+  const regimeParityEngine = new ATREngine(undefined, { backtest: true });
+  regimeParityEngine.params.isBotActive = false;
+  regimeParityEngine.baselineValue = 2_700_000;
+  regimeParityEngine.atrValue = 10_000;
+  const completedBull1m = Array.from({ length: 20 }, (_, i) => 2_690_000 + (i * 1_000));
+  (regimeParityEngine as any).recent1mCloses = completedBull1m;
+  // Deliberately conflicting chart samples: a chart-derived adaptive result
+  // would be BEAR, while the completed 1m closes plus current price are BULL.
+  regimeParityEngine.priceHistory = Array.from({ length: 20 }, (_, i) => ({ time: microStart + i, timeLabel: 'chart', price: 2_660_000 - (i * 1_000), baseline: 2_700_000, upperBand: 2_720_000, lowerBand: 2_680_000, stopLoss: 2_650_000 }));
+  await regimeParityEngine.handleMarketTick(2_712_000, microStart + 4_000);
+  const expectedRegimeAdaptive = strategyCore.evaluateAdaptiveParams(2_712_000, 2_700_000, 10_000, regimeParityEngine.params, [...completedBull1m.slice(-19), 2_712_000], { trend: 'SIDEWAYS', htfSlope: 0 }, regimeParityEngine.rsiValue, regimeParityEngine.volumeMultiplier, regimeParityEngine.volumeMa);
+  const uiAdaptive = regimeParityEngine.getFullState().adaptive;
+  assert(regimeParityEngine.marketRegime === expectedRegimeAdaptive.marketRegime && uiAdaptive.marketRegime === expectedRegimeAdaptive.marketRegime && uiAdaptive.slope === expectedRegimeAdaptive.slope, '[Adaptive parity] Execution and UI regime use the same completed-1m history, never chart samples');
 
   // Isolate this parameter semantic test from the intentionally persisted
   // daily-circuit restart scenario immediately above.
