@@ -516,7 +516,9 @@ export class ATREngine {
   private seedPriceHistoryFromCompletedCandles(candles: UpbitCandle[], baseline: number, atr: number) {
     const minAtrFloor = Math.max(5000, Math.round((candles[candles.length - 1]?.trade_price || 3000000) * 0.0025));
     const effectiveAtr = Math.max(atr, minAtrFloor);
-    const effectiveMultiplier = this.params.autoPilotEnabled ? (this.marketRegime === 'BULL' ? 1.8 : 2.4) : this.params.atrMultiplier;
+    const effectiveMultiplier = this.params.autoPilotEnabled
+      ? (this.marketRegime === 'BULL' ? 1.8 : this.marketRegime === 'BEAR' ? 3.5 : 2.4)
+      : this.params.atrMultiplier;
     const persistedStop = this.positionManager.getSnapshot().initialStopPrice;
     const count = candles.length;
     const startIndex = Math.max(0, count - 40);
@@ -856,24 +858,13 @@ export class ATREngine {
       }
     }
 
-    // Update 1-Minute Price History Chart Series
-    const currentMinuteBucket = Math.floor(timestamp / 60000) * 60000;
+    // Update Live Rolling Price History Chart Series (50 streaming points)
+    const lastPoint = this.priceHistory.length > 0 ? this.priceHistory[this.priceHistory.length - 1] : null;
+    const shouldPushNewPoint = !lastPoint || (timestamp - lastPoint.time >= 2000) || (Math.abs(price - lastPoint.price) >= 1000);
     const d = new Date(timestamp);
-    const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
-    const lastBar = this.priceHistory.length > 0 ? this.priceHistory[this.priceHistory.length - 1] : null;
-    const isSameMinute = lastBar && Math.floor(lastBar.time / 60000) * 60000 === currentMinuteBucket;
+    const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 
-    if (isSameMinute && lastBar) {
-      // Update the current in-flight minute bar with latest live tick and bands
-      lastBar.price = price;
-      lastBar.baseline = this.baselineValue;
-      lastBar.upperBand = upperBand;
-      lastBar.lowerBand = lowerBand;
-      lastBar.stopLoss = staticStopPrice;
-      lastBar.time = timestamp;
-      lastBar.timeLabel = timeLabel;
-    } else {
-      // Start new 1-minute bar
+    if (shouldPushNewPoint) {
       this.priceHistory.push({
         time: timestamp,
         timeLabel,
@@ -883,9 +874,17 @@ export class ATREngine {
         lowerBand,
         stopLoss: staticStopPrice
       });
-      if (this.priceHistory.length > 40) {
+      if (this.priceHistory.length > 50) {
         this.priceHistory.shift();
       }
+    } else if (lastPoint) {
+      lastPoint.price = price;
+      lastPoint.baseline = this.baselineValue;
+      lastPoint.upperBand = upperBand;
+      lastPoint.lowerBand = lowerBand;
+      lastPoint.stopLoss = staticStopPrice;
+      lastPoint.time = timestamp;
+      lastPoint.timeLabel = timeLabel;
     }
 
     this.notifyClients();
@@ -1373,7 +1372,24 @@ export class ATREngine {
       this.volumeMultiplier = calculatedVolumeMultiplier;
       this.recent1mCloses = closes;
       this.higherTfTrend = { trend: htfTrend, htfSlope };
-      this.seedPriceHistoryFromCompletedCandles(completedCandles, calculatedBaseline, calculatedAtr);
+
+      const lastClose = closes[closes.length - 1] || calculatedBaseline;
+      const initialAdaptive = this.strategyCore.evaluateAdaptiveParams(
+        lastClose,
+        calculatedBaseline,
+        calculatedAtr,
+        this.params,
+        closes,
+        { trend: htfTrend, htfSlope },
+        calculatedRsi,
+        calculatedVolumeMultiplier,
+        calculatedVolumeMa
+      );
+      this.marketRegime = initialAdaptive.marketRegime;
+
+      if (this.priceHistory.length === 0) {
+        this.seedPriceHistoryFromCompletedCandles(completedCandles, calculatedBaseline, calculatedAtr);
+      }
       this.researchRecorder?.recordCompletedCandles(symbol, completedCandles);
       console.log(`[ATREngine] 📊 Recalculated Dynamic Indicators: ATR=₩${calculatedAtr.toLocaleString()}, Baseline=₩${calculatedBaseline.toLocaleString()}, RSI=${calculatedRsi}, VolMult=${calculatedVolumeMultiplier}x`);
       console.log(`[ATREngine] 📈 Higher-TF (15m) Trend Confluence: ${htfTrend} (Slope: ${htfSlope.toFixed(2)}%)`);
