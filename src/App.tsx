@@ -725,40 +725,6 @@ export default function App() {
     });
     ctx.stroke();
 
-    // Event Markers
-    priceHistory.forEach((p, idx) => {
-      if (!p.event) return;
-      const x = getX(idx);
-      const y = getY(p.price);
-      ctx.save();
-      if (p.event === 'BUY') {
-        ctx.fillStyle = '#10b981';
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, Math.PI * 2);
-        ctx.fill();
-      } else if (p.event === 'SELL') {
-        ctx.fillStyle = '#059669';
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, Math.PI * 2);
-        ctx.fill();
-      } else if (p.event === 'STOP_LOSS') {
-        ctx.fillStyle = '#e11d48';
-        ctx.beginPath();
-        ctx.arc(x, y, 4, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.restore();
-    });
-
-    ctx.lineWidth = 2.5;
-    priceHistory.forEach((pt, idx) => {
-      const x = getX(idx);
-      const y = getY(pt.price);
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-
     // Draw trade event marker badges
     priceHistory.forEach((pt, idx) => {
       if (pt.event) {
@@ -888,7 +854,7 @@ export default function App() {
   const requestManualBuyConfirm = () => {
     const isAdditional = positionAmount > 0;
     const manualBuyPercent = 10 as const;
-    const selectedPercent = isAdditional ? manualBuyPercent : (orderRatio || 20);
+    const selectedPercent = isAdditional ? manualBuyPercent : (orderRatio ?? 20);
     const estBudget = currentEquity * (selectedPercent / 100);
     setTradeConfirmModal({
       type: 'BUY',
@@ -1281,7 +1247,7 @@ export default function App() {
                   : '포지션 운용 중';
                 const next = nextOrderInfo?.pages?.[0] || nextOrderInfo || {
                   type: hasPosition ? (authoritativeNextDcaNumber <= dcaSteps.length ? `DCA ${authoritativeNextDcaNumber}차` : '손절선·익절선 감시') : '첫 진입 감시',
-                  budgetKrw: currentEquity * ((orderRatio || 20) / 100),
+                  budgetKrw: currentEquity * ((orderRatio ?? 20) / 100),
                   targetPriceLabel: hasPosition && authoritativeNextDcaNumber <= dcaSteps.length
                     ? (authoritativeNextDcaLabel || formatPrice(nextDcaPrice))
                     : '조건 레이더 참조'
@@ -1404,8 +1370,8 @@ export default function App() {
                         category: (positionAmount > 0 ? 'DCA' : 'DIP') as any,
                         categoryLabel: positionAmount > 0 ? '하락 시 물타기' : '저점 눌림목 매수',
                         type: positionAmount > 0 ? 'DCA 1차 물타기' : '1차 저점 진입',
-                        budgetKrw: currentEquity * ((orderRatio || 25) / 100),
-                        unitPercent: orderRatio || 25,
+                        budgetKrw: currentEquity * ((orderRatio ?? 25) / 100),
+                        unitPercent: orderRatio ?? 25,
                         scaleMultiplier: 1.0,
                         targetPriceLabel: '하단 밴드 터치 또는 돌파',
                         themeColor: 'indigo' as const
@@ -1414,8 +1380,8 @@ export default function App() {
                         category: (positionAmount > 0 ? 'PYRAMID' : 'BREAKOUT') as any,
                         categoryLabel: positionAmount > 0 ? '상승 시 불타기' : '상승 추세 돌파 매수',
                         type: positionAmount > 0 ? '상승 불타기 1차' : '1차 돌파 진입',
-                        budgetKrw: currentEquity * ((orderRatio || 25) / 100),
-                        unitPercent: orderRatio || 25,
+                        budgetKrw: currentEquity * ((orderRatio ?? 25) / 100),
+                        unitPercent: orderRatio ?? 25,
                         scaleMultiplier: 1.0,
                         targetPriceLabel: positionAmount > 0 ? '+1.5% 상승 돌파 시' : '기준선 상향 돌파 시',
                         themeColor: 'amber' as const
@@ -1507,14 +1473,14 @@ export default function App() {
                             ? '₩0 (매수 완료)'
                             : currentPage.budgetKrw > 0
                             ? formatPrice(currentPage.budgetKrw)
-                            : formatPrice(currentEquity * (((currentPage.unitPercent || (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio ? adaptiveIndicators.dynamicOrderRatio : orderRatio || 20))) / 100))}
+                            : formatPrice(currentEquity * ((currentPage.unitPercent ?? (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio ? adaptiveIndicators.dynamicOrderRatio : orderRatio ?? 20)) / 100))}
                         </div>
                         <div className="text-[10px] text-slate-500 font-medium mt-0.5">
                           {currentPage.category === 'SCALP_TP' || currentPage.category === 'TRAILING_TP'
                             ? `${currentPage.categoryLabel} · 보유 수량의 ${currentPage.unitPercent}% 매도`
                             : currentPage.category === 'COMPLETED'
                             ? `${currentPage.categoryLabel} · 목표 수익 도달 대기`
-                            : `${currentPage.categoryLabel} · 총자산의 ${currentPage.unitPercent || (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio ? adaptiveIndicators.dynamicOrderRatio : orderRatio || 20)}% (1 Unit)`}
+                            : `${currentPage.categoryLabel} · 총자산의 ${currentPage.unitPercent ?? (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio ? adaptiveIndicators.dynamicOrderRatio : orderRatio ?? 20)}% (1 Unit)`}
                         </div>
                       </div>
                       <div className="text-right">
@@ -1851,7 +1817,31 @@ export default function App() {
                   if (row.active) return '지금 발동';
                   const score = proximityScore(row);
                   if (score >= 99) return '조건 대기';
-                  return `약 ${score.toFixed(score < 1 ? 2 : 1)}%`;
+                  const distance = `약 ${score.toFixed(score < 1 ? 2 : 1)}%`;
+                  switch (row.key) {
+                    case 'absolute-stop':
+                    case 'partial-cut':
+                    case 'profit-lock':
+                    case 'dip-entry':
+                    case 'emergency':
+                      return `↓ 현재가보다 ${distance} 하락하면`;
+                    case 'scalp-tp':
+                    case 'pyramid':
+                    case 'breakout-entry':
+                      return `↑ 현재가보다 ${distance} 상승하면`;
+                    case 'trailing':
+                      return isTrailingActive ? `↓ 현재가보다 ${distance} 하락하면` : `↑ 현재가보다 ${distance} 상승하면`;
+                    case 'dca-2':
+                      return isDca2Remainder ? `↓ 현재가보다 ${distance} 하락하면` : `↓ ${distance} 하락 후 반등 확인`;
+                    case 'bull-pullback':
+                      return `↓ ${distance} 하락 후 반등 확인`;
+                    case 'regime-target':
+                      return '보유비중 조건 확인';
+                    case 'reentry':
+                      return '반등 조건 확인';
+                    default:
+                      return `${distance} 조건 접근`;
+                  }
                 };
                 const candidateRows = activeRadarTab === 'BUY' ? buyRows : activeRadarTab === 'SELL' ? sellRows : [...buyRows, ...sellRows];
                 const visibleRows = candidateRows
@@ -1940,7 +1930,7 @@ export default function App() {
                 const dynamicTrailingCb = adaptiveIndicators?.dynamicTrailingCallback || 0.8;
                 const dynamicDca = adaptiveIndicators?.dynamicDcaStep || 2.0;
                 const currentSlope = adaptiveIndicators?.slope || 0;
-                const effectiveRatio = (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio) ? adaptiveIndicators.dynamicOrderRatio : (orderRatio || 20);
+                const effectiveRatio = (autoPilotEnabled && adaptiveIndicators?.dynamicOrderRatio) ? adaptiveIndicators.dynamicOrderRatio : (orderRatio ?? 20);
 
                 const minAtrFloor = Math.max(5000, Math.round(currentPrice * 0.0025));
                 const effectiveAtr = Math.max(atrValue, minAtrFloor);

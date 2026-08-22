@@ -23,6 +23,11 @@ export class MarketDataManager {
 
   // Connection & Watchdog State
   public marketState: MarketDataState = 'DISCONNECTED';
+  /** Last price from any source; used only for price ordering/fallback health. */
+  public lastAnyPriceReceivedAt = 0;
+  /** Last genuine WebSocket tick; used exclusively by the socket watchdog. */
+  public lastWsReceivedAt = 0;
+  /** @deprecated Compatibility alias for the last price from any source. */
   public lastReceivedAt = 0;
   private watchdogTimer: NodeJS.Timeout | null = null;
   private staleThresholdMs = 20000; // 20 seconds without tick = STALE (relaxed for low volatility)
@@ -69,6 +74,9 @@ export class MarketDataManager {
       this.exchange = exchange;
       this.symbol = symbol;
       this.recentTicks = [];
+      this.lastAnyPriceReceivedAt = 0;
+      this.lastWsReceivedAt = 0;
+      this.lastReceivedAt = 0;
       this.startStream();
     }
   }
@@ -81,29 +89,32 @@ export class MarketDataManager {
 
     this.upbitClient.subscribeTicker(symbol, (ticker: UpbitTickerData) => {
       if (generation !== this.marketGeneration || ticker.symbol !== UpbitClient.formatMarket(this.symbol)) return;
-      this.handleTick(ticker.price, ticker.timestamp);
+      this.handleTick(ticker.price, ticker.timestamp, 'WS');
     });
   }
 
-  public handleTick(price: number, timestamp: number) {
+  public handleTick(price: number, timestamp: number, source: 'WS' | 'REST' = 'WS') {
     if (!Number.isFinite(price) || price <= 0) return;
     // REST fallbacks and old sockets can arrive out of order. A late price
     // must never rewind strategy time or overwrite the newest market state.
-    if (timestamp && timestamp < this.lastReceivedAt) return;
+    if (timestamp && timestamp < this.lastAnyPriceReceivedAt) return;
     this.currentPrice = price;
-    this.lastReceivedAt = timestamp || Date.now();
+    const receivedAt = timestamp || Date.now();
+    this.lastAnyPriceReceivedAt = receivedAt;
+    this.lastReceivedAt = receivedAt;
+    if (source === 'WS') this.lastWsReceivedAt = receivedAt;
 
     if (this.marketState !== 'LIVE') {
       this.setMarketState('LIVE');
     }
 
-    this.recentTicks.push({ timestamp: this.lastReceivedAt, price });
+    this.recentTicks.push({ timestamp: receivedAt, price });
     if (this.recentTicks.length > this.maxTicksHistory) {
       this.recentTicks.shift();
     }
 
     if (this.onTickCallback) {
-      this.onTickCallback(price, this.lastReceivedAt);
+      this.onTickCallback(price, receivedAt);
     }
   }
 
@@ -128,22 +139,22 @@ export class MarketDataManager {
 
     this.watchdogTimer = setInterval(async () => {
       const now = Date.now();
-      const elapsed = this.lastReceivedAt > 0 ? now - this.lastReceivedAt : 0;
+      const wsElapsed = this.lastWsReceivedAt > 0 ? now - this.lastWsReceivedAt : 0;
 
       // 1. If no WebSocket tick received for >8s, poll REST ticker as fallback heartbeat
-      if (elapsed > 8000) {
+      if (wsElapsed > 8000) {
         try {
           const generation = this.marketGeneration;
           const symbol = this.symbol;
           const restTicker = await this.upbitClient.fetchTicker(symbol);
           if (generation === this.marketGeneration && symbol === this.symbol && restTicker?.symbol === UpbitClient.formatMarket(symbol)) {
-            this.handleTick(restTicker.price, restTicker.timestamp);
+            this.handleTick(restTicker.price, restTicker.timestamp, 'REST');
           }
         } catch {}
       }
 
       // 2. If still no tick received for >staleThresholdMs (20s), mark STALE and trigger WS reconnect
-      if (this.lastReceivedAt > 0 && Date.now() - this.lastReceivedAt > this.staleThresholdMs) {
+      if (this.lastWsReceivedAt > 0 && Date.now() - this.lastWsReceivedAt > this.staleThresholdMs) {
         if (this.marketState !== 'STALE' && this.marketState !== 'DISCONNECTED') {
           console.warn(`[MarketDataManager] ⚠️ No ticks received for >${this.staleThresholdMs / 1000}s. Setting market state to STALE.`);
           this.setMarketState('STALE');

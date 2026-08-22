@@ -17,6 +17,7 @@ import { PositionManager } from '../position/positionManager';
 import { OrderManager } from '../orders/orderManager';
 import { SecretManager } from '../security/secretManager';
 import { ResearchRecorder } from '../research/researchRecorder';
+import { MarketDataManager } from '../market/marketDataManager';
 import { PositionSnapshot, BotParams, Signal, OrderRecord } from '../types/trading';
 
 let passed = 0;
@@ -55,11 +56,13 @@ async function runAllTests() {
   const orderFile = path.join(testDataDir, 'order_history.json');
   const signalFile = path.join(testDataDir, 'processed_signals.json');
   const posFile = path.join(testDataDir, 'position_state.json');
+  const dailyRiskFile = path.join(testDataDir, 'daily_risk_state.json');
 
   if (fs.existsSync(reservationFile)) fs.writeFileSync(reservationFile, '[]', 'utf-8');
   if (fs.existsSync(orderFile)) fs.writeFileSync(orderFile, '[]', 'utf-8');
   if (fs.existsSync(signalFile)) fs.writeFileSync(signalFile, '[]', 'utf-8');
   if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
+  if (fs.existsSync(dailyRiskFile)) fs.unlinkSync(dailyRiskFile);
 
   const defaultParams: BotParams = {
     atrMultiplier: 3.0,
@@ -2386,6 +2389,95 @@ async function runAllTests() {
     haltedSubmitRejected = true;
   }
   assert(haltedSubmitRejected, '[Durability] OrderManager rejects all new submits after durability failure');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 23: Restart, Manual Exit, Dry-Run & Feed Boundaries
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 23: Restart, Manual Exit, Dry-Run & Feed Boundaries');
+
+  // A daily-loss circuit is sell-only after restart, not ordinary PAUSED.
+  const dailyRestartEngine = new ATREngine(undefined, { backtest: true });
+  dailyRestartEngine.positionManager.onInitialEntryFilled(2_700_000, 0.2, 2_700_000, 10_000, 2, 3);
+  dailyRestartEngine.params.isBotActive = true;
+  (dailyRestartEngine as any).requestedRunAfterStartup = true;
+  (dailyRestartEngine as any).riskGovernor.recordDailyLoss(100_000, 1_000_000);
+  (dailyRestartEngine as any).startupReady = false;
+  (dailyRestartEngine as any).refreshAtrFromExchange = async () => true;
+  (dailyRestartEngine as any).reconcileOnStartup = async () => true;
+  await (dailyRestartEngine as any).startStartupBarrier();
+  const dailyProtectiveSignal: Signal = {
+    id: `SIG_DAILY_RESTART_${Date.now()}`, timestamp: Date.now(), timeframe: 'tick', source: 'test',
+    type: 'ABSOLUTE_STOP_EXIT', priority: 1, symbol: 'KRW-ETH', price: 2_500_000, reason: 'daily restart protective test',
+    indicatorSnapshot: { baseline: 2_700_000, atr: 10_000, upperBand: 2_730_000, lowerBand: 2_670_000, currentStopLoss: 2_538_000, marketRegime: 'BEAR', slope: -0.2, volatilityRatio: 1, dynamicOrderRatio: 20 }
+  };
+  const dailyRestartEval = (dailyRestartEngine as any).riskGovernor.evaluateSignal(
+    dailyProtectiveSignal, dailyRestartEngine.botState, 'LIVE', 800_000, dailyRestartEngine.positionManager.getSnapshot(), 2_500_000, [], 0
+  );
+  assert(dailyRestartEngine.botState === 'HALTED' && dailyRestartEval.approved, '[Daily circuit restart] Restart remains sell-only HALTED and still approves ABSOLUTE_STOP_EXIT');
+
+  // A manual emergency sell must coordinate through pending orders rather than
+  // being rejected before it can cancel a resting DCA/limit sell.
+  const manualExitEngine = new ATREngine(undefined, { backtest: true });
+  manualExitEngine.positionManager.onInitialEntryFilled(2_700_000, 1, 2_700_000, 10_000, 2, 3);
+  manualExitEngine.botState = 'RUNNING';
+  (manualExitEngine as any).marketManager.marketState = 'LIVE';
+  (manualExitEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  let protectiveCancelCalled = false;
+  let submittedManualExit: any = null;
+  (manualExitEngine.orderManager as any).getPendingOrdersCount = () => 1;
+  (manualExitEngine.orderManager as any).cancelPendingOrdersForProtectiveExit = async () => { protectiveCancelCalled = true; };
+  (manualExitEngine as any).fetchRealAccountBalance = async () => { (manualExitEngine as any).lastExchangeCoinQuantity = 0.73; return true; };
+  (manualExitEngine.orderManager as any).submitOrder = async (request: any) => { submittedManualExit = request; };
+  await manualExitEngine.executeManualTrade('SELL');
+  assert(protectiveCancelCalled && submittedManualExit?.signalType === 'EMERGENCY_FULL_EXIT' && submittedManualExit?.requestedVolume === 0.73, '[Manual emergency sell] Pending orders are cancelled/reconciled and actual exchange quantity is sold');
+  let pendingManualBuyRejected = false;
+  try { await manualExitEngine.executeManualTrade('BUY', 10); } catch { pendingManualBuyRejected = true; }
+  assert(pendingManualBuyRejected, '[Manual emergency sell] Pending orders still reject manual BUY');
+
+  // A dry-run decision is diagnostic only: no production durable ledger may
+  // be changed and the normal fill handler must never be invoked.
+  const dryRunEngine = new ATREngine(undefined, { backtest: true });
+  dryRunEngine.params.dryRunMode = true;
+  dryRunEngine.botState = 'RUNNING';
+  (dryRunEngine as any).marketManager.marketState = 'LIVE';
+  const dryBefore = [posFile, orderFile, reservationFile].map((file) => fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '__MISSING__');
+  let dryFillHandlerCalled = false;
+  (dryRunEngine as any).handleOrderFilled = () => { dryFillHandlerCalled = true; };
+  (dryRunEngine as any).strategyCore.generateSignals = () => [{
+    id: `SIG_DRY_${Date.now()}`, timestamp: Date.now(), timeframe: 'tick', source: 'test', type: 'ENTRY_BUY', priority: 6,
+    symbol: 'KRW-ETH', price: 2_700_000, reason: 'dry-run entry',
+    indicatorSnapshot: { baseline: 2_700_000, atr: 10_000, upperBand: 2_730_000, lowerBand: 2_670_000, currentStopLoss: 2_538_000, marketRegime: 'SIDEWAYS', slope: 0, volatilityRatio: 1, dynamicOrderRatio: 20 }
+  }];
+  (dryRunEngine as any).riskGovernor.evaluateSignal = () => ({ approved: true, calculatedBudgetKrw: 100_000, orderRequest: {
+    clientOrderId: `ORD_DRY_${Date.now()}`, signalId: `SIG_DRY_ORDER_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY', requestedAmountKrw: 100_000, reason: 'dry-run entry', createdAt: Date.now()
+  }});
+  await dryRunEngine.handleMarketTick(2_700_000, Date.now());
+  const dryAfter = [posFile, orderFile, reservationFile].map((file) => fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '__MISSING__');
+  assert(!dryFillHandlerCalled && JSON.stringify(dryBefore) === JSON.stringify(dryAfter), '[Dry-run isolation] Simulated fill never mutates production position/order/risk files');
+
+  // REST fallback keeps the displayed price fresh, but cannot mask a zombie
+  // socket. The watchdog must reconnect based on WebSocket time only.
+  const feedManager = new MarketDataManager('UPBIT', 'KRW-ETH', undefined, undefined, false);
+  let reconnectCalls = 0;
+  (feedManager as any).upbitClient.fetchTicker = async () => ({ symbol: 'KRW-ETH', price: 2_700_000, timestamp: Date.now() });
+  (feedManager as any).upbitClient.reconnect = () => { reconnectCalls += 1; };
+  feedManager.lastWsReceivedAt = Date.now() - 25_000;
+  feedManager.lastAnyPriceReceivedAt = Date.now();
+  feedManager.lastReceivedAt = feedManager.lastAnyPriceReceivedAt;
+  (feedManager as any).startWatchdog();
+  await new Promise((resolve) => setTimeout(resolve, 3_300));
+  feedManager.destroy();
+  assert(feedManager.lastAnyPriceReceivedAt > feedManager.lastWsReceivedAt && reconnectCalls >= 1, '[Market feed] Healthy REST fallback does not reset WS zombie watchdog or prevent reconnect');
+
+  // Isolate this parameter semantic test from the intentionally persisted
+  // daily-circuit restart scenario immediately above.
+  if (fs.existsSync(dailyRiskFile)) fs.unlinkSync(dailyRiskFile);
+  const zeroRatioRisk = new GlobalRiskGovernor({ ...defaultParams, autoPilotEnabled: false, orderRatio: 0 });
+  const zeroRatioEval = zeroRatioRisk.evaluateSignal(
+    { ...bullBuySignal, id: `SIG_ZERO_RATIO_${Date.now()}`, type: 'ENTRY_BUY' }, 'RUNNING', 'LIVE', 1_000_000,
+    { ...testPosition, state: 'FLAT', amount: 0, entryPrice: null, totalCostKrw: 0 }, 2_700_000, [], 0
+  );
+  assert(zeroRatioEval.approved === false && zeroRatioEval.calculatedBudgetKrw === undefined && /Available budget/.test(zeroRatioEval.rejectionReason || ''), '[Zero semantics] orderRatio=0 remains zero and never falls back to a 25% BUY');
 
   // ──────────────────────────────────────────────────────
   // RESULTS

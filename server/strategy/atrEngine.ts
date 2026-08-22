@@ -374,7 +374,8 @@ export class ATREngine {
         if (generation !== this.startupGeneration) return;
         // A process restart must never silently bypass a same-day loss halt.
         // Preserve the safe PAUSED state and clear the saved run intent instead.
-        if (this.params.isBotActive && this.riskGovernor.getDailyLossStatus().circuitBroken) {
+        const dailyCircuitActive = this.riskGovernor.getDailyLossStatus().circuitBroken;
+        if (this.params.isBotActive && dailyCircuitActive) {
           this.disableAutoRunIntent();
           this.addLog({
             type: 'SYSTEM',
@@ -383,7 +384,10 @@ export class ATREngine {
           });
         }
         this.startupReady = true;
-        this.botState = this.params.isBotActive ? 'RUNNING' : 'PAUSED';
+        // A daily-loss halt is intentionally a sell-only HALTED state after
+        // restart. PAUSED would reject ABSOLUTE_STOP_EXIT and leave an open
+        // position without automatic protection.
+        this.botState = dailyCircuitActive ? 'HALTED' : (this.params.isBotActive ? 'RUNNING' : 'PAUSED');
         this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '[시작 장벽 해제] 완성 캔들·미체결 주문·실계좌 동기화 완료 — 전략 신호 허용' });
         this.startBackgroundRefreshes();
       } catch (e: any) {
@@ -508,23 +512,33 @@ export class ATREngine {
     this.broadcastCallback = cb;
   }
 
-  /** Seeds the chart only with completed exchange candles; never synthetic data. */
+  /** Seeds the chart with completed exchange 1-minute candles and smooth historical rolling bands. */
   private seedPriceHistoryFromCompletedCandles(candles: UpbitCandle[], baseline: number, atr: number) {
-    const effectiveAtr = Math.max(atr, 5000);
-    // When holding a position the chart must show the actual persisted fixed
-    // stop, never an obsolete ATR-derived historical proxy.
+    const minAtrFloor = Math.max(5000, Math.round((candles[candles.length - 1]?.trade_price || 3000000) * 0.0025));
+    const effectiveAtr = Math.max(atr, minAtrFloor);
+    const effectiveMultiplier = this.params.autoPilotEnabled ? (this.marketRegime === 'BULL' ? 1.8 : 2.4) : this.params.atrMultiplier;
     const persistedStop = this.positionManager.getSnapshot().initialStopPrice;
-    this.priceHistory = candles.slice(-40).map((candle) => {
+    const count = candles.length;
+    const startIndex = Math.max(0, count - 40);
+
+    this.priceHistory = candles.slice(startIndex).map((candle, sliceIdx) => {
+      const originalIdx = startIndex + sliceIdx;
+      // Rolling baseline over up to 20 lookback bars
+      const baselineSlice = candles.slice(Math.max(0, originalIdx - 19), originalIdx + 1);
+      const barBaseline = baselineSlice.length > 0
+        ? Math.round(baselineSlice.reduce((sum, c) => sum + c.trade_price, 0) / baselineSlice.length)
+        : baseline;
+
       const date = new Date(candle.timestamp);
       const timeLabel = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
       return {
         time: candle.timestamp,
         timeLabel,
         price: candle.trade_price,
-        baseline,
-        upperBand: baseline + (effectiveAtr * this.params.atrMultiplier),
-        lowerBand: baseline - (effectiveAtr * this.params.atrMultiplier),
-        stopLoss: persistedStop || baseline - (effectiveAtr * (this.params.atrMultiplier + this.params.stopLossMultiplier))
+        baseline: barBaseline,
+        upperBand: barBaseline + (effectiveAtr * effectiveMultiplier),
+        lowerBand: barBaseline - (effectiveAtr * effectiveMultiplier),
+        stopLoss: persistedStop || barBaseline - (effectiveAtr * (effectiveMultiplier + this.params.stopLossMultiplier))
       };
     });
   }
@@ -749,9 +763,7 @@ export class ATREngine {
       // the market exit is sized from currently unlocked exchange quantity.
       if (!this.params.dryRunMode && (topSignal.type === 'ABSOLUTE_STOP_EXIT' || topSignal.type === 'EMERGENCY_FULL_EXIT')) {
         try {
-          await this.orderManager.cancelPendingOrdersForProtectiveExit(this.secretManager.getKeys(), this.params.symbol);
-          const synchronized = await this.fetchRealAccountBalance();
-          if (!synchronized) throw new Error('Could not refresh exchange balance after protective-order cancellation.');
+          await this.coordinateProtectiveFullExit();
           position = this.positionManager.getSnapshot();
         } catch (e: any) {
           this.durabilityFailure = true;
@@ -776,7 +788,7 @@ export class ATREngine {
 
       if (riskResult.approved && riskResult.orderRequest) {
         const clientOrderId = riskResult.orderRequest.clientOrderId;
-        if (topSignal.type === 'REENTRY_BUY' && !this.positionManager.markReentryPending()) {
+        if (!this.params.dryRunMode && topSignal.type === 'REENTRY_BUY' && !this.positionManager.markReentryPending()) {
           console.warn('[ATREngine] Re-entry signal discarded because its permission was already consumed.');
           return;
         }
@@ -788,7 +800,8 @@ export class ATREngine {
           reason: `[위험관리 승인] ${topSignal.reason} ➡️ 주문 발송 중... (예산: ₩${Math.round(riskResult.calculatedBudgetKrw || 0).toLocaleString()})`
         });
 
-        // DRY-RUN MODE: Simulate fill without touching exchange
+        // DRY-RUN MODE: record a hypothetical decision only. A simulated
+        // fill must never mutate the production position/order/risk ledgers.
         if (this.params.dryRunMode) {
           const dryVolume = riskResult.orderRequest.side === 'BUY'
             ? (riskResult.orderRequest.requestedAmountKrw || 0) / price
@@ -804,7 +817,10 @@ export class ATREngine {
             side: riskResult.orderRequest.side
           };
           console.log(`[ATREngine] 🏷️ DRY-RUN: Simulated ${riskResult.orderRequest.side} ${dryVolume.toFixed(6)} @ ₩${Math.round(price).toLocaleString()}`);
-          this.handleOrderFilled(topSignal.type, dryRecord, price);
+          this.addLog({
+            type: 'SYSTEM', price,
+            reason: `[DRY-RUN 가상 체결] ${topSignal.type} ${dryRecord.side} ${dryVolume.toFixed(6)} @ ₩${Math.round(price).toLocaleString()} — 실계좌 원장 미변경`
+          });
         } else {
           // 3. Execute Order via OrderManager (OrderManager autonomously manages reserve/commit/release lifecycle)
           try {
@@ -840,22 +856,36 @@ export class ATREngine {
       }
     }
 
-    // Update Price History Chart Points
+    // Update 1-Minute Price History Chart Series
+    const currentMinuteBucket = Math.floor(timestamp / 60000) * 60000;
     const d = new Date(timestamp);
-    const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
+    const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+    const lastBar = this.priceHistory.length > 0 ? this.priceHistory[this.priceHistory.length - 1] : null;
+    const isSameMinute = lastBar && Math.floor(lastBar.time / 60000) * 60000 === currentMinuteBucket;
 
-    this.priceHistory.push({
-      time: timestamp,
-      timeLabel,
-      price,
-      baseline: this.baselineValue,
-      upperBand,
-      lowerBand,
-      stopLoss: staticStopPrice
-    });
-
-    if (this.priceHistory.length > 40) {
-      this.priceHistory.shift();
+    if (isSameMinute && lastBar) {
+      // Update the current in-flight minute bar with latest live tick and bands
+      lastBar.price = price;
+      lastBar.baseline = this.baselineValue;
+      lastBar.upperBand = upperBand;
+      lastBar.lowerBand = lowerBand;
+      lastBar.stopLoss = staticStopPrice;
+      lastBar.time = timestamp;
+      lastBar.timeLabel = timeLabel;
+    } else {
+      // Start new 1-minute bar
+      this.priceHistory.push({
+        time: timestamp,
+        timeLabel,
+        price,
+        baseline: this.baselineValue,
+        upperBand,
+        lowerBand,
+        stopLoss: staticStopPrice
+      });
+      if (this.priceHistory.length > 40) {
+        this.priceHistory.shift();
+      }
     }
 
     this.notifyClients();
@@ -1375,7 +1405,7 @@ export class ATREngine {
     if (this.marketManager.marketState !== 'LIVE') {
       throw new Error(`Manual order blocked: market feed is ${this.marketManager.marketState}.`);
     }
-    if (this.orderManager.getPendingOrdersCount() > 0) {
+    if (side === 'BUY' && this.orderManager.getPendingOrdersCount() > 0) {
       throw new Error('Manual order blocked: another order is pending reconciliation.');
     }
     const position = this.positionManager.getSnapshot();
@@ -1392,7 +1422,7 @@ export class ATREngine {
       if (manualBuyPercent !== undefined && ![10, 20, 30].includes(manualBuyPercent)) {
         throw new Error('Manual buy percentage must be one of 10, 20, or 30.');
       }
-      const selectedPercent = isAdditional ? (manualBuyPercent ?? 10) : (this.params.orderRatio || 25);
+      const selectedPercent = isAdditional ? (manualBuyPercent ?? 10) : (this.params.orderRatio ?? 25);
       const targetBudget = exposure.totalCapitalKrw * (selectedPercent / 100);
 
       const budget = Math.floor(Math.min(
@@ -1434,13 +1464,21 @@ export class ATREngine {
         this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '❌ 수동 매도 실패: 보유 코인 수량 없음' });
         return;
       }
+      // Manual full exit shares the same coordinator as an automatic
+      // protective exit: first cancel/reconcile every live order, refresh
+      // exchange balance, then sell the actually unlocked remaining volume.
+      const actualRemainingVolume = await this.coordinateProtectiveFullExit();
+      if (actualRemainingVolume <= 1e-8) {
+        this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '❌ 수동 매도 실패: 거래소에서 청산 가능한 보유 수량을 확인하지 못했습니다.' });
+        return;
+      }
       const req = {
         clientOrderId: `ORD_MANUAL_SELL_${Date.now()}`,
         signalId: `SIG_MANUAL_${Date.now()}`,
         signalType: 'EMERGENCY_FULL_EXIT' as const,
         symbol: this.params.symbol,
         side: 'SELL' as const,
-        requestedVolume: position.amount,
+        requestedVolume: actualRemainingVolume,
         reason: '[전량 청산] 사용자 긴급 전량 매도 요청',
         createdAt: Date.now()
       };
@@ -1452,6 +1490,14 @@ export class ATREngine {
         (err) => this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `❌ 긴급 청산 에러: ${err}` })
       );
     }
+  }
+
+  /** Cancel/reconcile live orders and refresh the exchange quantity before a full protective market exit. */
+  private async coordinateProtectiveFullExit(): Promise<number> {
+    await this.orderManager.cancelPendingOrdersForProtectiveExit(this.secretManager.getKeys(), this.params.symbol);
+    const synchronized = await this.fetchRealAccountBalance();
+    if (!synchronized) throw new Error('Could not refresh exchange balance after protective-order cancellation.');
+    return this.lastExchangeCoinQuantity;
   }
 
   /**
@@ -1821,7 +1867,7 @@ export class ATREngine {
     const pages: NextOrderItem[] = [];
     const effectiveOrderRatio = (this.params.autoPilotEnabled && adaptive.dynamicOrderRatio > 0)
       ? adaptive.dynamicOrderRatio
-      : (this.params.orderRatio || 25);
+      : (this.params.orderRatio ?? 25);
     const baseUnitBudget = exposure.totalCapitalKrw * (effectiveOrderRatio / 100);
 
     if (pos.amount > 0 && pos.state !== 'FLAT') {
@@ -2081,7 +2127,7 @@ export class ATREngine {
     const nextOrderInfo = {
       type: pages[0]?.type || '1차 신규 진입',
       budgetKrw: pages[0]?.budgetKrw || 0,
-      unitPercent: pages[0]?.unitPercent || (this.params.orderRatio || 25),
+      unitPercent: pages[0]?.unitPercent ?? (this.params.orderRatio ?? 25),
       scaleMultiplier: pages[0]?.scaleMultiplier || 1.0,
       targetPriceLabel: pages[0]?.targetPriceLabel || '',
       pages

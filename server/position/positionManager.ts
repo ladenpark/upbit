@@ -581,7 +581,7 @@ export class PositionManager {
     this.position.partialCutCount = cutStep;
     this.position.state = cutStep === 1 ? 'DEFENSIVE_1' : 'DEFENSIVE_2';
     this.position.lastUpdatedAt = Date.now();
-    this.setCooldown(this.params.cooldownSecondsAfterCut || 60, 'PARTIAL_LOSS_CUT');
+    this.setCooldown(this.params.cooldownSecondsAfterCut ?? 60, 'PARTIAL_LOSS_CUT');
 
     this.saveStateToFile();
     console.log(`[PositionManager] 🛡️ Partial Loss Cut #${cutStep} Filled: Cut ${cutVolume} @ ₩${cutPrice.toLocaleString()}, PnL=₩${pnl.toLocaleString()}, State ➡️ ${this.position.state}`);
@@ -609,7 +609,7 @@ export class PositionManager {
     this.position.state = 'EMERGENCY_EXIT';
     this.position.lastUpdatedAt = Date.now();
 
-    this.setCooldown(this.params.cooldownSecondsAfterCut || 60, 'EMERGENCY_TREND_CUT');
+    this.setCooldown(this.params.cooldownSecondsAfterCut ?? 60, 'EMERGENCY_TREND_CUT');
     this.saveStateToFile();
     console.log(`[PositionManager] Emergency Trend Cut: Cut ${cutVolume} @ ₩${cutPrice.toLocaleString()}, State ➡️ EMERGENCY_EXIT`);
   }

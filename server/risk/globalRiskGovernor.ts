@@ -433,7 +433,7 @@ export class GlobalRiskGovernor {
       const dynamicRatio = signal.indicatorSnapshot?.dynamicOrderRatio;
       const effectiveOrderRatio = (this.params.autoPilotEnabled && typeof dynamicRatio === 'number' && dynamicRatio > 0)
         ? dynamicRatio / 100
-        : (this.params.orderRatio || 25) / 100;
+        : (this.params.orderRatio ?? 25) / 100;
       let targetBudget = limits.totalCapitalKrw * effectiveOrderRatio;
 
       if (signal.type === 'REGIME_REBALANCE_BUY') {
