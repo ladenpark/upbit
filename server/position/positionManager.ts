@@ -72,6 +72,7 @@ export class PositionManager {
       trailingExitCount: 0,
       profitLockPrice: null,
       lastRegimeRebalanceAt: 0,
+      recycleCycleCount: 0,
       cooldownUntil: 0
     };
   }
@@ -551,6 +552,26 @@ export class PositionManager {
     this.position.state = 'ENTRY_FILLED';
     this.position.lastUpdatedAt = Date.now();
     this.saveStateToFile();
+  }
+
+  /**
+   * Additional execution of the same REENTRY order. It rebuilds the weighted
+   * average and protection levels, but a recycle cycle is counted per order,
+   * never per partial fill.
+   */
+  public addAdditionalReentryFilled(
+    fillPrice: number,
+    fillVolume: number,
+    baseline: number,
+    atr: number,
+    atrMultiplier: number,
+    stopLossMultiplier: number
+  ) {
+    this.onManualAdditionalBuyFilled(fillPrice, fillVolume, baseline, atr, atrMultiplier, stopLossMultiplier);
+    this.position.state = 'ENTRY_FILLED';
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+    console.log(`[PositionManager] Additional Re-entry Volume Filled: Added=${fillVolume}, recycle cycle remains ${this.position.recycleCycleCount || 0}`);
   }
 
   /**

@@ -15,7 +15,7 @@ import { ATRStrategyCore } from './atrStrategyCore';
 import { GlobalRiskGovernor } from '../risk/globalRiskGovernor';
 import { PositionManager } from '../position/positionManager';
 import { OrderManager } from '../orders/orderManager';
-import { UpbitClient } from '../exchanges/upbit';
+import { UpbitClient, UpbitCandle } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
 import { roundDownToTick } from '../utils/priceUtils';
 import { ResearchRecorder, ResearchDecision } from '../research/researchRecorder';
@@ -34,7 +34,7 @@ export class ATREngine {
   private researchRecorder?: ResearchRecorder;
 
   // Bot Lifecycle State
-  public botState: BotLifecycleState = 'PAUSED';
+  public botState: BotLifecycleState = 'STARTING';
 
   // Strategy Core Parameters
   public params: BotParams = {
@@ -102,6 +102,25 @@ export class ATREngine {
   private balanceRefreshTimer: NodeJS.Timeout | null = null;
   private atrRefreshTimer: NodeJS.Timeout | null = null;
   private balanceSyncTimeout: NodeJS.Timeout | null = null;
+  private startupReady = false;
+  private startupPromise: Promise<void> | null = null;
+  private startupFailureReason: string | null = null;
+  private startupGeneration = 0;
+  private accountContextGeneration = 0;
+
+  private captureAsyncContext() {
+    return {
+      startupGeneration: this.startupGeneration,
+      symbol: this.params.symbol,
+      accountContextGeneration: this.accountContextGeneration
+    };
+  }
+
+  private isAsyncContextCurrent(context: ReturnType<ATREngine['captureAsyncContext']>) {
+    return context.startupGeneration === this.startupGeneration &&
+      context.symbol === this.params.symbol &&
+      context.accountContextGeneration === this.accountContextGeneration;
+  }
 
   constructor(broadcastCallback?: (payload: any) => void, options: { backtest?: boolean } = {}) {
     this.broadcastCallback = broadcastCallback;
@@ -124,6 +143,11 @@ export class ATREngine {
         }
       }
     );
+    // Every background order watcher result is valid only for this exact
+    // symbol/account/startup context. invalidateStartupBarrier() replaces
+    // this guard before any previous async watcher response can commit.
+    const initialWatcherContext = this.captureAsyncContext();
+    this.orderManager.setWatcherContextGuard(() => this.isAsyncContextCurrent(initialWatcherContext));
 
     // Restore persisted trade logs from disk so UI doesn't reset on restart
     this.logs = PositionManager.loadTradeLogs().slice(0, 300);
@@ -178,8 +202,6 @@ export class ATREngine {
     this.totalTrades = closedTradesCount;
     this.winTrades = winCount;
 
-    this.initDefaultHistory();
-
     // Initialize Market Data Manager with tick dispatcher
     this.marketManager = new MarketDataManager(
       this.params.exchange,
@@ -192,15 +214,81 @@ export class ATREngine {
       !options.backtest
     );
 
-    if (!options.backtest) {
-      // Fetch initial dynamic ATR from candles
-      this.refreshAtrFromExchange();
-      // Initial account balance load & reconciliation
-      this.reconcileOnStartup();
+    if (options.backtest) {
+      // Backtests provide their own deterministic market/account setup.
+      this.startupReady = true;
+      this.botState = 'PAUSED';
+    } else {
+      this.startStartupBarrier();
+    }
+  }
+
+  /**
+   * No strategy signal is allowed until the market indicators, pending orders
+   * and exchange balance all describe the same point-in-time startup state.
+   */
+  private startStartupBarrier(): Promise<void> {
+    if (this.startupReady) return Promise.resolve();
+    if (this.startupPromise) return this.startupPromise;
+
+    const generation = this.startupGeneration;
+    this.botState = 'STARTING';
+    this.startupFailureReason = null;
+    this.notifyClients();
+    this.startupPromise = (async () => {
+      try {
+        const indicatorsReady = await this.refreshAtrFromExchange();
+        if (!indicatorsReady) throw new Error('완성된 1분/15분 캔들로 지표를 준비하지 못했습니다.');
+
+        const reconciled = await this.reconcileOnStartup();
+        if (!reconciled) throw new Error('거래소 주문 또는 잔고 동기화에 실패했습니다.');
+
+        if (generation !== this.startupGeneration) return;
+        this.startupReady = true;
+        this.botState = this.params.isBotActive ? 'RUNNING' : 'PAUSED';
+        this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '[시작 장벽 해제] 완성 캔들·미체결 주문·실계좌 동기화 완료 — 전략 신호 허용' });
+        this.startBackgroundRefreshes();
+      } catch (e: any) {
+        if (generation !== this.startupGeneration) return;
+        this.startupReady = false;
+        this.startupFailureReason = e.message || 'startup synchronization failed';
+        // Fail closed: a bot cannot become RUNNING from incomplete startup data.
+        this.params.isBotActive = false;
+        this.botState = 'PAUSED';
+        this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `⚠️ [시작 장벽 유지] ${this.startupFailureReason} — 자동 주문 차단` });
+      } finally {
+        if (generation === this.startupGeneration) {
+          this.startupPromise = null;
+          this.notifyClients();
+        }
+      }
+    })();
+    return this.startupPromise;
+  }
+
+  /** Discards stale market/account assumptions before a symbol or account switch. */
+  private invalidateStartupBarrier() {
+    this.startupGeneration += 1;
+    this.startupReady = false;
+    this.startupPromise = null;
+    this.startupFailureReason = null;
+    this.botState = 'STARTING';
+    this.recent1mCloses = [];
+    this.priceHistory = [];
+    this.higherTfTrend = { trend: 'SIDEWAYS', htfSlope: 0 };
+
+    const watcherContext = this.captureAsyncContext();
+    this.orderManager.setWatcherContextGuard(() => this.isAsyncContextCurrent(watcherContext));
+  }
+
+  private startBackgroundRefreshes() {
+    if (!this.balanceRefreshTimer) {
       // Start periodic background balance sync (every 10s)
       this.balanceRefreshTimer = setInterval(() => {
         this.fetchRealAccountBalance();
       }, 10000);
+    }
+    if (!this.atrRefreshTimer) {
       // Start periodic background ATR recalculation (every 30s)
       this.atrRefreshTimer = setInterval(() => {
         this.refreshAtrFromExchange();
@@ -208,22 +296,40 @@ export class ATREngine {
     }
   }
 
-  public async reconcileOnStartup() {
+  public async reconcileOnStartup(): Promise<boolean> {
     console.log('[ATREngine] 🔄 Starting complete startup state reconciliation...');
+    const context = this.captureAsyncContext();
+    const symbol = context.symbol;
     try {
       const keys = this.secretManager.getKeys();
       if (keys.upbitAccessKey && keys.upbitSecretKey) {
         // 1. Reconcile Pending Orders from disk against Upbit Exchange
-        await this.orderManager.reconcilePendingOrdersOnStartup(keys, 'UPBIT', this.params.symbol);
+        await this.orderManager.reconcilePendingOrdersOnStartup(
+          keys,
+          'UPBIT',
+          symbol,
+          () => this.isAsyncContextCurrent(context)
+        );
+        if (!this.isAsyncContextCurrent(context)) return false;
+        const unresolvedOrders = this.orderManager.getPendingOrders().filter((order) =>
+          order.status === 'UNKNOWN_PENDING_RECONCILIATION' ||
+          order.status === 'ORDER_SUBMITTING' ||
+          order.status === 'ORDER_SUBMITTED'
+        );
+        if (unresolvedOrders.length > 0) {
+          console.warn(`[ATREngine] Startup blocked: ${unresolvedOrders.length} order(s) remain unconfirmed.`);
+          return false;
+        }
 
         // 2. Sync Real Account Balances
-        await this.fetchRealAccountBalance();
+        const balanceSynced = await this.fetchRealAccountBalance();
+        if (!this.isAsyncContextCurrent(context) || !balanceSynced) return false;
 
         // 3. Query Open Orders on Exchange
-        const openRes = await this.upbitClient.getOpenOrders(keys.upbitAccessKey, keys.upbitSecretKey, this.params.symbol);
-        if (openRes.success && Array.isArray(openRes.orders)) {
-          console.log(`[ATREngine] 📋 Exchange active open orders: ${openRes.orders.length}`);
-        }
+        const openRes = await this.upbitClient.getOpenOrders(keys.upbitAccessKey, keys.upbitSecretKey, symbol);
+        if (!this.isAsyncContextCurrent(context)) return false;
+        if (!openRes.success || !Array.isArray(openRes.orders)) return false;
+        console.log(`[ATREngine] 📋 Exchange active open orders: ${openRes.orders.length}`);
 
         // 4. Position reconciled automatically via fetchRealAccountBalance
         this.addLog({
@@ -231,48 +337,34 @@ export class ATREngine {
           price: this.currentPrice,
           reason: `[시스템 복구 완료] 거래소 계좌 및 공식 평단가 동기화 완료`
         });
+        return balanceSynced;
       }
     } catch (e: any) {
       console.error('[ATREngine] Startup reconciliation error:', e.message);
     }
+    return false;
   }
 
   public setBroadcastCallback(cb: (payload: any) => void) {
     this.broadcastCallback = cb;
   }
 
-  private initDefaultHistory() {
-    const base = this.currentPrice;
-    const atr = this.atrValue;
-    const now = Date.now();
-    const history: PricePoint[] = [];
-    let tempPrice = base;
-
-    for (let i = 35; i >= 0; i--) {
-      const time = now - i * 1000;
-      const noise = (Math.random() - 0.5) * (atr * 0.35);
-      tempPrice = Math.max(tempPrice + noise, base * 0.8);
-
-      const baseline = base + Math.sin(i * 0.2) * (atr * 0.4);
-      const upper = baseline + atr * this.params.atrMultiplier;
-      const lower = baseline - atr * this.params.atrMultiplier;
-      const stop = lower - atr * this.params.stopLossMultiplier;
-
-      const d = new Date(time);
-      const timeLabel = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
-
-      history.push({
-        time,
+  /** Seeds the chart only with completed exchange candles; never synthetic data. */
+  private seedPriceHistoryFromCompletedCandles(candles: UpbitCandle[], baseline: number, atr: number) {
+    const effectiveAtr = Math.max(atr, 5000);
+    this.priceHistory = candles.slice(-40).map((candle) => {
+      const date = new Date(candle.timestamp);
+      const timeLabel = `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`;
+      return {
+        time: candle.timestamp,
         timeLabel,
-        price: Number(tempPrice.toFixed(2)),
-        baseline: Number(baseline.toFixed(2)),
-        upperBand: Number(upper.toFixed(2)),
-        lowerBand: Number(lower.toFixed(2)),
-        stopLoss: Number(stop.toFixed(2))
-      });
-    }
-
-    this.priceHistory = history;
+        price: candle.trade_price,
+        baseline,
+        upperBand: baseline + (effectiveAtr * this.params.atrMultiplier),
+        lowerBand: baseline - (effectiveAtr * this.params.atrMultiplier),
+        stopLoss: baseline - (effectiveAtr * (this.params.atrMultiplier + this.params.stopLossMultiplier))
+      };
+    });
   }
 
   /**
@@ -338,6 +430,14 @@ export class ATREngine {
   public async handleMarketTick(price: number, timestamp: number) {
     this.currentPrice = price;
     this.researchRecorder?.recordTick(this.params.symbol, price, timestamp);
+
+    // Ticks are retained by MarketDataManager while startup runs, but no
+    // indicator evaluation, protective-state mutation, signal or order can
+    // happen until the authoritative startup barrier has completed.
+    if (!this.startupReady) {
+      this.notifyClients();
+      return;
+    }
 
     // Candle closes drive regime/slope/scalp decisions; raw ticks remain for
     // DCA rebound and short-term microstructure checks.
@@ -564,7 +664,12 @@ export class ATREngine {
     // Use exchange-confirmed price if available, otherwise fall back to tick price
     const fillPrice = record.avgFillPrice > 0 ? record.avgFillPrice : tickPrice;
 
-    const isIncremental = overrideVolume !== undefined && overrideVolume > 0;
+    // A watcher can observe an order's very first fill (for example after a
+    // restart).  It must run the initial strategy transition once, not an
+    // "additional fill" transition merely because the delivery came from the
+    // watcher.
+    const isInitialStrategyFill = record.strategyFillKind === 'INITIAL';
+    const isIncremental = !isInitialStrategyFill && overrideVolume !== undefined && overrideVolume > 0;
 
     // Use overrideVolume (incremental added volume) if passed by watcher, otherwise full filledVolume
     const effectiveVolume = isIncremental
@@ -587,7 +692,7 @@ export class ATREngine {
           this.params.stopLossMultiplier
         );
       }
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -604,7 +709,7 @@ export class ATREngine {
         this.params.atrMultiplier,
         this.params.stopLossMultiplier
       );
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -613,15 +718,26 @@ export class ATREngine {
         reason: `${record.reason} [수동 추가 체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()} · DCA 슬롯 보존]`
       });
     } else if (signalType === 'REENTRY_BUY') {
-      this.positionManager.onReentryBuyFilled(
-        fillPrice,
-        effectiveVolume,
-        this.baselineValue,
-        this.atrValue,
-        this.params.atrMultiplier,
-        this.params.stopLossMultiplier
-      );
-      this.totalTrades += 1;
+      if (isIncremental) {
+        this.positionManager.addAdditionalReentryFilled(
+          fillPrice,
+          effectiveVolume,
+          this.baselineValue,
+          this.atrValue,
+          this.params.atrMultiplier,
+          this.params.stopLossMultiplier
+        );
+      } else {
+        this.positionManager.onReentryBuyFilled(
+          fillPrice,
+          effectiveVolume,
+          this.baselineValue,
+          this.atrValue,
+          this.params.atrMultiplier,
+          this.params.stopLossMultiplier
+        );
+      }
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -642,7 +758,7 @@ export class ATREngine {
           this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume);
         }
       }
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -657,7 +773,7 @@ export class ATREngine {
       } else {
         this.positionManager.onPyramidFilled(fillPrice, effectiveVolume);
       }
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -668,7 +784,7 @@ export class ATREngine {
     } else if (signalType === 'BOX_PYRAMID_BUY') {
       if (isIncremental) this.positionManager.addAdditionalBoxPyramidFilled(fillPrice, effectiveVolume);
       else this.positionManager.onBoxPyramidFilled(fillPrice, effectiveVolume);
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({
         type: 'BUY',
         price: fillPrice,
@@ -679,7 +795,7 @@ export class ATREngine {
     } else if (signalType === 'REGIME_REBALANCE_BUY') {
       const adaptive = this.strategyCore.evaluateAdaptiveParams(fillPrice, this.baselineValue, this.atrValue, this.params, this.priceHistory.map((point) => point.price), this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa);
       this.positionManager.onRegimeRebalanceBuyFilled(fillPrice, effectiveVolume, this.baselineValue, Math.max(this.atrValue, 5000), adaptive.dynamicAtr, this.params.stopLossMultiplier);
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       this.addLog({ type: 'BUY', price: fillPrice, amount: effectiveVolume, exchange: this.params.exchange, reason: `${record.reason} [체결: ${effectiveVolume.toFixed(6)} @ ₩${Math.round(fillPrice).toLocaleString()}]` });
     } else if (signalType === 'PARTIAL_LOSS_CUT') {
       const cutVolume = effectiveVolume;
@@ -745,7 +861,7 @@ export class ATREngine {
       }
 
       this.totalRealizedPnl += pnl;
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       if (pnl > 0) this.winTrades += 1;
 
       this.addLog({
@@ -764,7 +880,7 @@ export class ATREngine {
       const pnlPercent = entry > 0 ? ((fillPrice - entry) / entry) * 100 : 0;
       this.positionManager.onScalpPartialTakeProfitFilled(sellVolume, fillPrice, pnl);
       this.totalRealizedPnl += pnl;
-      this.totalTrades += 1;
+      if (!isIncremental) this.totalTrades += 1;
       if (pnl > 0) this.winTrades += 1;
       this.addLog({
         type: 'SELL', price: fillPrice, amount: sellVolume, pnl, pnlPercent, exchange: this.params.exchange,
@@ -786,7 +902,7 @@ export class ATREngine {
           this.positionManager.setScalpReentryCooldown(180);
         }
         this.totalRealizedPnl += pnl;
-        this.totalTrades += 1;
+        if (!isIncremental) this.totalTrades += 1;
         if (pnl > 0) this.winTrades += 1;
 
         if (signalType === 'EMERGENCY_FULL_EXIT') {
@@ -853,77 +969,78 @@ export class ATREngine {
    * Authoritative real-time ATR & Baseline recalculation from Upbit candle history
    * and Multi-Timeframe (15m) Trend Analysis for Whipsaw Filtering
    */
-  public async refreshAtrFromExchange() {
+  public async refreshAtrFromExchange(): Promise<boolean> {
+    const context = this.captureAsyncContext();
+    const symbol = context.symbol;
     try {
       // 1. Fetch 1-minute candles for immediate ATR & Baseline calculation
-      const candles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/1');
+      const candles = await this.upbitClient.fetchCandles(symbol, 20, 'minutes/1');
+      if (!this.isAsyncContextCurrent(context)) return false;
       const completedCandles = candles?.slice(0, -1) || [];
-      if (completedCandles.length >= 14) {
-        this.researchRecorder?.recordCompletedCandles(this.params.symbol, completedCandles);
-        let trSum = 0;
-        for (let i = 1; i < completedCandles.length; i++) {
-          const prevClose = completedCandles[i - 1].trade_price;
-          const high = completedCandles[i].high_price;
-          const low = completedCandles[i].low_price;
-          const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
-          trSum += tr;
-        }
-        const calculatedAtr = Math.round(trSum / (completedCandles.length - 1));
-        if (calculatedAtr > 0) {
-          this.atrValue = calculatedAtr;
-          const sumClose = completedCandles.reduce((acc, c) => acc + c.trade_price, 0);
-          this.baselineValue = Math.round(sumClose / completedCandles.length);
-
-          // Calculate RSI(14) from candle closes
-          const closes = completedCandles.map((c) => c.trade_price);
-          this.recent1mCloses = closes;
-          let gains = 0;
-          let losses = 0;
-          for (let i = closes.length - 14; i < closes.length; i++) {
-            const diff = closes[i] - closes[i - 1];
-            if (diff > 0) gains += diff;
-            else losses += Math.abs(diff);
-          }
-          const avgGain = gains / 14;
-          const avgLoss = losses / 14;
-          if (avgGain === 0 && avgLoss === 0) this.rsiValue = 50.0;
-          else if (avgLoss === 0) this.rsiValue = 100.0;
-          else if (avgGain === 0) this.rsiValue = 0.0;
-          else {
-            const rs = avgGain / avgLoss;
-            this.rsiValue = Number((100 - (100 / (1 + rs))).toFixed(1));
-          }
-
-          // Calculate Volume MA & Volume Multiplier
-          const volumes = completedCandles.map((c) => c.candle_acc_trade_volume).filter((v) => v > 0);
-          if (volumes.length >= 5) {
-            this.volumeMa = Number((volumes.reduce((a, b) => a + b, 0) / volumes.length).toFixed(4));
-            const latestVol = volumes[volumes.length - 1] || this.volumeMa;
-            this.volumeMultiplier = this.volumeMa > 0 ? Number((latestVol / this.volumeMa).toFixed(2)) : 1.0;
-          }
-
-          console.log(`[ATREngine] 📊 Recalculated Dynamic Indicators: ATR=₩${this.atrValue.toLocaleString()}, Baseline=₩${this.baselineValue.toLocaleString()}, RSI=${this.rsiValue}, VolMult=${this.volumeMultiplier}x`);
-        }
+      if (completedCandles.length < 14) return false;
+      let trSum = 0;
+      for (let i = 1; i < completedCandles.length; i++) {
+        const prevClose = completedCandles[i - 1].trade_price;
+        const high = completedCandles[i].high_price;
+        const low = completedCandles[i].low_price;
+        trSum += Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
       }
+      const calculatedAtr = Math.round(trSum / (completedCandles.length - 1));
+      if (calculatedAtr <= 0) return false;
+      const calculatedBaseline = Math.round(completedCandles.reduce((acc, candle) => acc + candle.trade_price, 0) / completedCandles.length);
+      const closes = completedCandles.map((candle) => candle.trade_price);
+      let gains = 0;
+      let losses = 0;
+      for (let i = closes.length - 14; i < closes.length; i++) {
+        const diff = closes[i] - closes[i - 1];
+        if (diff > 0) gains += diff;
+        else losses += Math.abs(diff);
+      }
+      const avgGain = gains / 14;
+      const avgLoss = losses / 14;
+      const calculatedRsi = avgGain === 0 && avgLoss === 0 ? 50.0
+        : avgLoss === 0 ? 100.0
+        : avgGain === 0 ? 0.0
+        : Number((100 - (100 / (1 + (avgGain / avgLoss)))).toFixed(1));
+      const volumes = completedCandles.map((candle) => candle.candle_acc_trade_volume).filter((volume) => volume > 0);
+      const calculatedVolumeMa = volumes.length >= 5
+        ? Number((volumes.reduce((sum, volume) => sum + volume, 0) / volumes.length).toFixed(4))
+        : 0;
+      const calculatedVolumeMultiplier = calculatedVolumeMa > 0
+        ? Number(((volumes[volumes.length - 1] || calculatedVolumeMa) / calculatedVolumeMa).toFixed(2))
+        : 1.0;
 
       // 2. Fetch 15-minute candles for Higher Timeframe trend confluence
-      const htfCandles = await this.upbitClient.fetchCandles(this.params.symbol, 20, 'minutes/15');
+      const htfCandles = await this.upbitClient.fetchCandles(symbol, 20, 'minutes/15');
+      if (!this.isAsyncContextCurrent(context)) return false;
       const completedHtfCandles = htfCandles?.slice(0, -1) || [];
-      if (completedHtfCandles.length >= 10) {
-        const htfCloses = completedHtfCandles.map((c) => c.trade_price);
-        const fastHtf = htfCloses.slice(-3).reduce((a, b) => a + b, 0) / 3;
-        const slowHtf = htfCloses.slice(-10).reduce((a, b) => a + b, 0) / 10;
-        const htfSlope = ((fastHtf - slowHtf) / slowHtf) * 100;
-        let htfTrend: 'BULL' | 'SIDEWAYS' | 'BEAR' = 'SIDEWAYS';
-        if (htfSlope > 0.15) htfTrend = 'BULL';
-        else if (htfSlope < -0.15) htfTrend = 'BEAR';
-        this.higherTfTrend = { trend: htfTrend, htfSlope };
-        console.log(`[ATREngine] 📈 Higher-TF (15m) Trend Confluence: ${htfTrend} (Slope: ${htfSlope.toFixed(2)}%)`);
-      }
+      if (completedHtfCandles.length < 10) return false;
+      const htfCloses = completedHtfCandles.map((candle) => candle.trade_price);
+      const fastHtf = htfCloses.slice(-3).reduce((a, b) => a + b, 0) / 3;
+      const slowHtf = htfCloses.slice(-10).reduce((a, b) => a + b, 0) / 10;
+      const htfSlope = ((fastHtf - slowHtf) / slowHtf) * 100;
+      const htfTrend: 'BULL' | 'SIDEWAYS' | 'BEAR' = htfSlope > 0.15 ? 'BULL' : htfSlope < -0.15 ? 'BEAR' : 'SIDEWAYS';
+
+      // Commit all related indicator values atomically after both timeframes
+      // have completed under the same symbol/account/generation context.
+      if (!this.isAsyncContextCurrent(context)) return false;
+      this.atrValue = calculatedAtr;
+      this.baselineValue = calculatedBaseline;
+      this.rsiValue = calculatedRsi;
+      this.volumeMa = calculatedVolumeMa;
+      this.volumeMultiplier = calculatedVolumeMultiplier;
+      this.recent1mCloses = closes;
+      this.higherTfTrend = { trend: htfTrend, htfSlope };
+      this.seedPriceHistoryFromCompletedCandles(completedCandles, calculatedBaseline, calculatedAtr);
+      this.researchRecorder?.recordCompletedCandles(symbol, completedCandles);
+      console.log(`[ATREngine] 📊 Recalculated Dynamic Indicators: ATR=₩${calculatedAtr.toLocaleString()}, Baseline=₩${calculatedBaseline.toLocaleString()}, RSI=${calculatedRsi}, VolMult=${calculatedVolumeMultiplier}x`);
+      console.log(`[ATREngine] 📈 Higher-TF (15m) Trend Confluence: ${htfTrend} (Slope: ${htfSlope.toFixed(2)}%)`);
 
       this.notifyClients();
+      return true;
     } catch (e: any) {
       console.warn('[ATREngine] ⚠️ ATR calculation fallback notice:', e.message);
+      return false;
     }
   }
 
@@ -936,6 +1053,9 @@ export class ATREngine {
     }
     if (this.botState === 'HALTED' || this.riskGovernor.getDailyLossStatus().circuitBroken) {
       throw new Error('Manual order blocked: circuit breaker is active.');
+    }
+    if (!this.startupReady) {
+      throw new Error('Manual order blocked: startup synchronization is incomplete.');
     }
     if (this.marketManager.marketState !== 'LIVE') {
       throw new Error(`Manual order blocked: market feed is ${this.marketManager.marketState}.`);
@@ -1021,6 +1141,8 @@ export class ATREngine {
    * Authoritative balance fetch & reconciliation with exchange
    */
   public async fetchRealAccountBalance(): Promise<boolean> {
+    const context = this.captureAsyncContext();
+    const symbol = context.symbol;
     try {
       const keys = this.secretManager.getKeys();
       if (this.params.exchange === 'UPBIT' && keys.upbitAccessKey && keys.upbitSecretKey) {
@@ -1028,17 +1150,20 @@ export class ATREngine {
           return await this.upbitClient.getAccountBalance(keys.upbitAccessKey!, keys.upbitSecretKey!);
         });
 
+        if (!this.isAsyncContextCurrent(context)) return false;
         if (res.success && res.balances) {
-          this.realBalances = res.balances;
-          const krw = this.realBalances['KRW'] || 0;
-          this.actualKrwBalance = krw;
-          const coinKey = this.params.symbol.replace('KRW-', '');
+          const balances = res.balances;
+          const krw = balances['KRW'] || 0;
+          const coinKey = symbol.replace('KRW-', '');
           // A limit sell locks the coin at Upbit.  It is still part of the
           // position and must not be reconciled to zero while that order is
           // open.
-          const realCoinQty = (this.realBalances[coinKey] || 0) + (res.lockedBalances?.[coinKey] || 0);
+          const realCoinQty = (balances[coinKey] || 0) + (res.lockedBalances?.[coinKey] || 0);
           const authoritativeAvgPrice = res.avgBuyPrices ? res.avgBuyPrices[coinKey] : null;
 
+          if (!this.isAsyncContextCurrent(context)) return false;
+          this.realBalances = balances;
+          this.actualKrwBalance = krw;
           // Reconcile position state with actual coin quantity and exchange authoritative avg buy price
           this.positionManager.reconcileWithExchange(realCoinQty, authoritativeAvgPrice, this.currentPrice);
 
@@ -1095,12 +1220,27 @@ export class ATREngine {
     const symbolChanged = newParams.symbol && newParams.symbol !== this.params.symbol;
     const exchangeChanged = newParams.exchange && newParams.exchange !== this.params.exchange;
 
+    // PositionManager models exactly one asset. Switching its market while a
+    // position or an exchange order exists would mix two assets in one state
+    // machine, so reject the request before mutating any active parameters.
+    if (symbolChanged || exchangeChanged) {
+      const position = this.positionManager.getSnapshot();
+      if (position.state !== 'FLAT' || this.orderManager.getPendingOrdersCount() > 0) {
+        throw new Error('보유 포지션 또는 미체결 주문이 있어 심볼/거래소를 변경할 수 없습니다. 전량 청산 및 주문 정리 후 다시 시도하세요.');
+      }
+    }
+
     this.params = { ...this.params, ...newParams };
     this.riskGovernor.setParams(this.params);
     this.positionManager.setParams(this.params);
 
     if (newParams.isBotActive !== undefined) {
-      this.botState = newParams.isBotActive ? 'RUNNING' : 'PAUSED';
+      if (newParams.isBotActive && !this.startupReady) {
+        this.botState = 'STARTING';
+        this.startStartupBarrier();
+      } else {
+        this.botState = newParams.isBotActive ? 'RUNNING' : 'PAUSED';
+      }
       this.addLog({
         type: 'SYSTEM',
         price: this.currentPrice,
@@ -1109,9 +1249,9 @@ export class ATREngine {
     }
 
     if (symbolChanged || exchangeChanged) {
+      this.invalidateStartupBarrier();
       this.marketManager.setSymbol(this.params.exchange, this.params.symbol);
-      this.refreshAtrFromExchange();
-      this.fetchRealAccountBalance();
+      this.startStartupBarrier();
     }
 
     this.notifyClients();
@@ -1120,7 +1260,11 @@ export class ATREngine {
   public setApiKeys(keys: ApiKeys) {
     this.secretManager.saveKeys(keys);
     this.orderManager.setApiKeysForWatcher(keys);
-    this.fetchRealAccountBalance();
+    // A key change can mean a different account. Reconcile orders and balance
+    // as a single fresh startup sequence before allowing any strategy action.
+    this.accountContextGeneration += 1;
+    this.invalidateStartupBarrier();
+    this.startStartupBarrier();
     this.addLog({
       type: 'SYSTEM',
       price: this.currentPrice,
@@ -1482,6 +1626,10 @@ export class ATREngine {
     return {
       params: this.params,
       botState: this.botState,
+      startup: {
+        ready: this.startupReady,
+        failureReason: this.startupFailureReason
+      },
       marketState: this.marketManager ? this.marketManager.marketState : 'DISCONNECTED',
       marketRegime: this.marketRegime,
       adaptive,

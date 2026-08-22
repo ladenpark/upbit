@@ -13,9 +13,15 @@
 - 한 틱에서 여러 조건이 겹쳐도 우선순위가 가장 높은 신호 하나만 반환한다.
 - 보호성 매도는 대기 중인 매수 주문이 있어도 허용하되 동일 보호 매도의 중복 발주는 차단한다.
 - 자동 신규 매수는 봇이 `RUNNING`, 시세가 `LIVE`이고 쿨다운과 일일 손실 차단이 해제된 상태에서만 가능하다.
+- 서버 시작·재시작 시에는 `STARTING` 장벽이 먼저 작동한다. 진행 중 봉이 제외된 실제 1분/15분 캔들로 ATR·Baseline·RSI를 준비하고, 저장된 미체결 주문과 거래소 실계좌를 모두 동기화한 뒤에만 `READY`(`RUNNING` 또는 `PAUSED`)로 전환한다. 이 전에는 틱 기록 외의 지표·신호·주문 처리를 하지 않으며 synthetic 가격 이력은 생성하지 않는다.
+- 단일 `PositionManager`는 한 자산만 표현한다. 따라서 포지션 상태가 `FLAT`이 아니거나 미체결 주문이 하나라도 있으면 심볼·거래소 변경 요청을 거부한다. 변경이 허용된 경우에만 기존 지표·가격 이력을 폐기하고 같은 `STARTING` 장벽을 다시 통과한다. `UNKNOWN_PENDING_RECONCILIATION`, `ORDER_SUBMITTING`, `ORDER_SUBMITTED` 상태의 주문이 하나라도 남으면 장벽은 해제되지 않는다.
+- 모든 비동기 캔들·잔고 응답은 요청 시작 시의 startup generation·심볼·계정 컨텍스트를 보관한다. 응답 시점에 컨텍스트가 달라졌다면 ATR·RSI·가격 이력·잔고·포지션에는 어떤 값도 반영하지 않고 폐기한다. 1분/15분 캔들은 하나의 고정 심볼 스냅샷으로 함께 조회·검증한 뒤에만 일괄 반영한다.
+- startup 미체결 주문 reconciliation도 같은 context guard를 사용한다. 거래소 주문 응답 뒤, 주문 상태·전략 적용 watermark·포지션 콜백을 반영하기 직전에 context를 다시 확인하며 stale 응답은 완전히 폐기한다.
+- background partial-fill·지연 취소·`UNKNOWN_PENDING_RECONCILIATION` watcher도 요청 시작 시 watcher context를 고정한다. API 키/계정·심볼·startup generation이 바뀐 뒤 도착한 이전 요청의 응답은 `applyUpbitOrderState`를 호출하지 않고 폐기한다.
 - AutoPilot 1 Unit은 총자산 기준 BULL 20%, SIDEWAYS 18%, BEAR 10%다. AutoPilot OFF에서는 `orderRatio`를 사용한다.
 - 최종 매수 예산은 `min(목표 예산, 가용 KRW × 98%, 잔여 노출 한도)`이며, 기본 최대 코인 노출은 총자산의 85%다.
 - 부분 체결은 거래소 누적량이 아니라 새로 늘어난 증분 체결량만 포지션에 반영한다.
+- 각 주문은 `strategyAppliedFilledVolume`과 최초 체결 적용 시각을 주문 이력에 영속화한다. `SUBMIT_FLOW`와 watcher 중 어느 경로가 먼저 확인해도 최초 체결 전이는 정확히 한 번만 실행되며, 이후 체결분만 추가 수량으로 반영한다. 이 원칙은 DCA·상승/박스 불타기·부분손절·급락 방어·재진입에 동일하게 적용한다.
 - BOX 불타기의 증분 체결은 같은 주문의 수량만 늘리며, 불타기 단계를 추가로 소비하지 않는다.
 - 보호성 매도(`ABSOLUTE_STOP_EXIT`, `EMERGENCY_FULL_EXIT`, 트레일링 익절)는 지정가 하한을 두지 않는 시장가 매도다. 체결 보장보다 가격을 우선하는 지정가 보호 주문은 사용하지 않는다.
 - 거래소 상태가 `OPEN` 또는 `PARTIALLY_FILLED`인 모든 주문은 watcher가 감시한다. 거래소에서 확인되지 않은 `UNKNOWN_PENDING_RECONCILIATION` 매수 주문은 시간 경과만으로 취소·예약 해제하지 않으며, 확인될 때까지 신규 매수를 막는다.

@@ -136,6 +136,17 @@ export interface OrderRecord {
   reason: string;
   error?: string;
   fills: OrderFill[];
+  /**
+   * Persistent strategy-application ledger. Exchange execution and local
+   * strategy state are intentionally tracked separately: an execution is
+   * handed to the strategy only for volume above this watermark.
+   */
+  strategyAppliedFilledVolume?: number;
+  strategyAppliedFee?: number;
+  strategyInitialFillApplied?: boolean;
+  strategyInitialFillAppliedAt?: number;
+  /** Transient delivery marker; never persisted as authoritative state. */
+  strategyFillKind?: 'INITIAL' | 'INCREMENTAL';
 }
 
 export type PositionState = 
@@ -202,6 +213,7 @@ export interface PositionSnapshot {
 }
 
 export type BotLifecycleState = 
+  | 'STARTING'
   | 'RUNNING'
   | 'PAUSED'
   | 'HALTED'

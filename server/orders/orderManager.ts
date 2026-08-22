@@ -23,6 +23,8 @@ export class OrderManager {
   private processedSignalIds: Set<string> = new Set();
   private partialFillWatchTimer: NodeJS.Timeout | null = null;
   private watchingOrderIds: Set<string> = new Set();
+  private watcherContextGeneration = 0;
+  private watcherContextGuard: () => boolean = () => true;
 
   constructor(
     riskGovernor?: GlobalRiskGovernor,
@@ -47,6 +49,20 @@ export class OrderManager {
 
   public setApiKeysForWatcher(keys: ApiKeys) {
     this.lastApiKeys = keys;
+  }
+
+  /** Invalidates any watcher request already in flight for an old account/symbol context. */
+  public setWatcherContextGuard(guard: () => boolean) {
+    this.watcherContextGeneration += 1;
+    this.watcherContextGuard = guard;
+  }
+
+  private captureWatcherContext() {
+    return this.watcherContextGeneration;
+  }
+
+  private isWatcherContextCurrent(contextGeneration: number) {
+    return contextGeneration === this.watcherContextGeneration && this.watcherContextGuard();
   }
 
   /**
@@ -275,7 +291,10 @@ export class OrderManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       reason: req.reason,
-      fills: []
+      fills: [],
+      strategyAppliedFilledVolume: 0,
+      strategyAppliedFee: 0,
+      strategyInitialFillApplied: false
     };
 
     this.orders.set(record.id, record);
@@ -392,9 +411,6 @@ export class OrderManager {
     onError: (error: string) => void,
     source: 'SUBMIT_FLOW' | 'WATCHER' = 'SUBMIT_FLOW'
   ) {
-    const prevFilledVolume = record.filledVolume;
-    const prevFee = record.fee;
-
     record.exchangeOrderId = exchangeOrder.uuid;
     const { executedVolume, avgFillPrice, totalFee } = this.extractUpbitFillData(exchangeOrder);
     const remainingVolume = parseFloat(exchangeOrder.remaining_volume) || 0;
@@ -408,16 +424,10 @@ export class OrderManager {
     record.error = undefined;
     this.saveOrdersToFile();
 
-    const newlyFilledVolume = Math.max(0, executedVolume - prevFilledVolume);
-    const newlyPaidFee = Math.max(0, totalFee - prevFee);
-    // Consumers must receive *only the newly filled amount*.  Passing the
-    // cumulative exchange volume on every watcher poll corrupts local
-    // positions and PnL after partial fills.
-    const incrementalRecord: OrderRecord = {
-      ...record,
-      filledVolume: newlyFilledVolume,
-      fee: newlyPaidFee
-    };
+    const appliedVolume = record.strategyAppliedFilledVolume || 0;
+    const appliedFee = record.strategyAppliedFee || 0;
+    const unappliedVolume = Math.max(0, executedVolume - appliedVolume);
+    const unappliedFee = Math.max(0, totalFee - appliedFee);
 
     console.log(`[OrderManager] 📊 Upbit confirmed (${source}): uuid=${exchangeOrder.uuid}, state=${exchangeOrder.state}, executed=${executedVolume}, avgPrice=₩${Math.round(avgFillPrice).toLocaleString()}`);
 
@@ -426,35 +436,17 @@ export class OrderManager {
         this.riskGovernor.commitExposure(record.clientOrderId);
       }
       this.watchingOrderIds.delete(record.id);
-      if (newlyFilledVolume > 0) {
-        if (source === 'WATCHER') {
-          this.onOrderUpdated?.(incrementalRecord, newlyFilledVolume);
-        } else {
-          onFilled(incrementalRecord);
-        }
-      }
+      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, source, onFilled);
     } else if (status === 'OPEN' || status === 'PARTIALLY_FILLED') {
       // Every live exchange order must be watched. OPEN orders are especially
       // important for protective limit sells: waiting for a partial fill before
       // registering them can leave an unfilled stop unmanaged indefinitely.
       this.watchingOrderIds.add(record.id);
-      if (newlyFilledVolume > 0) {
-        if (source === 'WATCHER') {
-          this.onOrderUpdated?.(incrementalRecord, newlyFilledVolume);
-        } else {
-          onFilled(incrementalRecord);
-        }
-      }
+      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, source, onFilled);
     } else if (status === 'CANCELLED' || status === 'REJECTED') {
       // Apply any partial execution before releasing the remaining BUY
       // reservation.  A CANCELLED order is terminal, not a full fill.
-      if (newlyFilledVolume > 0) {
-        if (source === 'WATCHER') {
-          this.onOrderUpdated?.(incrementalRecord, newlyFilledVolume);
-        } else {
-          onFilled(incrementalRecord);
-        }
-      }
+      this.deliverUnappliedStrategyFill(record, unappliedVolume, unappliedFee, source, onFilled);
       if (record.side === 'BUY' && this.riskGovernor) {
         this.riskGovernor.releaseExposure(record.clientOrderId);
       }
@@ -467,13 +459,52 @@ export class OrderManager {
     }
   }
 
+  /**
+   * Delivers exactly the not-yet-applied exchange delta. The completion
+   * watermark is persisted only after the synchronous strategy handler has
+   * returned, so a handler failure remains retryable on the next reconcile.
+   */
+  private deliverUnappliedStrategyFill(
+    record: OrderRecord,
+    volume: number,
+    fee: number,
+    source: 'SUBMIT_FLOW' | 'WATCHER',
+    onFilled: (record: OrderRecord) => void
+  ) {
+    if (volume <= 0) return;
+
+    const isInitial = !record.strategyInitialFillApplied;
+    const strategyRecord: OrderRecord = {
+      ...record,
+      filledVolume: volume,
+      fee,
+      strategyFillKind: isInitial ? 'INITIAL' : 'INCREMENTAL'
+    };
+
+    if (source === 'WATCHER') {
+      this.onOrderUpdated?.(strategyRecord, volume);
+    } else {
+      onFilled(strategyRecord);
+    }
+
+    record.strategyAppliedFilledVolume = Number(((record.strategyAppliedFilledVolume || 0) + volume).toFixed(8));
+    record.strategyAppliedFee = Number(((record.strategyAppliedFee || 0) + fee).toFixed(8));
+    if (isInitial) {
+      record.strategyInitialFillApplied = true;
+      record.strategyInitialFillAppliedAt = Date.now();
+    }
+    record.updatedAt = Date.now();
+    this.saveOrdersToFile();
+  }
+
   // ──────────────────────────────────────────────────────────
   // Startup Reconciliation for Pending Orders (Upbit)
   // ──────────────────────────────────────────────────────────
   public async reconcilePendingOrdersOnStartup(
     apiKeys: ApiKeys,
     exchange: 'UPBIT' = 'UPBIT',
-    symbol: string = 'KRW-ETH'
+    symbol: string = 'KRW-ETH',
+    isContextCurrent: () => boolean = () => true
   ): Promise<number> {
     console.log(`[OrderManager] 🔄 Reconciling pending orders on startup for Upbit...`);
     this.lastApiKeys = apiKeys;
@@ -491,6 +522,14 @@ export class OrderManager {
             apiKeys.upbitAccessKey,
             apiKeys.upbitSecretKey
           );
+          // The exchange response may belong to a symbol/account/startup
+          // generation that was invalidated while this request was in flight.
+          // Never let it mutate the order ledger, strategy watermark or
+          // position callback path after that point.
+          if (!isContextCurrent()) {
+            console.warn(`[OrderManager] Discarding stale startup reconcile result: ${ord.clientOrderId}`);
+            continue;
+          }
           if (res.found && res.order) {
             this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
             reconciledCount++;
@@ -510,95 +549,77 @@ export class OrderManager {
   // ──────────────────────────────────────────────────────────
   private startPartialFillWatcher() {
     if (this.partialFillWatchTimer) return;
-    this.partialFillWatchTimer = setInterval(async () => {
-      if (!this.lastApiKeys?.upbitAccessKey || !this.lastApiKeys?.upbitSecretKey) return;
-
-      const STALE_ORDER_TIMEOUT_MS = 60000;   // 60 seconds for OPEN/PARTIALLY_FILLED
-      const UNKNOWN_ORDER_TIMEOUT_MS = 120000; // 120 seconds for UNKNOWN_PENDING_RECONCILIATION
-      const now = Date.now();
-
-      // 1. Check watched orders (PARTIALLY_FILLED / OPEN)
-      for (const orderId of Array.from(this.watchingOrderIds)) {
-        const ord = this.orders.get(orderId);
-        if (!ord || (ord.status !== 'PARTIALLY_FILLED' && ord.status !== 'OPEN')) {
-          this.watchingOrderIds.delete(orderId);
-          continue;
-        }
-
-        const elapsed = now - ord.createdAt;
-
-        // Auto-cancel stale orders after 60 seconds
-        if (elapsed > STALE_ORDER_TIMEOUT_MS && ord.exchangeOrderId) {
-          console.warn(`[OrderManager] ⏰ Stale order detected (${Math.round(elapsed / 1000)}s): ${ord.clientOrderId}. Auto-cancelling...`);
-          try {
-            const cancelRes = await this.upbitClient.cancelOrder(
-              this.lastApiKeys.upbitAccessKey,
-              this.lastApiKeys.upbitSecretKey,
-              ord.exchangeOrderId
-            );
-            if (cancelRes.success && cancelRes.order) {
-              this.applyUpbitOrderState(ord, cancelRes.order, () => {}, () => {}, 'WATCHER');
-              console.log(`[OrderManager] ✅ Stale order auto-cancelled: ${ord.clientOrderId} (filled=${ord.filledVolume})`);
-            } else {
-              console.warn(`[OrderManager] ⚠️ Cancel failed for ${ord.clientOrderId}: ${cancelRes.error}`);
-            }
-          } catch (e) {
-            console.warn(`[OrderManager] Cancel error for ${ord.clientOrderId}:`, e);
-          }
-          continue;
-        }
-
-        // Normal reconciliation for non-stale watched orders
-        try {
-          const res = await this.reconcileUpbitOrder(
-            ord.clientOrderId,
-            ord.exchangeOrderId,
-            ord.symbol,
-            ord.side,
-            this.lastApiKeys.upbitAccessKey,
-            this.lastApiKeys.upbitSecretKey
-          );
-          if (res.found && res.order) {
-            this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
-          }
-        } catch (e) {
-          console.warn(`[OrderManager] Partial fill watcher: reconcile failed for ${ord.clientOrderId}`, e);
-        }
-      }
-
-      // 2. Check UNKNOWN_PENDING_RECONCILIATION orders (not in watchingOrderIds)
-      for (const ord of this.orders.values()) {
-        if (ord.status !== 'UNKNOWN_PENDING_RECONCILIATION') continue;
-        const elapsed = now - ord.updatedAt;
-        if (elapsed <= UNKNOWN_ORDER_TIMEOUT_MS) continue;
-
-        console.warn(`[OrderManager] ⏳ UNKNOWN order unresolved for ${Math.round(elapsed / 1000)}s: ${ord.clientOrderId}. Keeping reservation until exchange confirmation.`);
-
-        // Try one last reconciliation
-        try {
-          const res = await this.reconcileUpbitOrder(
-            ord.clientOrderId,
-            ord.exchangeOrderId,
-            ord.symbol,
-            ord.side,
-            this.lastApiKeys.upbitAccessKey,
-            this.lastApiKeys.upbitSecretKey
-          );
-          if (res.found && res.order) {
-            this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
-            continue;
-          }
-        } catch {}
-
-        // An API lookup failure is never evidence that an exchange order does
-        // not exist. Leave UNKNOWN and its BUY reservation intact; startup and
-        // background reconciliation will keep retrying until a confirmed state
-        // arrives from the exchange.
-      }
+    this.partialFillWatchTimer = setInterval(() => {
+      void this.processPartialFillWatcherCycle();
     }, 4000);
 
     if (this.partialFillWatchTimer.unref) {
       this.partialFillWatchTimer.unref();
+    }
+  }
+
+  /** One watcher cycle, extracted for deterministic stale-context testing. */
+  private async processPartialFillWatcherCycle() {
+    const keys = this.lastApiKeys;
+    if (!keys?.upbitAccessKey || !keys.upbitSecretKey) return;
+
+    const STALE_ORDER_TIMEOUT_MS = 60000;
+    const UNKNOWN_ORDER_TIMEOUT_MS = 120000;
+    const now = Date.now();
+
+    for (const orderId of Array.from(this.watchingOrderIds)) {
+      const ord = this.orders.get(orderId);
+      if (!ord || (ord.status !== 'PARTIALLY_FILLED' && ord.status !== 'OPEN')) {
+        this.watchingOrderIds.delete(orderId);
+        continue;
+      }
+      const watcherContext = this.captureWatcherContext();
+      if (!this.isWatcherContextCurrent(watcherContext)) continue;
+
+      try {
+        if (now - ord.createdAt > STALE_ORDER_TIMEOUT_MS && ord.exchangeOrderId) {
+          const cancelRes = await this.upbitClient.cancelOrder(keys.upbitAccessKey, keys.upbitSecretKey, ord.exchangeOrderId);
+          if (!this.isWatcherContextCurrent(watcherContext)) {
+            console.warn(`[OrderManager] Discarding stale watcher cancel result: ${ord.clientOrderId}`);
+            continue;
+          }
+          if (cancelRes.success && cancelRes.order) {
+            this.applyUpbitOrderState(ord, cancelRes.order, () => {}, () => {}, 'WATCHER');
+          }
+          continue;
+        }
+
+        const res = await this.reconcileUpbitOrder(
+          ord.clientOrderId, ord.exchangeOrderId, ord.symbol, ord.side,
+          keys.upbitAccessKey, keys.upbitSecretKey
+        );
+        if (!this.isWatcherContextCurrent(watcherContext)) {
+          console.warn(`[OrderManager] Discarding stale watcher reconcile result: ${ord.clientOrderId}`);
+          continue;
+        }
+        if (res.found && res.order) this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
+      } catch (e) {
+        console.warn(`[OrderManager] Partial fill watcher: reconcile failed for ${ord.clientOrderId}`, e);
+      }
+    }
+
+    for (const ord of this.orders.values()) {
+      if (ord.status !== 'UNKNOWN_PENDING_RECONCILIATION' || now - ord.updatedAt <= UNKNOWN_ORDER_TIMEOUT_MS) continue;
+      const watcherContext = this.captureWatcherContext();
+      if (!this.isWatcherContextCurrent(watcherContext)) continue;
+      try {
+        const res = await this.reconcileUpbitOrder(
+          ord.clientOrderId, ord.exchangeOrderId, ord.symbol, ord.side,
+          keys.upbitAccessKey, keys.upbitSecretKey
+        );
+        if (!this.isWatcherContextCurrent(watcherContext)) {
+          console.warn(`[OrderManager] Discarding stale UNKNOWN watcher result: ${ord.clientOrderId}`);
+          continue;
+        }
+        if (res.found && res.order) this.applyUpbitOrderState(ord, res.order, () => {}, () => {}, 'WATCHER');
+      } catch {
+        // UNKNOWN remains blocked until a later authoritative reconciliation.
+      }
     }
   }
 
@@ -612,7 +633,18 @@ export class OrderManager {
         const raw = fs.readFileSync(ORDERS_FILE, 'utf-8');
         const list: OrderRecord[] = JSON.parse(raw);
         const now = Date.now();
+        let migrated = false;
         list.forEach((ord) => {
+          // Old order files predate the strategy watermark. Their persisted
+          // position state has already consumed recorded fills, so treating
+          // historical volume as unapplied would duplicate a live position on
+          // the first post-upgrade watcher reconciliation.
+          if (ord.strategyAppliedFilledVolume === undefined) {
+            ord.strategyAppliedFilledVolume = ord.filledVolume || 0;
+            ord.strategyAppliedFee = ord.fee || 0;
+            ord.strategyInitialFillApplied = (ord.filledVolume || 0) > 0;
+            migrated = true;
+          }
           this.orders.set(ord.id, ord);
           if (ord.status === 'PARTIALLY_FILLED' || ord.status === 'OPEN') {
             this.watchingOrderIds.add(ord.id);
@@ -621,6 +653,7 @@ export class OrderManager {
             this.processedSignalIds.add(ord.signalId);
           }
         });
+        if (migrated) this.saveOrdersToFile();
         console.log(`[OrderManager] Restored ${this.orders.size} orders from history file (stale ghost orders cleaned).`);
       }
     } catch (e) {

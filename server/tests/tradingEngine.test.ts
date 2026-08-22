@@ -7,9 +7,11 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { ATRStrategyCore } from '../strategy/atrStrategyCore';
 import { GlobalRiskGovernor } from '../risk/globalRiskGovernor';
+import { ATREngine } from '../strategy/atrEngine';
 import { PositionManager } from '../position/positionManager';
 import { OrderManager } from '../orders/orderManager';
 import { SecretManager } from '../security/secretManager';
@@ -34,19 +36,29 @@ async function runAllTests() {
   console.log('🧪 Starting Automated Quantitative Trading Test Suite');
   console.log('======================================================');
 
-  // Clean test fixtures for isolated idempotent test suite execution only when not in live production
-  const testDataDir = process.env.DATA_DIR || path.resolve(process.cwd(), 'data');
+  // Fail closed before any stateful manager is constructed. A direct tsx run
+  // must never be able to clean or overwrite the live ./data directory.
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('Trading engine tests must run with NODE_ENV=test (use `npm test`).');
+  }
+  if (!process.env.DATA_DIR) {
+    throw new Error('Trading engine tests require an explicit isolated DATA_DIR (use `npm test`).');
+  }
+  const testDataDir = path.resolve(process.env.DATA_DIR);
+  const tmpRoot = path.resolve(os.tmpdir());
+  const relativeToTmp = path.relative(tmpRoot, testDataDir);
+  if (!relativeToTmp || relativeToTmp.startsWith('..') || path.isAbsolute(relativeToTmp)) {
+    throw new Error(`Trading engine test DATA_DIR must be a child of ${tmpRoot}, never the production data directory.`);
+  }
   const reservationFile = path.join(testDataDir, 'exposure_reservations.json');
   const orderFile = path.join(testDataDir, 'order_history.json');
   const signalFile = path.join(testDataDir, 'processed_signals.json');
   const posFile = path.join(testDataDir, 'position_state.json');
 
-  if (process.env.NODE_ENV === 'test') {
-    if (fs.existsSync(reservationFile)) fs.writeFileSync(reservationFile, '[]', 'utf-8');
-    if (fs.existsSync(orderFile)) fs.writeFileSync(orderFile, '[]', 'utf-8');
-    if (fs.existsSync(signalFile)) fs.writeFileSync(signalFile, '[]', 'utf-8');
-    if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
-  }
+  if (fs.existsSync(reservationFile)) fs.writeFileSync(reservationFile, '[]', 'utf-8');
+  if (fs.existsSync(orderFile)) fs.writeFileSync(orderFile, '[]', 'utf-8');
+  if (fs.existsSync(signalFile)) fs.writeFileSync(signalFile, '[]', 'utf-8');
+  if (fs.existsSync(posFile)) fs.unlinkSync(posFile);
 
   const defaultParams: BotParams = {
     atrMultiplier: 3.0,
@@ -246,12 +258,12 @@ async function runAllTests() {
 
   const secretManager = SecretManager.getInstance();
   secretManager.saveKeys({
-    upbitAccessKey: 'x7KF16Y6z8Ykp0UUAr8cyADjxgmaxenuxnTMp6JJ',
-    upbitSecretKey: 'j7QBxSwPqSiXX1tgJCRqbxDpZsyuWqmy2fUhIOhl'
+    upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL',
+    upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL'
   });
   const maskedStatus = secretManager.getMaskedStatus();
   assert(maskedStatus.hasUpbitKeys === true, 'Upbit Keys presence verified');
-  assert(maskedStatus.upbitAccessMasked === 'x7KF************p6JJ', 'API Key properly masked without plaintext exposure');
+  assert(maskedStatus.upbitAccessMasked === 'TEST************REAL', 'API Key properly masked without plaintext exposure');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 6: Atomic Exposure Reservation & Collision Blocking
@@ -778,6 +790,146 @@ async function runAllTests() {
 
   assert(watcherEventCount === 1, '[Scenario C] Startup reconcile triggered onOrderUpdated exactly 1 time');
   assert(watcherReceivedVolume === 1.0 && watcherReceivedIncrement === 1.0, '[Scenario C] Startup reconcile received 1.0 ETH added');
+
+  // A watcher may be the first observer after a restart. That delivery is an
+  // INITIAL strategy fill, not an additional-fill transition.
+  assert(recordC.strategyInitialFillApplied === true && recordC.strategyAppliedFilledVolume === 1.0, '[Scenario C] Initial watcher fill is persisted as strategy-applied');
+
+  // A startup reconcile response that arrives after the engine changed symbol,
+  // account or generation must not apply exchange state to the old order.
+  let staleReconcileContextCurrent = true;
+  let staleReconcileCallbacks = 0;
+  const staleReconcileManager = new OrderManager(undefined, () => { staleReconcileCallbacks++; });
+  const staleReconcileRecord: OrderRecord = {
+    id: `ORD_STALE_RECONCILE_${Date.now()}`,
+    clientOrderId: `CLIENT_STALE_RECONCILE_${Date.now()}`,
+    signalId: `SIG_STALE_RECONCILE_${Date.now()}`,
+    signalType: 'DCA_BUY',
+    symbol: 'KRW-ETH', side: 'BUY', status: 'ORDER_SUBMITTED',
+    requestedBudgetOrVolume: 1000000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'stale startup reconciliation', fills: []
+  };
+  (staleReconcileManager as any).orders.set(staleReconcileRecord.id, staleReconcileRecord);
+  let resolveStaleReconcile!: (value: any) => void;
+  (staleReconcileManager as any).reconcileUpbitOrder = () => new Promise((resolve) => { resolveStaleReconcile = resolve; });
+  const staleReconcileRun = staleReconcileManager.reconcilePendingOrdersOnStartup(
+    { upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' },
+    'UPBIT',
+    'KRW-ETH',
+    () => staleReconcileContextCurrent
+  );
+  staleReconcileContextCurrent = false;
+  resolveStaleReconcile({ found: true, order: { ...responseC, uuid: 'mock-stale-reconcile', identifier: staleReconcileRecord.clientOrderId } });
+  assert(await staleReconcileRun === 0, '[Stale reconcile] Stale exchange result is not counted as reconciled');
+  assert(staleReconcileRecord.status === 'ORDER_SUBMITTED' && staleReconcileRecord.filledVolume === 0 && staleReconcileRecord.strategyAppliedFilledVolume === undefined, '[Stale reconcile] Stale response cannot mutate order state or watermark');
+  assert(staleReconcileCallbacks === 0, '[Stale reconcile] Stale response cannot trigger a position callback');
+
+  // The periodic watcher is subject to exactly the same guard. A response
+  // started under the old API-key/account context must not apply an order
+  // state after that context is replaced.
+  let staleWatcherCallbacks = 0;
+  const staleWatcherManager = new OrderManager(undefined, () => { staleWatcherCallbacks++; });
+  const staleWatcherRecord: OrderRecord = {
+    id: `ORD_STALE_WATCHER_${Date.now()}`,
+    clientOrderId: `CLIENT_STALE_WATCHER_${Date.now()}`,
+    signalId: `SIG_STALE_WATCHER_${Date.now()}`,
+    signalType: 'DCA_BUY',
+    symbol: 'KRW-ETH', side: 'BUY', status: 'OPEN',
+    requestedBudgetOrVolume: 1000000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'stale watcher response', fills: []
+  };
+  (staleWatcherManager as any).orders.set(staleWatcherRecord.id, staleWatcherRecord);
+  (staleWatcherManager as any).watchingOrderIds.add(staleWatcherRecord.id);
+  staleWatcherManager.setApiKeysForWatcher({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  staleWatcherManager.setWatcherContextGuard(() => true);
+  let resolveStaleWatcher!: (value: any) => void;
+  (staleWatcherManager as any).reconcileUpbitOrder = () => new Promise((resolve) => { resolveStaleWatcher = resolve; });
+  const staleWatcherRun = (staleWatcherManager as any).processPartialFillWatcherCycle();
+  // setWatcherContextGuard increments the watcher generation, invalidating
+  // the request already in flight just as an API-key/account switch does.
+  staleWatcherManager.setWatcherContextGuard(() => true);
+  resolveStaleWatcher({ found: true, order: { ...responseC, uuid: 'mock-stale-watcher', identifier: staleWatcherRecord.clientOrderId } });
+  await staleWatcherRun;
+  assert(staleWatcherRecord.status === 'OPEN' && staleWatcherRecord.filledVolume === 0 && staleWatcherRecord.strategyAppliedFilledVolume === undefined, '[Stale watcher] Late watcher response cannot mutate order state or watermark');
+  assert(staleWatcherCallbacks === 0, '[Stale watcher] Late watcher response cannot trigger a position callback');
+
+  // The timeout-cancel path has the identical commit guard: cancellation from
+  // an old account must not mark a current order terminal or release state.
+  const staleCancelManager = new OrderManager();
+  const staleCancelRecord: OrderRecord = {
+    id: `ORD_STALE_CANCEL_${Date.now()}`, clientOrderId: `CLIENT_STALE_CANCEL_${Date.now()}`,
+    signalId: `SIG_STALE_CANCEL_${Date.now()}`, signalType: 'DCA_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'OPEN', exchangeOrderId: 'uuid-stale-cancel', requestedBudgetOrVolume: 1000000,
+    filledVolume: 0, avgFillPrice: 0, fee: 0, createdAt: Date.now() - 61000, updatedAt: Date.now(),
+    reason: 'stale timeout cancel', fills: []
+  };
+  (staleCancelManager as any).orders.set(staleCancelRecord.id, staleCancelRecord);
+  (staleCancelManager as any).watchingOrderIds.add(staleCancelRecord.id);
+  staleCancelManager.setApiKeysForWatcher({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  staleCancelManager.setWatcherContextGuard(() => true);
+  let resolveStaleCancel!: (value: any) => void;
+  (staleCancelManager as any).upbitClient.cancelOrder = () => new Promise((resolve) => { resolveStaleCancel = resolve; });
+  const staleCancelRun = (staleCancelManager as any).processPartialFillWatcherCycle();
+  staleCancelManager.setWatcherContextGuard(() => true);
+  resolveStaleCancel({ success: true, order: { ...responseC, uuid: 'uuid-stale-cancel', state: 'cancel', identifier: staleCancelRecord.clientOrderId } });
+  await staleCancelRun;
+  assert(staleCancelRecord.status === 'OPEN' && staleCancelRecord.filledVolume === 0, '[Stale watcher cancel] Late cancellation response cannot mutate order state');
+
+  // UNKNOWN reconciliation must also retain its ledger/reservation state when
+  // the account context changes while the exchange lookup is pending.
+  const staleUnknownManager = new OrderManager();
+  const staleUnknownRecord: OrderRecord = {
+    id: `ORD_STALE_UNKNOWN_${Date.now()}`, clientOrderId: `CLIENT_STALE_UNKNOWN_${Date.now()}`,
+    signalId: `SIG_STALE_UNKNOWN_${Date.now()}`, signalType: 'DCA_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'UNKNOWN_PENDING_RECONCILIATION', requestedBudgetOrVolume: 1000000,
+    filledVolume: 0, avgFillPrice: 0, fee: 0, createdAt: Date.now() - 121000, updatedAt: Date.now() - 121000,
+    reason: 'stale UNKNOWN reconciliation', fills: []
+  };
+  (staleUnknownManager as any).orders.set(staleUnknownRecord.id, staleUnknownRecord);
+  staleUnknownManager.setApiKeysForWatcher({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  staleUnknownManager.setWatcherContextGuard(() => true);
+  let resolveStaleUnknown!: (value: any) => void;
+  (staleUnknownManager as any).reconcileUpbitOrder = () => new Promise((resolve) => { resolveStaleUnknown = resolve; });
+  const staleUnknownRun = (staleUnknownManager as any).processPartialFillWatcherCycle();
+  staleUnknownManager.setWatcherContextGuard(() => true);
+  resolveStaleUnknown({ found: true, order: { ...responseC, uuid: 'mock-stale-unknown', identifier: staleUnknownRecord.clientOrderId } });
+  await staleUnknownRun;
+  assert(staleUnknownRecord.status === 'UNKNOWN_PENDING_RECONCILIATION' && staleUnknownRecord.filledVolume === 0, '[Stale UNKNOWN watcher] Late reconciliation cannot mutate uncertain order state');
+
+  // Replaying the exact same exchange state must never run a strategy handler
+  // twice. This applies to every stateful partial-fill signal, regardless of
+  // whether SUBMIT_FLOW or WATCHER observed the first execution.
+  const statefulFillSignals = ['DCA_BUY', 'PYRAMID_BUY', 'BOX_PYRAMID_BUY', 'PARTIAL_LOSS_CUT', 'EMERGENCY_TREND_CUT', 'REENTRY_BUY'] as const;
+  for (const signalType of statefulFillSignals) {
+    let initialHandlerCalls = 0;
+    const duplicateRecord: OrderRecord = {
+      id: `ORD_STRATEGY_LEDGER_${signalType}_${Date.now()}`,
+      clientOrderId: `CLIENT_STRATEGY_LEDGER_${signalType}_${Date.now()}`,
+      signalId: `SIG_STRATEGY_LEDGER_${signalType}_${Date.now()}`,
+      signalType,
+      symbol: 'KRW-ETH',
+      side: signalType === 'PARTIAL_LOSS_CUT' || signalType === 'EMERGENCY_TREND_CUT' ? 'SELL' : 'BUY',
+      status: 'ORDER_SUBMITTED',
+      requestedBudgetOrVolume: 1,
+      filledVolume: 0,
+      avgFillPrice: 0,
+      fee: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      reason: `Strategy ledger ${signalType}`,
+      fills: []
+    };
+    const response = { ...responseC, uuid: `mock-ledger-${signalType}`, identifier: duplicateRecord.clientOrderId };
+    testOrderManager.applyUpbitOrderState(duplicateRecord, response as any, (rec) => {
+      initialHandlerCalls++;
+      assert(rec.strategyFillKind === 'INITIAL', `[Strategy ledger] ${signalType} first handler is INITIAL`);
+    }, () => {}, 'SUBMIT_FLOW');
+    testOrderManager.applyUpbitOrderState(duplicateRecord, response as any, () => {
+      initialHandlerCalls++;
+    }, () => {}, 'WATCHER');
+    assert(initialHandlerCalls === 1, `[Strategy ledger] ${signalType} initial handler executes exactly once across submit/watcher`);
+    assert(duplicateRecord.strategyInitialFillApplied === true && duplicateRecord.strategyAppliedFilledVolume === 1.0, `[Strategy ledger] ${signalType} applied watermark is persisted`);
+  }
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 13: Non-Entry Signal Incremental Fill Protection (DCA, Pyramid, Cut)
@@ -1481,6 +1633,9 @@ async function runAllTests() {
   assert(reentryManager.markReentryPending() === false, '[Re-entry] A second re-entry cannot consume the same permission');
   reentryManager.onReentryBuyFilled(2660000, 0.2, 2700000, 30000, 3, 2);
   assert(reentryManager.getSnapshot().state === 'ENTRY_FILLED' && reentryManager.getSnapshot().amount === 0.9, '[Re-entry] Any confirmed fill returns position to normal holding state');
+  const recycleAfterInitialReentry = reentryManager.getSnapshot().recycleCycleCount || 0;
+  reentryManager.addAdditionalReentryFilled(2655000, 0.1, 2700000, 30000, 3, 2);
+  assert((reentryManager.getSnapshot().recycleCycleCount || 0) === recycleAfterInitialReentry, '[Re-entry] Incremental fill of the same order does not consume an additional recycle cycle');
   reentryManager.rebaseReconciledPosition(2700000, 30000, 3, 2);
   const rebasedSnapshot = reentryManager.getSnapshot();
   assert(rebasedSnapshot.partialCutCount === 0 && rebasedSnapshot.trailingActive === false && rebasedSnapshot.state === 'ENTRY_FILLED', '[Rebase] Defensive and trailing state are reset from the reconciled position');
@@ -1490,6 +1645,78 @@ async function runAllTests() {
     { ...labPyramidPosition, state: 'REENTRY_PENDING' }, 2750000, [], 0
   );
   assert(reentryPendingRisk.approved === false, '[Re-entry] Risk governor blocks all new buys while re-entry is pending');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 21: Startup Barrier
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 21: Startup Barrier & No Synthetic Signal Path');
+  const startupGateEngine = new ATREngine(undefined, { backtest: true });
+  (startupGateEngine as any).startupReady = false;
+  (startupGateEngine as any).botState = 'STARTING';
+  (startupGateEngine as any).strategyCore = {
+    generateSignals: () => { throw new Error('Strategy generation must be blocked during STARTING'); }
+  };
+  await startupGateEngine.handleMarketTick(2700000, Date.now());
+  assert(startupGateEngine.currentPrice === 2700000, '[Startup barrier] Tick price is retained while strategy evaluation is blocked');
+  assert((startupGateEngine as any).startupReady === false && startupGateEngine.botState === 'STARTING', '[Startup barrier] Engine remains STARTING until authoritative initialization completes');
+
+  // A late candle response from a previous generation must not overwrite the
+  // newly invalidated market context.
+  const staleMarketEngine = new ATREngine(undefined, { backtest: true });
+  staleMarketEngine.atrValue = 11111;
+  staleMarketEngine.baselineValue = 2222222;
+  let resolveCandles!: (candles: any[]) => void;
+  (staleMarketEngine as any).upbitClient.fetchCandles = () => new Promise<any[]>((resolve) => { resolveCandles = resolve; });
+  const staleMarketRefresh = staleMarketEngine.refreshAtrFromExchange();
+  (staleMarketEngine as any).invalidateStartupBarrier();
+  resolveCandles(Array.from({ length: 20 }, (_, index) => ({
+    timestamp: Date.now() - ((20 - index) * 60000), trade_price: 3000000 + index,
+    high_price: 3000100 + index, low_price: 2999900 + index, candle_acc_trade_volume: 10 + index
+  })));
+  assert(await staleMarketRefresh === false, '[Stale generation] Late candle refresh is discarded');
+  assert(staleMarketEngine.atrValue === 11111 && staleMarketEngine.baselineValue === 2222222, '[Stale generation] Late candles cannot overwrite indicators');
+
+  // The same rule applies to a delayed account response: no balance or
+  // position reconciliation may commit after context invalidation.
+  const staleAccountEngine = new ATREngine(undefined, { backtest: true });
+  staleAccountEngine.actualKrwBalance = 123456;
+  staleAccountEngine.realBalances = { KRW: 123456 };
+  let resolveAccount!: (value: any) => void;
+  (staleAccountEngine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+  (staleAccountEngine as any).upbitClient.getAccountBalance = () => new Promise<any>((resolve) => { resolveAccount = resolve; });
+  const staleAccountRefresh = staleAccountEngine.fetchRealAccountBalance();
+  (staleAccountEngine as any).invalidateStartupBarrier();
+  resolveAccount({ success: true, balances: { KRW: 999999 }, lockedBalances: {}, avgBuyPrices: {} });
+  assert(await staleAccountRefresh === false, '[Stale generation] Late account refresh is discarded');
+  assert(staleAccountEngine.actualKrwBalance === 123456 && staleAccountEngine.realBalances.KRW === 123456, '[Stale generation] Late account response cannot overwrite balances');
+
+  // A single PositionManager cannot safely represent two symbols. Active
+  // positions and any non-terminal order therefore block market switches.
+  const activePositionSwitchEngine = new ATREngine(undefined, { backtest: true });
+  activePositionSwitchEngine.positionManager.onInitialEntryFilled(3000000, 0.1, 3000000, 10000, 2, 3);
+  let activePositionSwitchRejected = false;
+  try {
+    activePositionSwitchEngine.updateParams({ symbol: 'KRW-BTC' });
+  } catch {
+    activePositionSwitchRejected = true;
+  }
+  assert(activePositionSwitchRejected && activePositionSwitchEngine.params.symbol === 'KRW-ETH', '[Symbol switch] Active position rejects symbol change without mutating params');
+
+  const pendingOrderSwitchEngine = new ATREngine(undefined, { backtest: true });
+  const pendingSwitchOrder: OrderRecord = {
+    id: `ORD_PENDING_SWITCH_${Date.now()}`, clientOrderId: `CLIENT_PENDING_SWITCH_${Date.now()}`,
+    signalId: `SIG_PENDING_SWITCH_${Date.now()}`, signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'OPEN', requestedBudgetOrVolume: 100000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'pending switch guard', fills: []
+  };
+  ((pendingOrderSwitchEngine.orderManager as any).orders as Map<string, OrderRecord>).set(pendingSwitchOrder.id, pendingSwitchOrder);
+  let pendingOrderSwitchRejected = false;
+  try {
+    pendingOrderSwitchEngine.updateParams({ exchange: 'BINANCE' as any });
+  } catch {
+    pendingOrderSwitchRejected = true;
+  }
+  assert(pendingOrderSwitchRejected && pendingOrderSwitchEngine.params.exchange === 'UPBIT', '[Symbol switch] Pending order rejects exchange change without mutating params');
 
   // ──────────────────────────────────────────────────────
   // RESULTS
