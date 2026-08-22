@@ -205,6 +205,25 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
           ws.send(JSON.stringify({ type: 'POSITION_REBASE_RESULT', payload: { success: true } }));
           break;
 
+        case 'RESTART_SERVER': {
+          if (data.payload?.confirmed !== true) throw new Error('Server restart requires explicit confirmation.');
+          // Acknowledge before closing the socket so the UI can show a clear
+          // reconnecting state. PM2 is responsible for bringing this process
+          // back; a forced fallback exit prevents active WS clients from
+          // keeping httpServer.close() open indefinitely.
+          ws.send(JSON.stringify({ type: 'SERVER_RESTARTING', payload: { message: 'Server restart acknowledged.' } }), () => {
+            console.warn('[Server] Restart requested by authorized WebSocket client.');
+            setTimeout(() => {
+              wss.clients.forEach((client) => client.close(1012, 'Server restarting'));
+              wss.close();
+              server.close(() => process.exit(0));
+              const forcedExit = setTimeout(() => process.exit(0), 1500);
+              forcedExit.unref();
+            }, 100).unref();
+          });
+          break;
+        }
+
         default:
           console.warn('[Server WS] Unknown action:', data.type);
       }

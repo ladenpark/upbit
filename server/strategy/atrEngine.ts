@@ -35,6 +35,8 @@ export class ATREngine {
 
   // Bot Lifecycle State
   public botState: BotLifecycleState = 'STARTING';
+  /** Set only by a local persistence failure; cleared exclusively by process restart. */
+  private durabilityFailure = false;
 
   // Strategy Core Parameters
   public params: BotParams = {
@@ -148,6 +150,18 @@ export class ATREngine {
     // this guard before any previous async watcher response can commit.
     const initialWatcherContext = this.captureAsyncContext();
     this.orderManager.setWatcherContextGuard(() => this.isAsyncContextCurrent(initialWatcherContext));
+    this.orderManager.setStrategyFillDurabilityLookup((eventId) => this.positionManager.hasDurablyAppliedFillEvent(eventId));
+    this.orderManager.setDurabilityFailureHandler(() => {
+      this.durabilityFailure = true;
+      this.botState = 'HALTED';
+      this.params.isBotActive = false;
+      this.addLog({
+        type: 'SYSTEM',
+        price: this.currentPrice,
+        reason: '🚨 [저장 안전 정지] 주문 또는 체결 원장을 디스크에 저장하지 못했습니다 — 재시작 후 거래소 동기화가 필요합니다.'
+      });
+      this.notifyClients();
+    });
 
     // Restore persisted trade logs from disk so UI doesn't reset on restart
     this.logs = PositionManager.loadTradeLogs().slice(0, 300);
@@ -660,6 +674,34 @@ export class ATREngine {
    * Falls back to (requestedBudgetOrVolume / tickPrice) ONLY if exchange data is missing.
    */
   private handleOrderFilled(signalType: string, record: any, tickPrice: number, overrideVolume?: number) {
+    const fillEventId = record.strategyFillEventId as string | undefined;
+    if (!fillEventId) {
+      this.applyOrderFillToPosition(signalType, record, tickPrice, overrideVolume);
+      return;
+    }
+
+    // Persist the position mutation and its fill-event identity together. If
+    // the order watermark write fails afterwards, restart recovery advances
+    // only the watermark and never applies this position transition twice.
+    if (!this.positionManager.beginDurableFillEvent(fillEventId)) return;
+    try {
+      this.applyOrderFillToPosition(signalType, record, tickPrice, overrideVolume);
+    } finally {
+      if (!this.positionManager.completeDurableFillEvent(fillEventId)) {
+        this.durabilityFailure = true;
+        this.botState = 'HALTED';
+        this.params.isBotActive = false;
+        this.addLog({
+          type: 'SYSTEM',
+          price: tickPrice,
+          reason: '🚨 [저장 안전 정지] 포지션 체결 상태를 디스크에 영속화하지 못했습니다 — 재시작 후 거래소 동기화가 필요합니다.'
+        });
+        throw new Error('Durable position fill write failed; bot halted for safe recovery.');
+      }
+    }
+  }
+
+  private applyOrderFillToPosition(signalType: string, record: any, tickPrice: number, overrideVolume?: number) {
     const position = this.positionManager.getSnapshot();
     // Use exchange-confirmed price if available, otherwise fall back to tick price
     const fillPrice = record.avgFillPrice > 0 ? record.avgFillPrice : tickPrice;
@@ -1219,6 +1261,10 @@ export class ATREngine {
   public updateParams(newParams: Partial<BotParams>) {
     const symbolChanged = newParams.symbol && newParams.symbol !== this.params.symbol;
     const exchangeChanged = newParams.exchange && newParams.exchange !== this.params.exchange;
+
+    if (newParams.isBotActive === true && this.durabilityFailure) {
+      throw new Error('저장 안전 정지 상태입니다. 서버를 재시작하고 거래소 동기화가 완료되기 전에는 봇을 다시 가동할 수 없습니다.');
+    }
 
     // PositionManager models exactly one asset. Switching its market while a
     // position or an exchange order exists would mix two assets in one state

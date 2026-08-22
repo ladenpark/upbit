@@ -10,6 +10,8 @@ const POSITION_FILE = path.join(DATA_DIR, 'position_state.json');
 export class PositionManager {
   private position: PositionSnapshot;
   private params: BotParams;
+  private activeFillEventId: string | null = null;
+  private activeFillDirty = false;
 
   constructor(params: BotParams) {
     this.params = params;
@@ -73,12 +75,52 @@ export class PositionManager {
       profitLockPrice: null,
       lastRegimeRebalanceAt: 0,
       recycleCycleCount: 0,
+      appliedFillEventIds: [],
       cooldownUntil: 0
     };
   }
 
   public getSnapshot(): PositionSnapshot {
-    return { ...this.position, dcaSlots: this.position.dcaSlots.map((s) => ({ ...s })) };
+    return {
+      ...this.position,
+      dcaSlots: this.position.dcaSlots.map((s) => ({ ...s })),
+      appliedFillEventIds: [...(this.position.appliedFillEventIds || [])]
+    };
+  }
+
+  /**
+   * Makes the next position-state write include this exchange fill identity.
+   * The marker and changed position are stored in the same atomic rename, so
+   * a later order-ledger write failure can be recovered without replaying it.
+   */
+  public beginDurableFillEvent(eventId: string): boolean {
+    if ((this.position.appliedFillEventIds || []).includes(eventId)) return false;
+    this.activeFillEventId = eventId;
+    this.activeFillDirty = false;
+    return true;
+  }
+
+  public completeDurableFillEvent(eventId: string): boolean {
+    if (this.activeFillEventId !== eventId || !this.activeFillDirty) {
+      this.activeFillEventId = null;
+      this.activeFillDirty = false;
+      return false;
+    }
+    try {
+      // All nested position-manager mutations are batched. This is the one
+      // and only write that publishes both final state and the fill marker.
+      this.commitStateToFile();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      this.activeFillEventId = null;
+      this.activeFillDirty = false;
+    }
+  }
+
+  public hasDurablyAppliedFillEvent(eventId: string): boolean {
+    return (this.position.appliedFillEventIds || []).includes(eventId);
   }
 
   public setParams(newParams: BotParams) {
@@ -763,14 +805,33 @@ export class PositionManager {
   }
 
   private saveStateToFile() {
+    if (this.activeFillEventId) {
+      this.activeFillDirty = true;
+      return;
+    }
+
+    this.commitStateToFile();
+  }
+
+  /** Performs the physical atomic rename. Durable fill transactions call this once at commit. */
+  private commitStateToFile() {
+    let addedActiveEvent = false;
     try {
       const dir = path.dirname(POSITION_FILE);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      if (this.activeFillEventId && !(this.position.appliedFillEventIds || []).includes(this.activeFillEventId)) {
+        this.position.appliedFillEventIds = [...(this.position.appliedFillEventIds || []), this.activeFillEventId].slice(-500);
+        addedActiveEvent = true;
+      }
       const tmpFile = POSITION_FILE + '.tmp';
       fs.writeFileSync(tmpFile, JSON.stringify(this.position, null, 2), 'utf-8');
       fs.renameSync(tmpFile, POSITION_FILE);
     } catch (e) {
+      if (addedActiveEvent && this.activeFillEventId) {
+        this.position.appliedFillEventIds = (this.position.appliedFillEventIds || []).filter((id) => id !== this.activeFillEventId);
+      }
       console.error('[PositionManager] Failed to save position state to file:', e);
+      throw e;
     }
   }
 }

@@ -147,6 +147,8 @@ export interface OrderRecord {
   strategyInitialFillAppliedAt?: number;
   /** Transient delivery marker; never persisted as authoritative state. */
   strategyFillKind?: 'INITIAL' | 'INCREMENTAL';
+  /** Stable fill-event key used to recover safely when order and position files commit at different times. */
+  strategyFillEventId?: string;
 }
 
 export type PositionState = 
@@ -207,6 +209,8 @@ export interface PositionSnapshot {
   lastRegimeRebalanceAt?: number;
   /** 한 포지션 안에서 완료된 방어→재진입 순환 횟수 */
   recycleCycleCount?: number;
+  /** Bounded ledger of fill events already atomically included in position_state.json. */
+  appliedFillEventIds?: string[];
   // Cooldown
   cooldownUntil: number;
   cooldownReason?: string;

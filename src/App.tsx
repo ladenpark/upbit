@@ -88,6 +88,9 @@ export default function App() {
   // Backend WS Connection State
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const [showRestartConfirm, setShowRestartConfirm] = useState(false);
+  const [serverRestarting, setServerRestarting] = useState(false);
+  const restartRequestedRef = useRef(false);
 
   // Symbol Selection (Upbit Exclusive)
   const exchange = 'UPBIT';
@@ -298,6 +301,10 @@ export default function App() {
       ws.onopen = () => {
         console.log('Connected to Full-Stack ATR Backend!');
         setWsConnected(true);
+        if (restartRequestedRef.current) {
+          restartRequestedRef.current = false;
+          setServerRestarting(false);
+        }
       };
 
       ws.onmessage = (event) => {
@@ -385,6 +392,9 @@ export default function App() {
             }
           } else if (data.type === 'POSITION_REBASE_RESULT') {
             setRebaseStatus('✅ 거래소 잔고와 최신 지표 기준으로 포지션 보호 조건을 보정했습니다.');
+          } else if (data.type === 'SERVER_RESTARTING') {
+            restartRequestedRef.current = true;
+            setServerRestarting(true);
           }
         } catch (err) {
           console.error('Error parsing backend WS message:', err);
@@ -419,6 +429,17 @@ export default function App() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type, payload }));
     }
+  };
+
+  const requestServerRestart = () => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      window.alert('서버 연결이 끊어져 있어 재시작 요청을 보낼 수 없습니다. 연결이 복구된 뒤 다시 시도하세요.');
+      return;
+    }
+    setShowRestartConfirm(false);
+    restartRequestedRef.current = true;
+    setServerRestarting(true);
+    sendWsCommand('RESTART_SERVER', { confirmed: true });
   };
 
   const handleCoinChange = (newCoin: string) => {
@@ -973,7 +994,7 @@ export default function App() {
 
       {/* Main App Container */}
       <div
-        className={`w-full max-w-sm bg-white sm:rounded-3xl shadow-xl border border-slate-200 overflow-hidden flex flex-col transition-all duration-300 ${
+        className={`relative w-full max-w-sm bg-white sm:rounded-3xl shadow-xl border border-slate-200 overflow-hidden flex flex-col transition-all duration-300 ${
           deviceFrameMode ? 'h-[100dvh] sm:h-[844px]' : 'h-[100dvh]'
         }`}
       >
@@ -1191,7 +1212,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Position action summary: explain why the bot is waiting without duplicating the radar. */}
+              {/* Unified strategy status + next action: one source of truth, opens the condition radar. */}
               {(() => {
                 const hasPosition = positionAmount > 0;
                 const dcaSteps = [2, 4.2, 5.5];
@@ -1208,12 +1229,23 @@ export default function App() {
                   : isDefensive
                   ? '방어 상태 · 다음 대응 대기'
                   : '포지션 운용 중';
+                const next = nextOrderInfo?.pages?.[0] || nextOrderInfo || {
+                  type: hasPosition ? (authoritativeNextDcaNumber <= dcaSteps.length ? `DCA ${authoritativeNextDcaNumber}차` : '손절선·익절선 감시') : '첫 진입 감시',
+                  budgetKrw: currentEquity * ((orderRatio || 20) / 100),
+                  targetPriceLabel: hasPosition && authoritativeNextDcaNumber <= dcaSteps.length
+                    ? (authoritativeNextDcaLabel || formatPrice(nextDcaPrice))
+                    : '조건 레이더 참조'
+                };
+                const isExit = String(next.type).includes('익절') || String(next.type).includes('매도');
 
                 return (
-                  <div className="rounded-2xl border border-slate-200 bg-white px-3.5 py-3 shadow-2xs">
+                  <button
+                    onClick={() => setActiveTab('radar')}
+                    className="w-full rounded-2xl border border-slate-200 bg-white px-3.5 py-3 text-left shadow-2xs transition hover:border-indigo-200 active:scale-[0.99]"
+                  >
                     <div className="flex items-center justify-between gap-3">
                       <div className="min-w-0">
-                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">현재 전략 상태</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">전략 상태 · 다음 행동</p>
                         <p className="mt-0.5 truncate text-sm font-bold text-slate-900">{headline}</p>
                       </div>
                       <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-bold ${
@@ -1222,21 +1254,18 @@ export default function App() {
                         {positionLifecycleState}
                       </span>
                     </div>
-                    <div className="mt-2 grid grid-cols-2 gap-2 border-t border-slate-100 pt-2 text-[10px]">
-                      <div>
+                    <div className="mt-2 flex items-end justify-between gap-3 border-t border-slate-100 pt-2">
+                      <div className="min-w-0">
                         <p className="text-slate-400">다음 행동</p>
-                        <p className="mt-0.5 font-semibold text-slate-700">
-                          {hasPosition ? (authoritativeNextDcaNumber <= dcaSteps.length ? `DCA ${authoritativeNextDcaNumber}차` : '손절선·익절선 감시') : '첫 진입 감시'}
-                        </p>
+                        <p className="mt-0.5 truncate text-sm font-bold text-slate-800">{next.type}</p>
+                        <p className="mt-0.5 truncate text-[10px] text-slate-500">{next.targetPriceLabel}</p>
                       </div>
-                      <div className="text-right">
-                        <p className="text-slate-400">기준 가격</p>
-                        <p className="mt-0.5 font-semibold mono text-slate-700">
-                          {hasPosition && authoritativeNextDcaNumber <= dcaSteps.length ? (authoritativeNextDcaLabel || formatPrice(nextDcaPrice)) : '조건 레이더 참조'}
-                        </p>
+                      <div className="shrink-0 text-right">
+                        <p className={`text-sm font-extrabold mono ${isExit ? 'text-emerald-600' : 'text-indigo-600'}`}>{formatPrice(next.budgetKrw || 0)}</p>
+                        <p className="mt-0.5 text-[10px] text-slate-400">조건 레이더 보기 →</p>
                       </div>
                     </div>
-                  </div>
+                  </button>
                 );
               })()}
 
@@ -1318,32 +1347,6 @@ export default function App() {
                   </div>
                 </div>
               </div>
-
-              {/* Swipeable Next Order Unit & Target Budget Card */}
-              {(() => {
-                const next = nextOrderInfo?.pages?.[0] || nextOrderInfo || {
-                  type: positionAmount > 0 ? '다음 추가 매수' : '첫 진입 대기',
-                  budgetKrw: currentEquity * ((orderRatio || 20) / 100),
-                  unitPercent: orderRatio || 20,
-                  targetPriceLabel: positionAmount > 0 ? '다음 DCA 또는 추세 조건 충족 시' : '저점 또는 돌파 조건 충족 시'
-                };
-                const isExit = String(next.type).includes('익절') || String(next.type).includes('매도');
-                return (
-                  <button onClick={() => setActiveTab('radar')} className="w-full rounded-2xl border border-slate-200 bg-white px-3.5 py-3 text-left shadow-2xs transition hover:border-indigo-200 active:scale-[0.99]">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">NEXT ACTION</p>
-                        <p className="mt-0.5 truncate text-sm font-bold text-slate-900">{next.type}</p>
-                        <p className="mt-1 truncate text-[11px] text-slate-500">{next.targetPriceLabel}</p>
-                      </div>
-                      <div className="shrink-0 text-right">
-                        <p className={`text-sm font-extrabold mono ${isExit ? 'text-emerald-600' : 'text-indigo-600'}`}>{formatPrice(next.budgetKrw || 0)}</p>
-                        <p className="mt-1 text-[10px] text-slate-400">조건 레이더 보기 →</p>
-                      </div>
-                    </div>
-                  </button>
-                );
-              })()}
 
               {false && (() => {
                 const pages = nextOrderInfo?.pages && nextOrderInfo.pages.length > 0
@@ -2768,6 +2771,24 @@ export default function App() {
                 {isBotActive ? <Square className="w-4 h-4 fill-white" /> : <Play className="w-4 h-4 fill-white" />}
                 <span>{isBotActive ? '자동 봇 정지 (IDLE)' : '자동 봇 가동 시작 (START)'}</span>
               </button>
+
+              <div className="rounded-2xl border border-rose-200 bg-rose-50 p-3.5 shadow-2xs">
+                <div className="flex items-start gap-2.5">
+                  <RefreshCw className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-extrabold text-rose-900">서버 재시작</p>
+                    <p className="mt-0.5 text-[10px] leading-relaxed text-rose-700">저장된 주문·포지션 상태를 다시 동기화한 뒤 자동으로 재연결합니다. 재시작 중에는 주문을 만들지 않습니다.</p>
+                  </div>
+                </div>
+                <button
+                  disabled={serverRestarting || !wsConnected}
+                  onClick={() => setShowRestartConfirm(true)}
+                  className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl bg-rose-600 py-2.5 text-xs font-extrabold text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${serverRestarting ? 'animate-spin' : ''}`} />
+                  {serverRestarting ? '서버 재시작·자동 재연결 중...' : wsConnected ? '서버 재시작' : '서버 연결 대기 중'}
+                </button>
+              </div>
             </div>
           )}
 
@@ -3132,6 +3153,24 @@ export default function App() {
             </div>
           )}
         </div>
+
+        {showRestartConfirm && (
+          <div className="absolute inset-0 z-[70] grid place-items-center bg-slate-950/45 p-5 backdrop-blur-[1px]">
+            <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-4 shadow-xl">
+              <div className="flex items-start gap-2.5">
+                <div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-rose-100 text-rose-600"><RefreshCw className="h-4 w-4" /></div>
+                <div>
+                  <h3 className="text-sm font-extrabold text-slate-900">서버를 재시작할까요?</h3>
+                  <p className="mt-1 text-[11px] leading-relaxed text-slate-500">연결이 약 2~3초 끊어진 뒤 자동으로 다시 연결됩니다. 시작 장벽이 완료되기 전까지 신규 주문은 차단됩니다.</p>
+                </div>
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-2">
+                <button onClick={() => setShowRestartConfirm(false)} className="rounded-xl bg-slate-100 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-200">취소</button>
+                <button onClick={requestServerRestart} className="rounded-xl bg-rose-600 py-2.5 text-xs font-extrabold text-white hover:bg-rose-700">재시작</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Mobile Bottom Navigation Bar (Fixed/Sticky at bottom) */}
         <nav className="sticky bottom-0 left-0 right-0 w-full bg-white/95 backdrop-blur-md border-t border-slate-200 px-2 py-2 flex items-center justify-around shrink-0 z-50 shadow-md">

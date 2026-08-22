@@ -25,6 +25,9 @@ export class OrderManager {
   private watchingOrderIds: Set<string> = new Set();
   private watcherContextGeneration = 0;
   private watcherContextGuard: () => boolean = () => true;
+  private isStrategyFillDurablyApplied?: (eventId: string) => boolean;
+  private onDurabilityFailure?: (error: unknown) => void;
+  private durabilityFailure = false;
 
   constructor(
     riskGovernor?: GlobalRiskGovernor,
@@ -55,6 +58,15 @@ export class OrderManager {
   public setWatcherContextGuard(guard: () => boolean) {
     this.watcherContextGeneration += 1;
     this.watcherContextGuard = guard;
+  }
+
+  /** Reads the position-state fill ledger during restart recovery. */
+  public setStrategyFillDurabilityLookup(lookup: (eventId: string) => boolean) {
+    this.isStrategyFillDurablyApplied = lookup;
+  }
+
+  public setDurabilityFailureHandler(handler: (error: unknown) => void) {
+    this.onDurabilityFailure = handler;
   }
 
   private captureWatcherContext() {
@@ -268,6 +280,9 @@ export class OrderManager {
     onFilled: (record: OrderRecord) => void,
     onError: (error: string) => void
   ): Promise<OrderRecord> {
+    if (this.durabilityFailure) {
+      throw new Error('Durability failure is active. Restart and complete exchange reconciliation before submitting any order.');
+    }
     if (this.processedSignalIds.has(req.signalId)) {
       throw new Error(`[OrderManager] Signal ID ${req.signalId} has already been processed (Duplicate prevented).`);
     }
@@ -298,7 +313,13 @@ export class OrderManager {
     };
 
     this.orders.set(record.id, record);
-    this.saveOrdersToFile();
+    try {
+      this.saveOrdersToFile();
+    } catch (e) {
+      this.durabilityFailure = true;
+      this.onDurabilityFailure?.(e);
+      throw e;
+    }
 
     // Auto-reserve exposure for BUY orders if riskGovernor is attached
     if (req.side === 'BUY' && req.requestedAmountKrw && this.riskGovernor) {
@@ -422,7 +443,13 @@ export class OrderManager {
     record.fee = totalFee;
     record.updatedAt = Date.now();
     record.error = undefined;
-    this.saveOrdersToFile();
+    try {
+      this.saveOrdersToFile();
+    } catch (e) {
+      this.durabilityFailure = true;
+      this.onDurabilityFailure?.(e);
+      throw e;
+    }
 
     const appliedVolume = record.strategyAppliedFilledVolume || 0;
     const appliedFee = record.strategyAppliedFee || 0;
@@ -474,27 +501,44 @@ export class OrderManager {
     if (volume <= 0) return;
 
     const isInitial = !record.strategyInitialFillApplied;
+    const cumulativeAppliedVolume = Number(((record.strategyAppliedFilledVolume || 0) + volume).toFixed(8));
+    const fillEventId = `${record.clientOrderId}:${cumulativeAppliedVolume.toFixed(8)}`;
     const strategyRecord: OrderRecord = {
       ...record,
       filledVolume: volume,
       fee,
-      strategyFillKind: isInitial ? 'INITIAL' : 'INCREMENTAL'
+      strategyFillKind: isInitial ? 'INITIAL' : 'INCREMENTAL',
+      strategyFillEventId: fillEventId
     };
 
-    if (source === 'WATCHER') {
-      this.onOrderUpdated?.(strategyRecord, volume);
-    } else {
-      onFilled(strategyRecord);
+    try {
+      if (this.isStrategyFillDurablyApplied?.(fillEventId)) {
+        console.warn(`[OrderManager] Recovering durable position fill without replay: ${fillEventId}`);
+      } else if (source === 'WATCHER') {
+        this.onOrderUpdated?.(strategyRecord, volume);
+      } else {
+        onFilled(strategyRecord);
+      }
+    } catch (e) {
+      this.durabilityFailure = true;
+      this.onDurabilityFailure?.(e);
+      throw e;
     }
 
-    record.strategyAppliedFilledVolume = Number(((record.strategyAppliedFilledVolume || 0) + volume).toFixed(8));
+    record.strategyAppliedFilledVolume = cumulativeAppliedVolume;
     record.strategyAppliedFee = Number(((record.strategyAppliedFee || 0) + fee).toFixed(8));
     if (isInitial) {
       record.strategyInitialFillApplied = true;
       record.strategyInitialFillAppliedAt = Date.now();
     }
     record.updatedAt = Date.now();
-    this.saveOrdersToFile();
+    try {
+      this.saveOrdersToFile();
+    } catch (e) {
+      this.durabilityFailure = true;
+      this.onDurabilityFailure?.(e);
+      throw e;
+    }
   }
 
   // ──────────────────────────────────────────────────────────
@@ -560,6 +604,7 @@ export class OrderManager {
 
   /** One watcher cycle, extracted for deterministic stale-context testing. */
   private async processPartialFillWatcherCycle() {
+    if (this.durabilityFailure) return;
     const keys = this.lastApiKeys;
     if (!keys?.upbitAccessKey || !keys.upbitSecretKey) return;
 
@@ -662,15 +707,11 @@ export class OrderManager {
   }
 
   private saveOrdersToFile() {
-    try {
-      const dir = path.dirname(ORDERS_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const list = Array.from(this.orders.values()).slice(-200);
-      const tmpFile = ORDERS_FILE + '.tmp';
-      fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), 'utf-8');
-      fs.renameSync(tmpFile, ORDERS_FILE);
-    } catch (e) {
-      console.error('[OrderManager] Failed to save order history:', e);
-    }
+    const dir = path.dirname(ORDERS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const list = Array.from(this.orders.values()).slice(-200);
+    const tmpFile = ORDERS_FILE + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), 'utf-8');
+    fs.renameSync(tmpFile, ORDERS_FILE);
   }
 }

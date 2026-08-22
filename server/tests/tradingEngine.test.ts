@@ -3,7 +3,8 @@
  * Tests: Strategy, Risk, Position, Order Idempotency, Exposure Reservation,
  *        Fill Confirmation, Timeout Reconciliation, Collision Blocking
  * 
- * Run: npx tsx server/tests/tradingEngine.test.ts
+ * Run: npm test
+ * The npm script supplies NODE_ENV=test and an isolated temporary DATA_DIR.
  */
 
 import fs from 'fs';
@@ -1717,6 +1718,135 @@ async function runAllTests() {
     pendingOrderSwitchRejected = true;
   }
   assert(pendingOrderSwitchRejected && pendingOrderSwitchEngine.params.exchange === 'UPBIT', '[Symbol switch] Pending order rejects exchange change without mutating params');
+
+  // ──────────────────────────────────────────────────────
+  // TEST GROUP 22: Durable Fill Recovery / Failure Injection
+  // ──────────────────────────────────────────────────────
+  console.log('\n▶ TEST GROUP 22: Durable Fill Recovery & Failure Injection');
+  const durableClientOrderId = `CLIENT_DURABLE_${Date.now()}`;
+  const durableEventId = `${durableClientOrderId}:1.00000000`;
+  const durablePosition = new PositionManager(defaultParams);
+  assert(durablePosition.beginDurableFillEvent(durableEventId) === true, '[Durability] New fill event can start an atomic position transition');
+  durablePosition.onInitialEntryFilled(2700000, 1, 2700000, 10000, 2, 3);
+  assert(durablePosition.completeDurableFillEvent(durableEventId) === true, '[Durability] Position transition and fill-event ID persist together');
+
+  const durabilityOrderManager = new OrderManager();
+  const durabilityOrder: OrderRecord = {
+    id: `ORD_DURABLE_${Date.now()}`, clientOrderId: durableClientOrderId,
+    signalId: `SIG_DURABLE_${Date.now()}`, signalType: 'DCA_BUY', symbol: 'KRW-ETH', side: 'BUY',
+    status: 'ORDER_SUBMITTED', requestedBudgetOrVolume: 1000000, filledVolume: 0, avgFillPrice: 0, fee: 0,
+    createdAt: Date.now(), updatedAt: Date.now(), reason: 'durability failure injection', fills: [],
+    strategyAppliedFilledVolume: 0, strategyAppliedFee: 0, strategyInitialFillApplied: false
+  };
+  (durabilityOrderManager as any).orders.set(durabilityOrder.id, durabilityOrder);
+  let durabilitySaveCount = 0;
+  const realOrderSave = (durabilityOrderManager as any).saveOrdersToFile.bind(durabilityOrderManager);
+  (durabilityOrderManager as any).saveOrdersToFile = () => {
+    durabilitySaveCount++;
+    if (durabilitySaveCount === 2) throw new Error('injected order rename failure');
+    return realOrderSave();
+  };
+  let durabilityHandlerCalls = 0;
+  let durabilityFailedClosed = false;
+  durabilityOrderManager.setDurabilityFailureHandler(() => { durabilityFailedClosed = true; });
+  try {
+    durabilityOrderManager.applyUpbitOrderState(
+      durabilityOrder,
+      { ...responseC, uuid: 'mock-durable-order', identifier: durableClientOrderId },
+      () => { durabilityHandlerCalls++; },
+      () => {},
+      'SUBMIT_FLOW'
+    );
+  } catch {
+    // Expected: the post-handler order watermark write is injected to fail.
+  }
+  assert(durabilityHandlerCalls === 1 && durabilityFailedClosed, '[Durability] Order watermark write failure is surfaced and fail-closes the manager');
+
+  // Simulate restart: order_history contains the pre-watermark first write,
+  // while position_state already contains the same durable event. The fill
+  // must update only the order watermark, never call the strategy again.
+  const restartedPosition = new PositionManager(defaultParams);
+  const restartedOrderManager = new OrderManager();
+  restartedOrderManager.setStrategyFillDurabilityLookup((eventId) => restartedPosition.hasDurablyAppliedFillEvent(eventId));
+  const restartedOrder = restartedOrderManager.getAllOrders().find((order) => order.clientOrderId === durableClientOrderId)!;
+  let replayedStrategyCalls = 0;
+  restartedOrderManager.applyUpbitOrderState(
+    restartedOrder,
+    { ...responseC, uuid: 'mock-durable-order', identifier: durableClientOrderId },
+    () => { replayedStrategyCalls++; },
+    () => {},
+    'WATCHER'
+  );
+  assert(restartedPosition.hasDurablyAppliedFillEvent(durableEventId), '[Durability] Restart restores the position fill-event ledger');
+  assert(replayedStrategyCalls === 0 && restartedOrder.strategyAppliedFilledVolume === 1, '[Durability] Restart repairs only the watermark without replaying the position transition');
+
+  const failingPosition = new PositionManager(defaultParams);
+  const failingEventId = `CLIENT_POSITION_WRITE_FAIL_${Date.now()}:0.40000000`;
+  failingPosition.beginDurableFillEvent(failingEventId);
+  (failingPosition as any).saveStateToFile = () => { throw new Error('injected position rename failure'); };
+  let positionWriteFailed = false;
+  try {
+    failingPosition.onInitialEntryFilled(2700000, 0.4, 2700000, 10000, 2, 3);
+  } catch {
+    positionWriteFailed = true;
+  }
+  assert(positionWriteFailed && failingPosition.completeDurableFillEvent(failingEventId) === false, '[Durability] Position write failure prevents a durable fill marker from being acknowledged');
+
+  // REENTRY and REGIME_REBALANCE each invoke a nested manual-add mutator.
+  // Their whole fill must still produce one final physical position commit;
+  // a hypothetical second write therefore cannot publish an early marker.
+  const nestedFillPosition = new PositionManager(defaultParams);
+  nestedFillPosition.onInitialEntryFilled(2700000, 1, 2700000, 10000, 2, 3);
+  const nestedEventId = `CLIENT_NESTED_FILL_${Date.now()}:0.20000000`;
+  let nestedPhysicalCommits = 0;
+  const actualCommit = (nestedFillPosition as any).commitStateToFile.bind(nestedFillPosition);
+  (nestedFillPosition as any).commitStateToFile = () => {
+    nestedPhysicalCommits++;
+    if (nestedPhysicalCommits === 2) throw new Error('injected second write failure');
+    return actualCommit();
+  };
+  nestedFillPosition.beginDurableFillEvent(nestedEventId);
+  nestedFillPosition.onReentryBuyFilled(2650000, 0.2, 2700000, 10000, 2, 3);
+  assert(nestedFillPosition.completeDurableFillEvent(nestedEventId) === true && nestedPhysicalCommits === 1, '[Durability] Nested REENTRY commits final position and marker exactly once');
+  assert(nestedFillPosition.hasDurablyAppliedFillEvent(nestedEventId), '[Durability] Second-write failure cannot expose an early nested fill marker');
+
+  const regimeFillPosition = new PositionManager(defaultParams);
+  regimeFillPosition.onInitialEntryFilled(2700000, 1, 2700000, 10000, 2, 3);
+  const regimeEventId = `CLIENT_REGIME_FILL_${Date.now()}:0.15000000`;
+  let regimePhysicalCommits = 0;
+  const actualRegimeCommit = (regimeFillPosition as any).commitStateToFile.bind(regimeFillPosition);
+  (regimeFillPosition as any).commitStateToFile = () => {
+    regimePhysicalCommits++;
+    if (regimePhysicalCommits === 2) throw new Error('injected regime second write failure');
+    return actualRegimeCommit();
+  };
+  regimeFillPosition.beginDurableFillEvent(regimeEventId);
+  regimeFillPosition.onRegimeRebalanceBuyFilled(2680000, 0.15, 2700000, 10000, 2, 3);
+  assert(regimeFillPosition.completeDurableFillEvent(regimeEventId) === true && regimePhysicalCommits === 1 && regimeFillPosition.hasDurablyAppliedFillEvent(regimeEventId), '[Durability] Nested REGIME_REBALANCE commits final position and marker exactly once');
+
+  const haltedResumeEngine = new ATREngine(undefined, { backtest: true });
+  (haltedResumeEngine as any).durabilityFailure = true;
+  haltedResumeEngine.botState = 'HALTED';
+  let haltedResumeRejected = false;
+  try {
+    haltedResumeEngine.updateParams({ isBotActive: true });
+  } catch {
+    haltedResumeRejected = true;
+  }
+  assert(haltedResumeRejected && haltedResumeEngine.botState === 'HALTED' && haltedResumeEngine.params.isBotActive === false, '[Durability] HALTED engine rejects in-process bot resume until restart');
+
+  const haltedOrderManager = new OrderManager();
+  (haltedOrderManager as any).durabilityFailure = true;
+  let haltedSubmitRejected = false;
+  try {
+    await haltedOrderManager.submitOrder({
+      signalId: `SIG_HALTED_SUBMIT_${Date.now()}`, clientOrderId: `CLIENT_HALTED_SUBMIT_${Date.now()}`,
+      signalType: 'ENTRY_BUY', symbol: 'KRW-ETH', side: 'BUY', requestedAmountKrw: 100000, reason: 'durability terminal-state test', createdAt: Date.now()
+    }, { upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' }, 'UPBIT', () => {}, () => {});
+  } catch {
+    haltedSubmitRejected = true;
+  }
+  assert(haltedSubmitRejected, '[Durability] OrderManager rejects all new submits after durability failure');
 
   // ──────────────────────────────────────────────────────
   // RESULTS
