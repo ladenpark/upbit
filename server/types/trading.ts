@@ -219,6 +219,20 @@ export interface PositionSnapshot {
   lastRegimeRebalanceAt?: number;
   /** 한 포지션 안에서 완료된 방어→재진입 순환 횟수 */
   recycleCycleCount?: number;
+  /**
+   * Protective/DCA order lifecycle. A stage is identified by the exchange
+   * client order id, so several partial fills cannot masquerade as several
+   * strategy stages.
+   */
+  executionStages?: Record<string, {
+    signalType: SignalType;
+    targetVolume?: number;
+    targetBudgetKrw?: number;
+    cumulativeFilledVolume: number;
+    status: 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED_PARTIAL';
+    startedAt: number;
+    updatedAt: number;
+  }>;
   /** Bounded ledger of fill events already atomically included in position_state.json. */
   appliedFillEventIds?: string[];
   /** Authoritative per-order fill watermark persisted with the position mutation. */
@@ -267,7 +281,7 @@ export interface AdaptiveIndicators {
 }
 
 export interface NextOrderItem {
-  category: 'DIP' | 'BREAKOUT' | 'DCA' | 'PYRAMID' | 'COMPLETED' | 'SCALP_DIP' | 'SCALP_BREAKOUT' | 'SCALP_TP' | 'TRAILING_TP';
+  category: 'DIP' | 'BREAKOUT' | 'DCA' | 'PYRAMID' | 'REGIME_TARGET' | 'COMPLETED' | 'SCALP_DIP' | 'SCALP_BREAKOUT' | 'SCALP_TP' | 'TRAILING_TP';
   categoryLabel: string;
   type: string;
   budgetKrw: number;
@@ -369,9 +383,14 @@ export interface BotParams {
 export interface ApiKeys {
   upbitAccessKey?: string;
   upbitSecretKey?: string;
+  /** Telegram bot credentials are encrypted with the same local secret store. */
+  telegramBotToken?: string;
+  telegramChatId?: string;
 }
 
 export interface MaskedApiKeys {
   hasUpbitKeys: boolean;
   upbitAccessMasked?: string;
+  hasTelegramAlerts?: boolean;
+  telegramChatIdMasked?: string;
 }

@@ -7,7 +7,8 @@ import {
   ApiKeys,
   NextOrderItem,
   Signal,
-  PositionSnapshot
+  PositionSnapshot,
+  SignalType
 } from '../types/trading';
 import { SecretManager } from '../security/secretManager';
 import { MarketDataManager } from '../market/marketDataManager';
@@ -19,8 +20,12 @@ import { UpbitClient, UpbitCandle } from '../exchanges/upbit';
 import { ApiGateway } from '../gateway/apiGateway';
 import { roundDownToTick } from '../utils/priceUtils';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { ResearchRecorder, ResearchDecision } from '../research/researchRecorder';
 import { DCA2_RECOVERY_PREBUY_FRACTION, FIXED_DCA_DROP_PERCENTS, FIXED_DCA_UNIT_SCALES } from './strategyRuleConstants';
+
+const RUN_INTENT_FILE = path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'bot_run_intent.json');
 
 export class ATREngine {
   // Sub-modules
@@ -32,6 +37,37 @@ export class ATREngine {
   public orderManager: OrderManager;
   private upbitClient: UpbitClient;
   private apiGateway: ApiGateway;
+  /** User's last explicit run choice; restored only after the startup barrier succeeds. */
+  private requestedRunAfterStartup = false;
+
+  private loadRunIntent(): boolean {
+    try {
+      if (!fs.existsSync(RUN_INTENT_FILE)) return false;
+      return JSON.parse(fs.readFileSync(RUN_INTENT_FILE, 'utf-8'))?.isBotActive === true;
+    } catch (error) {
+      console.error('[ATREngine] Failed to load bot run intent; starting paused:', error);
+      return false;
+    }
+  }
+
+  private persistRunIntent(isBotActive: boolean) {
+    try {
+      const dir = path.dirname(RUN_INTENT_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmp = `${RUN_INTENT_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ isBotActive, updatedAt: Date.now() }), 'utf-8');
+      fs.renameSync(tmp, RUN_INTENT_FILE);
+    } catch (error) {
+      // This is a convenience preference, never a reason to keep trading.
+      console.error('[ATREngine] Failed to persist bot run intent:', error);
+    }
+  }
+
+  private disableAutoRunIntent() {
+    this.requestedRunAfterStartup = false;
+    this.params.isBotActive = false;
+    this.persistRunIntent(false);
+  }
   private researchRecorder?: ResearchRecorder;
 
   // Bot Lifecycle State
@@ -112,6 +148,15 @@ export class ATREngine {
   private accountContextGeneration = 0;
   private lastExchangeCoinQuantity = 0;
   private rebaseRequired = false;
+  /**
+   * Upbit balance snapshots can lag a confirmed order fill by a few seconds.
+   * Keep a short-lived local KRW shadow so a pre-fill snapshot cannot make
+   * the risk governor believe both the old KRW and newly bought coin exist.
+   */
+  private balanceShadowUntil = 0;
+  private balanceShadowByOrder = new Map<string, { funds: number; fee: number }>();
+  /** FIFO cost lots used for the live daily circuit breaker (fees included). */
+  private dailyCostLots: { volume: number; price: number; fee: number }[] = [];
 
   private captureAsyncContext() {
     return {
@@ -156,6 +201,8 @@ export class ATREngine {
     this.secretManager = SecretManager.getInstance();
     this.upbitClient = new UpbitClient();
     this.apiGateway = ApiGateway.getInstance();
+    this.requestedRunAfterStartup = !options.backtest && this.loadRunIntent();
+    this.params.isBotActive = this.requestedRunAfterStartup;
     if (!options.backtest && process.env.NODE_ENV !== 'test') {
       this.researchRecorder = new ResearchRecorder();
     }
@@ -164,7 +211,7 @@ export class ATREngine {
     this.riskGovernor = new GlobalRiskGovernor(this.params);
     this.riskGovernor.setPersistenceFailureHandler((error) => {
       this.durabilityFailure = true;
-      this.params.isBotActive = false;
+      this.disableAutoRunIntent();
       this.botState = 'HALTED';
       this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `🚨 [위험 원장 안전 정지] ${error instanceof Error ? error.message : String(error)}` });
       this.notifyClients();
@@ -202,10 +249,15 @@ export class ATREngine {
       (clientOrderId) => this.positionManager.getDurableFillWatermark(clientOrderId),
       (clientOrderId, funds) => this.positionManager.restoreDurableFillWatermarkFunds(clientOrderId, funds)
     );
+    this.orderManager.setOnPartialOrderCancelled((record) => {
+      if (!record.signalType || !['DCA_BUY', 'PARTIAL_LOSS_CUT', 'TRAILING_STOP_EXIT'].includes(record.signalType)) return;
+      this.positionManager.finalizeCancelledPartialStage(record.clientOrderId, record.signalType, record.filledVolume);
+      this.notifyClients();
+    });
     this.orderManager.setDurabilityFailureHandler(() => {
       this.durabilityFailure = true;
       this.botState = 'HALTED';
-      this.params.isBotActive = false;
+      this.disableAutoRunIntent();
       this.addLog({
         type: 'SYSTEM',
         price: this.currentPrice,
@@ -266,6 +318,10 @@ export class ATREngine {
     this.totalFeesPaid = Math.round(totalFees);
     this.totalTrades = closedTradesCount;
     this.winTrades = winCount;
+    // `buyQueue` now contains only the still-open FIFO cost basis. Continue
+    // from that exact basis for live fills instead of switching the circuit
+    // breaker back to a gross entry-price approximation after restart.
+    this.dailyCostLots = buyQueue.map((lot) => ({ volume: lot.vol, price: lot.price, fee: lot.fee }));
 
     // Initialize Market Data Manager with tick dispatcher
     this.marketManager = new MarketDataManager(
@@ -316,6 +372,16 @@ export class ATREngine {
         if (this.rebaseRequired) throw new Error('거래소 잔고가 로컬 체결 원장과 다릅니다. 포지션 보정이 필요합니다.');
 
         if (generation !== this.startupGeneration) return;
+        // A process restart must never silently bypass a same-day loss halt.
+        // Preserve the safe PAUSED state and clear the saved run intent instead.
+        if (this.params.isBotActive && this.riskGovernor.getDailyLossStatus().circuitBroken) {
+          this.disableAutoRunIntent();
+          this.addLog({
+            type: 'SYSTEM',
+            price: this.currentPrice,
+            reason: '⚠️ [자동 가동 복원 차단] 당일 손실 서킷 브레이커가 활성화되어 있습니다 — 보호 매도만 허용'
+          });
+        }
         this.startupReady = true;
         this.botState = this.params.isBotActive ? 'RUNNING' : 'PAUSED';
         this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '[시작 장벽 해제] 완성 캔들·미체결 주문·실계좌 동기화 완료 — 전략 신호 허용' });
@@ -325,7 +391,7 @@ export class ATREngine {
         this.startupReady = false;
         this.startupFailureReason = e.message || 'startup synchronization failed';
         // Fail closed: a bot cannot become RUNNING from incomplete startup data.
-        this.params.isBotActive = false;
+        this.disableAutoRunIntent();
         this.botState = this.durabilityFailure ? 'HALTED' : 'PAUSED';
         this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: `⚠️ [시작 장벽 유지] ${this.startupFailureReason} — 자동 주문 차단` });
       } finally {
@@ -474,7 +540,8 @@ export class ATREngine {
     position: PositionSnapshot,
     dropSpeed: number,
     historyPrices: number[],
-    activeSignals: Signal[]
+    activeSignals: Signal[],
+    currentExposurePercent: number
   ) {
     if (!this.researchRecorder) return;
 
@@ -484,7 +551,8 @@ export class ATREngine {
     };
     const evaluate = (params: BotParams) => summarize(this.strategyCore.generateSignals(
       price, this.baselineValue, this.atrValue, params, position, dropSpeed,
-      historyPrices, this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa
+      historyPrices, this.higherTfTrend, this.rsiValue, this.volumeMultiplier, this.volumeMa,
+      historyPrices, { currentExposurePercent }
     ));
     const baselineParams: BotParams = {
       ...this.params,
@@ -531,6 +599,14 @@ export class ATREngine {
     // arm trailing/re-entry state or mutate the PositionManager before a
     // restart and authoritative reconciliation.
     if (this.durabilityFailure || this.botState === 'HALTED' && !this.riskGovernor.getDailyLossStatus().circuitBroken) {
+      this.notifyClients();
+      return;
+    }
+
+    // A balance/ledger discrepancy needs an explicit, paused rebase.  Do not
+    // let a later tick arm trailing/re-entry state or create another order
+    // while the dashboard is asking the user to reconcile the position.
+    if (this.rebaseRequired) {
       this.notifyClients();
       return;
     }
@@ -632,6 +708,15 @@ export class ATREngine {
 
     // 1. Generate Strategy Signals (evaluateAdaptiveParams is called again inside with identical inputs — same result)
     let position = this.positionManager.getSnapshot();
+    const exposureLimits = this.riskGovernor.calculateExposureLimits(
+      this.actualKrwBalance,
+      position.amount,
+      price,
+      0
+    );
+    const currentExposurePercent = exposureLimits.totalCapitalKrw > 0
+      ? (exposureLimits.currentExposureKrw / exposureLimits.totalCapitalKrw) * 100
+      : 0;
     const candidateSignals = this.strategyCore.generateSignals(
       price,
       this.baselineValue,
@@ -644,9 +729,10 @@ export class ATREngine {
       this.rsiValue,
       this.volumeMultiplier,
       this.volumeMa,
-      tickHistoryPrices
+      tickHistoryPrices,
+      { currentExposurePercent }
     );
-    this.captureShadowDecisions(timestamp, price, position, dropSpeed, historyPrices, candidateSignals);
+    this.captureShadowDecisions(timestamp, price, position, dropSpeed, historyPrices, candidateSignals, currentExposurePercent);
 
     if (candidateSignals.length > 0) {
       console.log(`[ATREngine] 🎯 Signals Generated (${candidateSignals.length}):`, candidateSignals.map((s) => `[${s.type}] ${s.reason}`));
@@ -669,7 +755,7 @@ export class ATREngine {
           position = this.positionManager.getSnapshot();
         } catch (e: any) {
           this.durabilityFailure = true;
-          this.params.isBotActive = false;
+          this.disableAutoRunIntent();
           this.botState = 'HALTED';
           this.addLog({ type: 'SYSTEM', price, reason: `🚨 [보호청산 안전 정지] ${e.message}` });
           this.notifyClients();
@@ -786,6 +872,7 @@ export class ATREngine {
     const fillEventId = record.strategyFillEventId as string | undefined;
     if (!fillEventId) {
       this.applyOrderFillToPosition(signalType, record, tickPrice, overrideVolume);
+      this.applyConfirmedBalanceShadow(record, tickPrice, overrideVolume);
       return;
     }
 
@@ -806,7 +893,7 @@ export class ATREngine {
       if (!this.positionManager.completeDurableFillEvent(fillEventId)) {
         this.durabilityFailure = true;
         this.botState = 'HALTED';
-        this.params.isBotActive = false;
+        this.disableAutoRunIntent();
         this.addLog({
           type: 'SYSTEM',
           price: tickPrice,
@@ -815,6 +902,37 @@ export class ATREngine {
         throw new Error('Durable position fill write failed; bot halted for safe recovery.');
       }
     }
+    this.applyConfirmedBalanceShadow(record, tickPrice, overrideVolume);
+  }
+
+  /** Apply only the newly confirmed cumulative fill cost/proceeds to local KRW. */
+  private applyConfirmedBalanceShadow(record: any, tickPrice: number, overrideVolume?: number) {
+    if (this.params.dryRunMode || !record?.clientOrderId || (record.side !== 'BUY' && record.side !== 'SELL')) return;
+
+    const fillPrice = Number(record.avgFillPrice) > 0 ? Number(record.avgFillPrice) : tickPrice;
+    const volume = overrideVolume && overrideVolume > 0
+      ? overrideVolume
+      : Math.max(0, Number(record.filledVolume) || 0);
+    const cumulativeFunds = Number(record.strategyFillCumulativeFunds);
+    const cumulativeFee = Number(record.strategyFillCumulativeFee);
+    const previous = this.balanceShadowByOrder.get(record.clientOrderId) || { funds: 0, fee: 0 };
+    const totalFunds = Number.isFinite(cumulativeFunds) && cumulativeFunds >= 0
+      ? cumulativeFunds
+      : previous.funds + (volume * fillPrice);
+    const totalFee = Number.isFinite(cumulativeFee) && cumulativeFee >= 0
+      ? cumulativeFee
+      : previous.fee + Math.max(0, Number(record.fee) || 0);
+    const incrementalFunds = Math.max(0, totalFunds - previous.funds);
+    const incrementalFee = Math.max(0, totalFee - previous.fee);
+    if (incrementalFunds <= 0 && incrementalFee <= 0) return;
+
+    this.balanceShadowByOrder.set(record.clientOrderId, { funds: totalFunds, fee: totalFee });
+    const krwDelta = record.side === 'BUY'
+      ? -(incrementalFunds + incrementalFee)
+      : (incrementalFunds - incrementalFee);
+    this.actualKrwBalance = Math.max(0, this.actualKrwBalance + krwDelta);
+    this.realBalances = { ...this.realBalances, KRW: this.actualKrwBalance };
+    this.balanceShadowUntil = Date.now() + 15_000;
   }
 
   private applyOrderFillToPosition(signalType: string, record: any, tickPrice: number, overrideVolume?: number) {
@@ -906,14 +1024,14 @@ export class ATREngine {
     } else if (signalType === 'DCA_BUY') {
       if (isIncremental) {
         // Incremental DCA fill: add to current DCA slot volume without consuming a new slot
-        this.positionManager.addAdditionalDcaFilled(fillPrice, effectiveVolume);
+        this.positionManager.addAdditionalDcaFilled(fillPrice, effectiveVolume, record.status === 'FILLED');
       } else {
         const nextSlot = position.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED') || { slotNumber: 1 };
         if (record.reason.includes('DCA 2차 접근 반등 선매수')) {
           const plannedTargetPrice = (position.entryPrice || fillPrice) * 0.958;
           this.positionManager.onDcaRecoveryPrebuyFilled(nextSlot.slotNumber, fillPrice, effectiveVolume, plannedTargetPrice);
         } else {
-          this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume);
+          this.positionManager.onDcaFilled(nextSlot.slotNumber, fillPrice, effectiveVolume, record.status === 'FILLED');
         }
       }
       if (!isIncremental) this.totalTrades += 1;
@@ -1015,7 +1133,7 @@ export class ATREngine {
       if (isFullExit) {
         this.positionManager.onPositionClosed(pnl, signalType);
       } else {
-        this.positionManager.onTrailingPartialFilled(sellVolume, fillPrice, pnl);
+        this.positionManager.onTrailingPartialFilled(sellVolume, fillPrice, pnl, record.status === 'FILLED');
       }
 
       this.totalRealizedPnl += pnl;
@@ -1065,7 +1183,7 @@ export class ATREngine {
 
         if (signalType === 'EMERGENCY_FULL_EXIT') {
           this.botState = 'HALTED';
-          this.params.isBotActive = false;
+          this.disableAutoRunIntent();
         }
       } else {
         this.positionManager.reducePositionOnPartialExit(sellVolume, pnl);
@@ -1083,30 +1201,43 @@ export class ATREngine {
       });
     }
 
-    // ── Record daily loss for Circuit Breaker ──
-    // Sum up total capital for threshold calculation
-    const totalCap = this.actualKrwBalance + (this.positionManager.getSnapshot().amount * this.currentPrice);
-    if (this.totalRealizedPnl < 0) {
-      // Only track realized losses (positive lossAmount = how much was lost)
-      // We pass the absolute loss from this specific trade, not the cumulative
+    // Persist order-level stage progress alongside the fill mutation. This is
+    // intentionally separate from quantity accounting: a partial fragment
+    // changes quantity immediately, but it never becomes a second DCA/cut/
+    // trailing stage merely because the watcher reports it again.
+    if (record.clientOrderId && ['DCA_BUY', 'PARTIAL_LOSS_CUT', 'TRAILING_STOP_EXIT'].includes(signalType)) {
+      this.positionManager.recordExecutionStage(
+        record.clientOrderId,
+        signalType as SignalType,
+        Number(record.strategyFillCumulativeVolume) > 0 ? Number(record.strategyFillCumulativeVolume) : effectiveVolume,
+        record.status === 'FILLED',
+        record.side === 'SELL' ? Number(record.requestedBudgetOrVolume) : undefined,
+        record.side === 'BUY' ? Number(record.requestedBudgetOrVolume) : undefined
+      );
     }
-    // Check if this specific fill was a losing sell
-    if (
-      signalType !== 'ENTRY_BUY' && signalType !== 'BREAKOUT_BUY' &&
-      signalType !== 'DCA_BUY' && signalType !== 'MANUAL_ADD_BUY' && signalType !== 'PYRAMID_BUY' &&
-      signalType !== 'BOX_PYRAMID_BUY' && signalType !== 'REENTRY_BUY'
-    ) {
-      const entry = position.entryPrice || fillPrice;
-      const thisTradePnl = (fillPrice - entry) * effectiveVolume;
-      if (thisTradePnl < 0) {
-        const { circuitBroken } = this.riskGovernor.recordDailyLoss(Math.abs(thisTradePnl), totalCap);
+
+    // ── Record daily loss for Circuit Breaker ──
+    // The breaker must use the same net realized PnL concept as the dashboard:
+    // FIFO matched cost + allocated BUY fee + this SELL fee, never gross price
+    // movement alone.
+    if (record.side === 'BUY') {
+      this.dailyCostLots.push({ volume: effectiveVolume, price: fillPrice, fee: feeCharged });
+    } else if (record.side === 'SELL') {
+      const netPnl = this.consumeDailyCostLots(effectiveVolume, fillPrice, feeCharged, position.entryPrice || fillPrice);
+      if (netPnl < 0) {
+        // Balance polling may still show the pre-fill KRW amount here. Use
+        // the confirmed SELL proceeds for this threshold calculation; the
+        // same amount is then installed in the short-lived balance shadow.
+        const projectedKrw = this.actualKrwBalance + ((effectiveVolume * fillPrice) - feeCharged);
+        const totalCap = projectedKrw + (this.positionManager.getSnapshot().amount * this.currentPrice);
+        const { circuitBroken } = this.riskGovernor.recordDailyLoss(Math.abs(netPnl), totalCap);
         if (circuitBroken) {
           this.botState = 'HALTED';
-          this.params.isBotActive = false;
+          this.disableAutoRunIntent();
           this.addLog({
             type: 'SYSTEM',
             price: fillPrice,
-            reason: `🚨 [서킷 브레이커] 일일 최대 손실 한도(${this.params.dailyMaxLossPercent || 5}%) 초과 — 봇 자동 정지`
+            reason: `🚨 [서킷 브레이커] 수수료 포함 일일 순손실 한도(${this.params.dailyMaxLossPercent || 5}%) 초과 — 봇 자동 정지`
           });
         }
       }
@@ -1121,6 +1252,29 @@ export class ATREngine {
         this.fetchRealAccountBalance();
       }, 1500);
     }
+  }
+
+  /** Consumes FIFO lots and returns fee-inclusive net realized PnL for one SELL fill. */
+  private consumeDailyCostLots(volume: number, sellPrice: number, sellFee: number, fallbackEntryPrice: number): number {
+    let remaining = volume;
+    let cost = 0;
+    let allocatedBuyFees = 0;
+    while (remaining > 1e-12 && this.dailyCostLots.length > 0) {
+      const lot = this.dailyCostLots[0];
+      const matched = Math.min(remaining, lot.volume);
+      const feePortion = lot.fee * (matched / lot.volume);
+      cost += matched * lot.price;
+      allocatedBuyFees += feePortion;
+      lot.volume -= matched;
+      lot.fee -= feePortion;
+      remaining -= matched;
+      if (lot.volume <= 1e-12) this.dailyCostLots.shift();
+    }
+    // A manually adopted/rebased position has no local historical lots. Use
+    // its authoritative entry price as a neutral fallback rather than invent
+    // a profit; its SELL fee is still counted.
+    if (remaining > 1e-12) cost += remaining * fallbackEntryPrice;
+    return (volume * sellPrice) - cost - allocatedBuyFees - sellFee;
   }
 
   /**
@@ -1325,8 +1479,21 @@ export class ATREngine {
           const authoritativeAvgPrice = res.avgBuyPrices ? res.avgBuyPrices[coinKey] : null;
 
           if (!this.isAsyncContextCurrent(context)) return false;
-          this.realBalances = balances;
-          this.actualKrwBalance = krw;
+          // Do not overwrite the local post-fill shadow with an eventually
+          // consistent, pre-fill exchange snapshot. The next matching (or
+          // post-grace) snapshot becomes authoritative again.
+          const shadowIsFresh = Date.now() < this.balanceShadowUntil;
+          const krwMatchesShadow = Math.abs(krw - this.actualKrwBalance) <= Math.max(10, this.actualKrwBalance * 0.001);
+          if (!shadowIsFresh || krwMatchesShadow) {
+            this.realBalances = balances;
+            this.actualKrwBalance = krw;
+            if (krwMatchesShadow) {
+              this.balanceShadowByOrder.clear();
+              this.balanceShadowUntil = 0;
+            }
+          } else {
+            this.realBalances = { ...balances, KRW: this.actualKrwBalance };
+          }
           this.lastExchangeCoinQuantity = realCoinQty;
           // A missing local position ledger cannot safely be recreated from
           // amount/average alone: DCA, trailing, cooldown and durable fill
@@ -1334,12 +1501,23 @@ export class ATREngine {
           const local = this.positionManager.getSnapshot();
           const quantityMismatch = Math.abs(local.amount - realCoinQty) > 1e-8;
           const averageMismatch = realCoinQty > 1e-8 && Boolean(authoritativeAvgPrice && Math.abs((local.entryPrice || 0) - authoritativeAvgPrice) > 1);
-          if (!allowMissingPositionStateRecovery && this.positionManager.hasPersistedState() && (quantityMismatch || averageMismatch)) {
+          // Before an order fills, Upbit may report a balance snapshot from
+          // just before that order.  It is not safe to label that expected
+          // in-flight delta as a manual/external position change.  Wait for
+          // the order watcher to settle, then let a subsequent authoritative
+          // poll reconcile the final state.
+          const hasPendingOrders = this.orderManager.getPendingOrdersCount() > 0;
+          if (hasPendingOrders && (quantityMismatch || averageMismatch)) {
+            // Deliberately preserve the local durable position unchanged.
+          } else if (shadowIsFresh && (quantityMismatch || averageMismatch)) {
+            // The same lag can affect the coin balance. Never mistake the
+            // pre-fill snapshot for an external manual trade/rebase event.
+          } else if (!allowMissingPositionStateRecovery && this.positionManager.hasPersistedState() && (quantityMismatch || averageMismatch)) {
             // An external transfer/manual trade cannot safely inherit DCA,
             // trailing and durable-fill state. Preserve the local ledger and
             // require the explicit paused rebase path instead of guessing.
             this.rebaseRequired = true;
-            this.params.isBotActive = false;
+            this.disableAutoRunIntent();
             this.botState = 'PAUSED';
             this.addLog({ type: 'SYSTEM', price: this.currentPrice, reason: '⚠️ [포지션 보정 필요] 거래소 수량 또는 평단이 로컬 체결 원장과 다릅니다. 자동 전략을 정지했습니다.' });
           } else if (this.positionManager.hasPersistedState() || realCoinQty <= 1e-8 || allowMissingPositionStateRecovery) {
@@ -1384,12 +1562,20 @@ export class ATREngine {
     if (openOrders.orders.length > 0) {
       throw new Error('거래소 미체결 주문이 있어 포지션 보정을 실행할 수 없습니다. 먼저 주문을 정리하세요.');
     }
-    const synchronized = await this.fetchRealAccountBalance(true);
-    if (!synchronized) {
+    // Do not call the ordinary reconciliation path here: it writes an
+    // intermediate amount/average-only position before protection fields are
+    // rebuilt. Read the balance and adopt/rebase once below instead.
+    const context = this.captureAsyncContext();
+    const balanceRes = await this.apiGateway.enqueue(3, async () => {
+      return await this.upbitClient.getAccountBalance(keys.upbitAccessKey!, keys.upbitSecretKey!);
+    });
+    if (!this.isAsyncContextCurrent(context) || !balanceRes.success || !balanceRes.balances) {
       throw new Error('거래소 잔고 동기화에 실패해 포지션 보정을 중단했습니다.');
     }
-    const position = this.positionManager.getSnapshot();
-    if (position.amount <= 0 || !position.entryPrice) {
+    const coinKey = this.params.symbol.replace('KRW-', '');
+    const exchangeQuantity = (balanceRes.balances[coinKey] || 0) + (balanceRes.lockedBalances?.[coinKey] || 0);
+    const exchangeEntryPrice = balanceRes.avgBuyPrices?.[coinKey] || 0;
+    if (exchangeQuantity <= 1e-8 || exchangeEntryPrice <= 0) {
       throw new Error('거래소에서 확인된 보유 포지션이 없어 보정을 중단했습니다.');
     }
     const adaptive = this.strategyCore.evaluateAdaptiveParams(
@@ -1398,9 +1584,12 @@ export class ATREngine {
       this.rsiValue, this.volumeMultiplier, this.volumeMa
     );
     const atrMultiplier = this.params.autoPilotEnabled ? adaptive.dynamicAtr : this.params.atrMultiplier;
-    this.positionManager.rebaseReconciledPosition(
-      this.baselineValue, this.atrValue, atrMultiplier, this.params.stopLossMultiplier
+    this.positionManager.adoptAndRebaseExchangePosition(
+      exchangeQuantity, exchangeEntryPrice, this.baselineValue, this.atrValue, atrMultiplier
     );
+    this.realBalances = balanceRes.balances;
+    this.actualKrwBalance = balanceRes.balances.KRW || 0;
+    this.lastExchangeCoinQuantity = exchangeQuantity;
     this.rebaseRequired = false;
     const repaired = this.positionManager.getSnapshot();
     this.addLog({
@@ -1417,6 +1606,9 @@ export class ATREngine {
 
     if (newParams.isBotActive === true && this.durabilityFailure) {
       throw new Error('저장 안전 정지 상태입니다. 서버를 재시작하고 거래소 동기화가 완료되기 전에는 봇을 다시 가동할 수 없습니다.');
+    }
+    if (newParams.isBotActive === true && this.rebaseRequired) {
+      throw new Error('포지션 보정이 필요합니다. 봇을 정지한 상태에서 보정을 완료하기 전에는 다시 가동할 수 없습니다.');
     }
     if (newParams.isBotActive === true && this.riskGovernor.getDailyLossStatus().circuitBroken) {
       throw new Error('당일 손실 서킷 브레이커가 활성화되어 있습니다. 신규 매수는 다음 KST 일자 초기화 전까지 재개할 수 없습니다. 보호 매도만 허용됩니다.');
@@ -1438,11 +1630,26 @@ export class ATREngine {
       }
     }
 
-    this.params = { ...this.params, ...newParams };
+    // Strategy Lab controls are retired from live operation. Keep their
+    // signal-only recorder variants, but never allow a persisted or stale UI
+    // configuration to alter real order decisions.
+    this.params = {
+      ...this.params,
+      ...newParams,
+      experimentDca2RsiRecoveryEnabled: false,
+      experimentDca2VolumeConfirmationEnabled: false,
+      experimentPyramidRsiGuardEnabled: false,
+      experimentPyramidVolumeConfirmationEnabled: false,
+      experimentScalpTrendExpansionEnabled: false,
+      experimentScalpReentryCooldownEnabled: false,
+      experimentTrendTrailingArmingEnabled: false
+    };
     this.riskGovernor.setParams(this.params);
     this.positionManager.setParams(this.params);
 
     if (newParams.isBotActive !== undefined) {
+      this.requestedRunAfterStartup = newParams.isBotActive;
+      this.persistRunIntent(newParams.isBotActive);
       if (newParams.isBotActive && !this.startupReady) {
         this.botState = 'STARTING';
         this.startStartupBarrier();
@@ -1497,6 +1704,14 @@ export class ATREngine {
     };
     this.logs.unshift(newLog);
     if (this.logs.length > 300) this.logs.pop();
+
+    // Do not alert on ordinary manual pauses or every trade. Only conditions
+    // that require the owner to inspect/recover the engine are pushed.
+    if (log.type === 'SYSTEM' && /(안전 정지|포지션 보정 필요|시작 장벽 유지|보호청산 안전 정지|저장 안전 정지)/.test(log.reason)) {
+      void this.secretManager.sendTelegramAlert(
+        `🚨 Upbit 퀀트봇 주의\n${log.reason}\n현재가: ₩${Math.round(this.currentPrice).toLocaleString()}\n시간: ${timeLabel}`
+      );
+    }
 
     // Persist trade logs (BUY/SELL/STOP_LOSS) to disk
     if (log.type !== 'SYSTEM') {
@@ -1611,6 +1826,43 @@ export class ATREngine {
 
     if (pos.amount > 0 && pos.state !== 'FLAT') {
       const entry = pos.entryPrice || this.currentPrice;
+      const currentExposurePercent = exposure.totalCapitalKrw > 0
+        ? (exposure.currentExposureKrw / exposure.totalCapitalKrw) * 100
+        : 0;
+      const positionPnlPercent = entry > 0 ? ((this.currentPrice - entry) / entry) * 100 : 0;
+      const strongBullTarget =
+        this.higherTfTrend?.trend === 'BULL' && adaptive.marketRegime === 'BULL' &&
+        positionPnlPercent >= 0.70 && adaptive.slope >= 0.10 && adaptive.volumeMultiplier >= 1.30 &&
+        adaptive.rsi >= 52 && adaptive.rsi <= 68;
+      const bullTargetExposurePercent = strongBullTarget ? 70 : 65;
+      const hasDcaOrderInProgress = pos.dcaSlots.some((slot) =>
+        slot.status === 'RESERVED' || slot.status === 'ORDER_PENDING' || slot.status === 'PARTIALLY_FILLED'
+      );
+      const defensivePosition = pos.state === 'DEFENSIVE' || pos.state === 'DEFENSIVE_1' || pos.state === 'DEFENSIVE_2' || pos.state === 'EMERGENCY_EXIT';
+      const canBuildBullCore =
+        this.params.autoPilotEnabled && this.params.pyramidingEnabled &&
+        this.higherTfTrend?.trend === 'BULL' && adaptive.marketRegime === 'BULL' && adaptive.rsi < 75 &&
+        currentExposurePercent < bullTargetExposurePercent - 2 &&
+        !pos.trailingActive && !(pos.trailingExitCount && pos.trailingExitCount >= 1) &&
+        !hasDcaOrderInProgress && !defensivePosition && (pos.partialCutCount || 0) === 0 &&
+        Date.now() - (pos.lastRegimeRebalanceAt || 0) >= 120_000 && Date.now() >= pos.cooldownUntil;
+
+      // Only expose this as the next action when it is genuinely eligible;
+      // a higher-timeframe BULL alone is not enough during a BULL_PULLBACK.
+      if (canBuildBullCore) {
+        const gapKrw = Math.max(0, (exposure.totalCapitalKrw * (bullTargetExposurePercent / 100)) - exposure.currentExposureKrw);
+        const stepBudget = Math.floor(Math.min(gapKrw, exposure.totalCapitalKrw * 0.05, this.actualKrwBalance * 0.98, exposure.remainingAllowableExposureKrw));
+        pages.push({
+          category: 'REGIME_TARGET',
+          categoryLabel: '상승장 보유비중 우선',
+          type: 'BULL 목표비중 채우기 (최대 5%p)',
+          budgetKrw: stepBudget,
+          unitPercent: 5,
+          scaleMultiplier: 1,
+          targetPriceLabel: `현재 ${currentExposurePercent.toFixed(1)}% → 목표 ${bullTargetExposurePercent}% (현재 BULL·RSI<75·방어/DCA 대기 없음)`,
+          themeColor: 'amber'
+        });
+      }
 
       // Page 1: DCA 물타기 (하락 시 대응)
       const nextDcaSlot = pos.dcaSlots.find((s) => s.status === 'AVAILABLE' || s.status === 'PARTIALLY_FILLED');
@@ -1845,6 +2097,9 @@ export class ATREngine {
       },
       marketState: this.marketManager ? this.marketManager.marketState : 'DISCONNECTED',
       marketRegime: this.marketRegime,
+      // Presentation-only: lets the radar explain why a BULL target-add is
+      // waiting without duplicating or changing the strategy decision.
+      higherTimeframe: this.higherTfTrend,
       adaptive,
       dropSpeed,
       rsi: this.rsiValue,

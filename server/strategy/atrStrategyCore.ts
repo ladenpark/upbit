@@ -1,6 +1,11 @@
 import { Signal, SignalType, BotParams, PositionSnapshot, SidewaysContext } from '../types/trading';
 import { DCA2_RECOVERY_PREBUY_FRACTION, FIXED_DCA_DROP_PERCENTS, PARTIAL_CUT_RULES } from './strategyRuleConstants';
 
+/** Account-level exposure supplied by the engine for regime allocation decisions. */
+export interface StrategyExposureContext {
+  currentExposurePercent?: number;
+}
+
 export class ATRStrategyCore {
   private recentPrices: number[] = [];
 
@@ -154,7 +159,8 @@ export class ATRStrategyCore {
     rsi: number = 50.0,
     volumeMultiplier: number = 1.0,
     volumeMa: number = 0.0,
-    microPriceHistory: number[] = priceHistory
+    microPriceHistory: number[] = priceHistory,
+    exposureContext?: StrategyExposureContext
   ): Signal[] {
     const signals: Signal[] = [];
     const now = Date.now();
@@ -250,7 +256,7 @@ export class ATRStrategyCore {
     // --- Rule 3: 2-Stage Capital Recycling Partial Loss Cuts (Priority 2) ---
     const cutCount = position.partialCutCount || 0;
     if (hasPosition && params.partialLossCutEnabled && position.state !== 'EMERGENCY_EXIT') {
-      // 1st Stage: -1.0% drop -> trim 30% to secure cash for DCA #1
+      // 1st Stage: -1.5% drop -> trim 30% to secure cash for DCA #1
       if (cutCount === 0 && pnlPercent <= -PARTIAL_CUT_RULES.first.lossPercent) {
         signals.push({
           id: `SIG_PARTIAL_CUT_1_${now}`,
@@ -282,6 +288,62 @@ export class ATRStrategyCore {
         });
         return signals;
       }
+    }
+
+    // A confirmed higher-timeframe BULL keeps a 65% core position while the
+    // live weight is below target. This deliberately uses a light gate: it is
+    // for participating in an established trend, not for chasing a breakout.
+    // The stricter momentum/volume gates are reserved for the 65% → 70%
+    // extension, leaving a meaningful cash reserve for adverse moves.
+    const recentBullPrices = priceHistory.slice(-15);
+    const recentBullHigh = recentBullPrices.length ? Math.max(...recentBullPrices) : currentPrice;
+    const pullbackFromRecentHigh = recentBullHigh > 0 ? ((recentBullHigh - currentPrice) / recentBullHigh) * 100 : 0;
+    const recentMicroPrices = microPriceHistory.slice(-20);
+    const recentMicroLow = recentMicroPrices.length ? Math.min(...recentMicroPrices) : currentPrice;
+    const reboundFromMicroLow = recentMicroLow > 0 ? ((currentPrice - recentMicroLow) / recentMicroLow) * 100 : 0;
+    const isStrongBullContinuation =
+      higherTfTrend?.trend === 'BULL' && adaptive.marketRegime === 'BULL' &&
+      pnlPercent >= 0.70 && adaptive.slope >= 0.10 && adaptive.volumeMultiplier >= 1.30 &&
+      adaptive.rsi >= 52 && adaptive.rsi <= 68;
+    const isBaseBullCore =
+      higherTfTrend?.trend === 'BULL' && adaptive.marketRegime === 'BULL' &&
+      adaptive.rsi < 75;
+    const isBullPullbackRebound =
+      higherTfTrend?.trend === 'BULL' &&
+      pullbackFromRecentHigh >= 0.60 && pullbackFromRecentHigh <= 1.40 &&
+      reboundFromMicroLow >= 0.20 && pnlPercent >= -0.90 &&
+      adaptive.slope >= 0.03 && adaptive.volumeMultiplier >= 1.00 &&
+      adaptive.rsi >= 45 && adaptive.rsi <= 62;
+    const bullTargetExposurePercent = isStrongBullContinuation ? 70 : 65;
+    const bullExposureBelowTarget = exposureContext?.currentExposurePercent === undefined
+      ? true // Direct-core callers retain the pre-existing BULL behavior.
+      : exposureContext.currentExposurePercent < bullTargetExposurePercent - 2;
+    const sinceLastRegimeAddMs = now - (position.lastRegimeRebalanceAt || 0);
+    const canAddByTime = sinceLastRegimeAddMs >= 120_000;
+    const defensivePosition = position.state === 'DEFENSIVE' || position.state === 'DEFENSIVE_1' || position.state === 'DEFENSIVE_2' || position.state === 'EMERGENCY_EXIT';
+    const canRebalanceExposure = !defensivePosition && now >= position.cooldownUntil;
+    const hasTrailingExitedThisCycle = Boolean(position.trailingExitCount && position.trailingExitCount >= 1);
+    const hasDcaOrderInProgress = position.dcaSlots.some((slot) => slot.status === 'RESERVED' || slot.status === 'ORDER_PENDING' || slot.status === 'PARTIALLY_FILLED');
+    const shouldBuildBullExposure =
+      hasPosition && params.autoPilotEnabled && params.pyramidingEnabled &&
+      higherTfTrend?.trend === 'BULL' && bullExposureBelowTarget &&
+      !position.trailingActive && !hasTrailingExitedThisCycle && !hasDcaOrderInProgress &&
+      (position.partialCutCount || 0) === 0 && canAddByTime && canRebalanceExposure &&
+      (isBaseBullCore || isBullPullbackRebound);
+
+    if (shouldBuildBullExposure) {
+      signals.push({
+        id: `SIG_BULL_TARGET_ADD_${now}`, timestamp: now, timeframe: 'tick', source: 'REGIME_EXPOSURE_CONTROLLER',
+        type: 'REGIME_REBALANCE_BUY', priority: 6, symbol: params.symbol, price: currentPrice,
+        regimeTargetExposurePercent: bullTargetExposurePercent,
+        reason: isBullPullbackRebound
+          ? `[BULL 눌림목 반등 매수] 최근 고점 대비 -${pullbackFromRecentHigh.toFixed(2)}% 눌림 뒤 저점 +${reboundFromMicroLow.toFixed(2)}% 회복 확인 ➡️ 총자산 5%p 이내로 보유비중 ${bullTargetExposurePercent}%까지 추가`
+          : isStrongBullContinuation
+            ? `[BULL 강한 추세 확장] 현재 코인 비중 ${exposureContext?.currentExposurePercent?.toFixed(1) ?? '확인 중'}% · 거래량 ${adaptive.volumeMultiplier.toFixed(2)}x·기울기 +${adaptive.slope.toFixed(2)}% 확인 ➡️ 목표 비중 70%까지 5%p 이내 추가`
+            : `[BULL 기본 비중 채우기] 현재 코인 비중 ${exposureContext?.currentExposurePercent?.toFixed(1) ?? '확인 중'}% · 15분 상승 추세 및 RSI ${adaptive.rsi.toFixed(0)}<75 확인 ➡️ 목표 비중 65%까지 5%p 이내 추가`,
+        indicatorSnapshot: snapshot
+      });
+      return signals;
     }
 
     // --- Rule 3-b: Box-Range Scalp Take-Profit (Priority 3, SIDEWAYS only, Full Exit) ---
@@ -469,38 +531,17 @@ export class ATRStrategyCore {
       }
     }
 
-    // Trailing Distribution Gate: 한 번이라도 트레일링 익절이 시작된 포지션은 전량 청산(FLAT)까지 모든 불타기 일체 금지
-    const hasTrailingExitedThisCycle = Boolean(position.trailingExitCount && position.trailingExitCount >= 1);
-
     // Regime exposure controller: target allocation is reached gradually, not
     // by enlarging the initial order. The governor calculates the actual gap
     // to the target and caps every fill at 5% of total capital.
-    const sinceLastRegimeAddMs = now - (position.lastRegimeRebalanceAt || 0);
-    const canAddByTime = sinceLastRegimeAddMs >= 120_000;
+    const canBearRebalanceExposure = canRebalanceExposure && (position.partialCutCount || 0) === 0;
     const recentPrices = microPriceHistory.slice(-10);
     const recentLow = recentPrices.length ? Math.min(...recentPrices) : currentPrice;
     const reboundFromRecentLow = recentLow > 0 ? ((currentPrice - recentLow) / recentLow) * 100 : 0;
 
     if (
-      hasPosition && params.autoPilotEnabled && params.pyramidingEnabled &&
-      adaptive.marketRegime === 'BULL' && higherTfTrend?.trend === 'BULL' &&
-      !position.trailingActive && !hasTrailingExitedThisCycle && canAddByTime &&
-      pnlPercent >= 0.30 && adaptive.slope >= 0.05 && adaptive.volumeMultiplier >= 1.05 &&
-      adaptive.rsi >= 50 && adaptive.rsi <= 70
-    ) {
-      signals.push({
-        id: `SIG_BULL_TARGET_ADD_${now}`, timestamp: now, timeframe: 'tick', source: 'REGIME_EXPOSURE_CONTROLLER',
-        type: 'REGIME_REBALANCE_BUY', priority: 6, symbol: params.symbol, price: currentPrice,
-        regimeTargetExposurePercent: 65,
-        reason: `[BULL 목표비중 채우기] 상승 추세·거래량 ${adaptive.volumeMultiplier.toFixed(2)}x·기울기 +${adaptive.slope.toFixed(2)}% 확인 ➡️ 목표 코인 비중 65%까지 5%p 이내 추가`,
-        indicatorSnapshot: snapshot
-      });
-      return signals;
-    }
-
-    if (
       hasPosition && params.autoPilotEnabled && params.dcaEnabled &&
-      adaptive.marketRegime === 'BEAR' && !position.trailingActive && canAddByTime &&
+      adaptive.marketRegime === 'BEAR' && !position.trailingActive && canAddByTime && canBearRebalanceExposure &&
       pnlPercent <= -0.50 && reboundFromRecentLow >= 0.20 && adaptive.slope >= -0.15 &&
       adaptive.rsi >= 25 && adaptive.rsi <= 48
     ) {

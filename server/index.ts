@@ -172,6 +172,25 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
           break;
         }
 
+        case 'SAVE_TELEGRAM_CONFIG': {
+          const { telegramBotToken, telegramChatId } = data.payload || {};
+          if (typeof telegramBotToken !== 'string' || typeof telegramChatId !== 'string') {
+            throw new Error('텔레그램 토큰 또는 Chat ID 형식이 올바르지 않습니다.');
+          }
+          secretManager.saveTelegramConfig(telegramBotToken, telegramChatId);
+          const delivered = await secretManager.sendTelegramAlert('✅ Upbit 퀀트봇 알림이 연결되었습니다. 안전 정지·포지션 보정 필요·시작 실패를 즉시 알려드립니다.');
+          if (!delivered) throw new Error('텔레그램 테스트 메시지를 전송하지 못했습니다. 봇 토큰과 Chat ID를 확인하세요.');
+          ws.send(JSON.stringify({ type: 'TELEGRAM_CONFIG_RESULT', payload: { success: true } }));
+          break;
+        }
+
+        case 'TEST_TELEGRAM_ALERT': {
+          const delivered = await secretManager.sendTelegramAlert('🔔 Upbit 퀀트봇 텔레그램 연결 테스트입니다.');
+          if (!delivered) throw new Error('저장된 텔레그램 설정으로 테스트 메시지를 전송하지 못했습니다.');
+          ws.send(JSON.stringify({ type: 'TELEGRAM_CONFIG_RESULT', payload: { success: true } }));
+          break;
+        }
+
         case 'TEST_API_KEYS': {
           const { upbitAccessKey, upbitSecretKey } = data.payload;
           const currentKeys = secretManager.getKeys();
@@ -234,6 +253,7 @@ wss.on('connection', (ws: WebSocket, request: http.IncomingMessage) => {
       }
     } catch (err: any) {
       console.error('[Server WS] Message handling error:', err.message);
+      ws.send(JSON.stringify({ type: 'COMMAND_ERROR', payload: { message: err.message || '요청 처리 중 오류가 발생했습니다.' } }));
     }
   });
 

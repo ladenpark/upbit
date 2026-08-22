@@ -153,6 +153,11 @@ async function runAllTests() {
   assert(emergencyTrendSignals.length > 0, 'Emergency Trend Cut detected on drop speed');
   assert(emergencyTrendSignals[0]?.type === 'EMERGENCY_TREND_CUT', 'Emergency Trend Cut triggered for 40% capital protection');
 
+  const beforeFirstPartialCut = strategyCore.generateSignals(2860000, baseline, atr, defaultParams, testPosition, 0, priceHistory);
+  assert(!beforeFirstPartialCut.some((s) => s.type === 'PARTIAL_LOSS_CUT'), 'First partial cut does not trigger before the widened -1.5% threshold');
+  const firstPartialCutSignals = strategyCore.generateSignals(2856000, baseline, atr, defaultParams, testPosition, 0, priceHistory);
+  assert(firstPartialCutSignals[0]?.type === 'PARTIAL_LOSS_CUT', 'First partial cut triggers at the widened -1.5% threshold');
+
   // ──────────────────────────────────────────────────────
   // TEST GROUP 2: Global Risk Governor & Max Exposure
   // ──────────────────────────────────────────────────────
@@ -215,6 +220,11 @@ async function runAllTests() {
   );
   assert(fullRiskEval.approved === false, 'New BUY blocked when Global Max Exposure is exceeded');
 
+  const netLossEngine = new ATREngine(undefined, { backtest: true });
+  (netLossEngine as any).dailyCostLots = [{ volume: 1, price: 2700000, fee: 1350 }];
+  const feeOnlyLoss = (netLossEngine as any).consumeDailyCostLots(1, 2700000, 1350, 2700000);
+  assert(feeOnlyLoss === -2700, '[Daily circuit] Flat-price SELL includes allocated BUY and SELL fees as a net realized loss');
+
   // ──────────────────────────────────────────────────────
   // TEST GROUP 3: Static Stop Loss Snapshot Immutability
   // ──────────────────────────────────────────────────────
@@ -244,6 +254,18 @@ async function runAllTests() {
     5000000, defSnapshot, 2700000, 0, 0
   );
   assert(dcaRiskEval.approved === false, 'DCA immediately blocked during Cooldown & DEFENSIVE state (Infinite loop prevented)');
+
+  const defensiveRegimeSignal: Signal = { ...buySignal, id: 'SIG_DEFENSIVE_REGIME', type: 'REGIME_REBALANCE_BUY', regimeTargetExposurePercent: 40, reason: 'BEAR 목표비중 채우기' };
+  const defensiveRegimeEval = riskGovernor.evaluateSignal(
+    defensiveRegimeSignal, 'RUNNING', 'LIVE', 5000000, defSnapshot, 2700000, 0, 0
+  );
+  assert(defensiveRegimeEval.approved === false, '[Defensive conflict] Regime rebalance BUY is blocked after a partial loss cut');
+  const protectedCutCount = defSnapshot.partialCutCount;
+  const protectedCooldown = defSnapshot.cooldownUntil;
+  const protectedStop = defSnapshot.initialStopPrice;
+  posManager.onRegimeRebalanceBuyFilled(2680000, 0.1, 2650000, 35000, 3, 2);
+  const afterRegimeFill = posManager.getSnapshot();
+  assert(afterRegimeFill.partialCutCount === protectedCutCount && afterRegimeFill.cooldownUntil === protectedCooldown && afterRegimeFill.initialStopPrice === protectedStop, '[Defensive conflict] Any legacy/in-flight regime fill preserves partial-cut count, cooldown and fixed stop');
 
   // ──────────────────────────────────────────────────────
   // TEST GROUP 5: Order Idempotency & Stale Market Feed
@@ -959,6 +981,28 @@ async function runAllTests() {
   assert(snapAfterDca2.dcaSlots[0].filledVolume === 0.5, '[DCA Partial Fill] Slot 1 volume correctly updated to 0.5 ETH');
   assert(snapAfterDca2.dcaSlots[1].status === 'AVAILABLE', '[DCA Partial Fill] Slot 2 remains untouched & AVAILABLE (No false slot consumption!)');
 
+  // A single exchange DCA order must remain one lifecycle stage while it is
+  // only partially filled. The terminal fragment, not the first fragment,
+  // marks the slot complete.
+  const lifecyclePosManager = new PositionManager(defaultParams);
+  lifecyclePosManager.onInitialEntryFilled(2700000, 1, 2650000, 35000, 3, 2);
+  lifecyclePosManager.onDcaFilled(1, 2600000, 0.2, false);
+  assert(lifecyclePosManager.getSnapshot().dcaSlots[0].status === 'PARTIALLY_FILLED', '[Stage lifecycle] First DCA fragment stays PARTIALLY_FILLED');
+  lifecyclePosManager.addAdditionalDcaFilled(2600000, 0.3, true);
+  lifecyclePosManager.recordExecutionStage('CLIENT_STAGE_DCA_1', 'DCA_BUY', 0.5, true, undefined, 1300000);
+  const lifecycleSnapshot = lifecyclePosManager.getSnapshot();
+  assert(lifecycleSnapshot.dcaSlots[0].status === 'FILLED' && lifecycleSnapshot.executionStages?.CLIENT_STAGE_DCA_1?.cumulativeFilledVolume === 0.5 && lifecycleSnapshot.executionStages.CLIENT_STAGE_DCA_1.status === 'FILLED', '[Stage lifecycle] Final DCA fragment completes exactly its own order stage');
+  lifecyclePosManager.onTrailingPartialFilled(0.1, 2800000, 10000, false);
+  assert((lifecyclePosManager.getSnapshot().trailingExitCount || 0) === 0, '[Stage lifecycle] First trailing fragment does not consume a trailing exit count');
+  lifecyclePosManager.onTrailingPartialFilled(0.1, 2800000, 10000, true);
+  assert((lifecyclePosManager.getSnapshot().trailingExitCount || 0) === 1, '[Stage lifecycle] Final trailing fragment consumes one trailing exit count');
+  const cancelledStageManager = new PositionManager(defaultParams);
+  cancelledStageManager.onInitialEntryFilled(2700000, 1, 2650000, 35000, 3, 2);
+  cancelledStageManager.onDcaFilled(1, 2600000, 0.2, false);
+  cancelledStageManager.recordExecutionStage('CLIENT_CANCELLED_DCA', 'DCA_BUY', 0.2, false, undefined, 1300000);
+  cancelledStageManager.finalizeCancelledPartialStage('CLIENT_CANCELLED_DCA', 'DCA_BUY', 0.2);
+  assert(cancelledStageManager.getSnapshot().dcaSlots[0].status === 'FILLED' && cancelledStageManager.getSnapshot().executionStages?.CLIENT_CANCELLED_DCA?.status === 'CANCELLED_PARTIAL', '[Stage lifecycle] Cancelled DCA partial is explicitly completed once without retrying the full stage');
+
   // 2. PYRAMID_BUY Partial Fill (0.3 ETH) -> Watcher Fill (0.2 ETH)
   // Step 1: Initial submit of Pyramid (Count becomes 1, volume +0.3 ETH)
   nonEntryPosManager.onPyramidFilled(2800000, 0.3);
@@ -1548,7 +1592,7 @@ async function runAllTests() {
     amount: 1,
     totalCostKrw: 2700000,
     initialStopPrice: 2500000,
-    partialCutCount: 2,
+    partialCutCount: 0,
     dcaSlots: [{ slotNumber: 1, status: 'FILLED' }, { slotNumber: 2, status: 'FILLED' }, { slotNumber: 3, status: 'FILLED' }],
     pyramidingCount: 0,
     trailingActive: false,
@@ -1563,14 +1607,40 @@ async function runAllTests() {
 
   const earlyTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.3);
   assert(earlyTrendFollowSignals[0]?.id.startsWith('SIG_BULL_TARGET_ADD'), '[BULL Target] Confirmed BULL continuation deploys cash toward its target exposure');
-  assert(earlyTrendFollowSignals[0]?.regimeTargetExposurePercent === 65, '[BULL Target] Target exposure is capped at 65%');
+  assert(earlyTrendFollowSignals[0]?.regimeTargetExposurePercent === 70, '[BULL Target] Strong continuation may extend the target exposure to 70%');
+  const underweightBullSignals = strategyCore.generateSignals(
+    2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0,
+    baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.3, 0,
+    baseBullHistory, { currentExposurePercent: 40 }
+  );
+  assert(underweightBullSignals[0]?.type === 'REGIME_REBALANCE_BUY', '[BULL Hold] Underweight confirmed BULL prioritizes building its core position');
+  assert(underweightBullSignals[0]?.regimeTargetExposurePercent === 70, '[BULL Hold] Only a strong confirmed BULL can extend the target to 70%');
+  const baseBullCoreSignals = strategyCore.generateSignals(
+    2710000, 2650000, 30000, defaultParams, labPyramidPosition, 0,
+    baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 72, 0.50, 0,
+    baseBullHistory, { currentExposurePercent: 40 }
+  );
+  assert(baseBullCoreSignals[0]?.type === 'REGIME_REBALANCE_BUY' && baseBullCoreSignals[0]?.regimeTargetExposurePercent === 65, '[BULL Hold] A confirmed BULL fills its 65% core target without requiring momentum-volume confirmation');
+  const onTargetBullSignals = strategyCore.generateSignals(
+    2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0,
+    baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.3, 0,
+    baseBullHistory, { currentExposurePercent: 70 }
+  );
+  assert(!onTargetBullSignals.some((signal) => signal.type === 'REGIME_REBALANCE_BUY'), '[BULL Hold] Target-weight BULL does not churn additional target-allocation buys');
+  const bullPullbackHistory = [98, 98.2, 98.4, 98.6, 98.8, 99, 99.2, 99.4, 99.6, 99.8, 100, 100.2, 100.4, 100.6, 100.8];
+  const bullPullbackAddSignals = strategyCore.generateSignals(
+    99.4, 99.8, 1, defaultParams, { ...labPyramidPosition, entryPrice: 100, amount: 1, totalCostKrw: 100, initialStopPrice: 90 }, 0,
+    bullPullbackHistory, { trend: 'BULL', htfSlope: 0.5 }, 55, 1.1, 0,
+    [...bullPullbackHistory.slice(-10), 99.1, 99.2, 99.4], { currentExposurePercent: 40 }
+  );
+  assert(bullPullbackAddSignals[0]?.type === 'REGIME_REBALANCE_BUY' && bullPullbackAddSignals[0]?.reason.includes('눌림목 반등'), '[BULL Pullback] A confirmed shallow pullback rebound builds exposure without moving DCA thresholds');
   const targetBudgetEval = riskGovernor.evaluateSignal(
     earlyTrendFollowSignals[0], 'RUNNING', 'LIVE', 8_000_000,
     { ...labPyramidPosition, amount: 2_000, entryPrice: 1_000, totalCostKrw: 2_000_000 }, 1_000, [], 0
   );
   assert(targetBudgetEval.approved === true && targetBudgetEval.calculatedBudgetKrw === 500_000, `[Regime Controller] Each target-exposure order is capped at 5% of total capital (actual: ₩${targetBudgetEval.calculatedBudgetKrw}, ${targetBudgetEval.rejectionReason || 'approved'})`);
   const weakTrendFollowSignals = strategyCore.generateSignals(2720000, 2650000, 30000, defaultParams, labPyramidPosition, 0, baseBullHistory, { trend: 'BULL', htfSlope: 0.5 }, 60, 1.0);
-  assert(!weakTrendFollowSignals.some((signal) => signal.type === 'REGIME_REBALANCE_BUY'), '[BULL Target] Low-volume rise does not consume additional cash');
+  assert(weakTrendFollowSignals[0]?.type === 'REGIME_REBALANCE_BUY' && weakTrendFollowSignals[0]?.regimeTargetExposurePercent === 65, '[BULL Target] A non-overheated confirmed BULL fills its 65% core target even without volume expansion');
 
   const scalpExpansionPosition: PositionSnapshot = {
     ...labPyramidPosition,
@@ -1666,6 +1736,24 @@ async function runAllTests() {
   assert(startupGateEngine.currentPrice === 2700000, '[Startup barrier] Tick price is retained while strategy evaluation is blocked');
   assert((startupGateEngine as any).startupReady === false && startupGateEngine.botState === 'STARTING', '[Startup barrier] Engine remains STARTING until authoritative initialization completes');
 
+  // A reconciliation-required engine is deliberately more restrictive than
+  // PAUSED: it must neither evaluate a later tick nor accept a UI resume
+  // until the explicit rebase transaction has completed.
+  const rebaseRequiredEngine = new ATREngine(undefined, { backtest: true });
+  (rebaseRequiredEngine as any).startupReady = true;
+  (rebaseRequiredEngine as any).rebaseRequired = true;
+  (rebaseRequiredEngine as any).strategyCore = {
+    generateSignals: () => { throw new Error('Strategy generation must be blocked while rebase is required'); }
+  };
+  await rebaseRequiredEngine.handleMarketTick(2700000, Date.now());
+  let rebaseResumeRejected = false;
+  try {
+    rebaseRequiredEngine.updateParams({ isBotActive: true });
+  } catch {
+    rebaseResumeRejected = true;
+  }
+  assert(rebaseResumeRejected && rebaseRequiredEngine.params.isBotActive === false, '[Rebase guard] Reconciliation-required state blocks ticks and bot resume');
+
   // A late candle response from a previous generation must not overwrite the
   // newly invalidated market context.
   const staleMarketEngine = new ATREngine(undefined, { backtest: true });
@@ -1695,6 +1783,34 @@ async function runAllTests() {
   resolveAccount({ success: true, balances: { KRW: 999999 }, lockedBalances: {}, avgBuyPrices: {} });
   assert(await staleAccountRefresh === false, '[Stale generation] Late account refresh is discarded');
   assert(staleAccountEngine.actualKrwBalance === 123456 && staleAccountEngine.realBalances.KRW === 123456, '[Stale generation] Late account response cannot overwrite balances');
+
+  // A confirmed BUY must immediately reduce the exposure cash base. Upbit can
+  // return the pre-fill KRW snapshot for a short period; that stale snapshot
+  // must not restore spendable cash and allow a second over-exposure BUY.
+  const balanceShadowEngine = new ATREngine(undefined, { backtest: true });
+  balanceShadowEngine.actualKrwBalance = 1_000_000;
+  balanceShadowEngine.realBalances = { KRW: 1_000_000 };
+  (balanceShadowEngine as any).applyConfirmedBalanceShadow({
+    clientOrderId: 'CLIENT_BALANCE_SHADOW', side: 'BUY', avgFillPrice: 2_500_000,
+    filledVolume: 0.08, strategyFillCumulativeFunds: 200_000, strategyFillCumulativeFee: 100
+  }, 2_500_000, 0.08);
+  (balanceShadowEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (balanceShadowEngine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+  (balanceShadowEngine as any).upbitClient.getAccountBalance = async () => ({ success: true, balances: { KRW: 1_000_000 }, lockedBalances: {}, avgBuyPrices: {} });
+  assert(balanceShadowEngine.actualKrwBalance === 799900 && await balanceShadowEngine.fetchRealAccountBalance() === true && balanceShadowEngine.actualKrwBalance === 799900, '[Balance shadow] A stale pre-fill KRW response cannot restore already-spent buying power');
+
+  // A pending order can legitimately make the exchange balance differ from
+  // the durable local position for one poll. That in-flight window must not
+  // be misclassified as an external/manual trade and pause the bot.
+  const pendingBalanceEngine = new ATREngine(undefined, { backtest: true });
+  pendingBalanceEngine.positionManager.onInitialEntryFilled(2_700_000, 0.1, 2_700_000, 10_000, 2, 3);
+  (pendingBalanceEngine as any).secretManager.getKeys = () => ({ upbitAccessKey: 'TEST_ACCESS_KEY_NOT_REAL', upbitSecretKey: 'TEST_SECRET_KEY_NOT_REAL' });
+  (pendingBalanceEngine as any).apiGateway.enqueue = async (_priority: number, task: () => Promise<any>) => task();
+  (pendingBalanceEngine as any).upbitClient.getAccountBalance = async () => ({
+    success: true, balances: { KRW: 700_000, ETH: 0.1 }, lockedBalances: {}, avgBuyPrices: { ETH: 2_700_000 }
+  });
+  (pendingBalanceEngine.orderManager as any).getPendingOrdersCount = () => 1;
+  assert(await pendingBalanceEngine.fetchRealAccountBalance() === true && !(pendingBalanceEngine as any).rebaseRequired && pendingBalanceEngine.positionManager.getSnapshot().amount === 0.1, '[Balance reconciliation] Pending-order balance lag does not trigger a false rebase pause');
 
   // A single PositionManager cannot safely represent two symbols. Active
   // positions and any non-terminal order therefore block market switches.
@@ -1735,6 +1851,21 @@ async function runAllTests() {
   (corruptedOrderEngine as any).refreshAtrFromExchange = async () => true;
   await (corruptedOrderEngine as any).startStartupBarrier();
   assert(corruptedOrderEngine.orderManager.hasPersistenceLoadFailure() && (corruptedOrderEngine as any).startupReady === false && (corruptedOrderEngine.botState as string) === 'PAUSED', '[Persistence load] Corrupted order_history blocks startup READY and new trading');
+
+  const semanticOrder = { ...pendingSwitchOrder, id: 'ORD_SEMANTIC_DUP_A', clientOrderId: 'CLIENT_SEMANTIC_DUP', signalId: 'SIG_SEMANTIC_DUP' };
+  fs.writeFileSync(orderFile, JSON.stringify([semanticOrder, { ...semanticOrder, id: 'ORD_SEMANTIC_DUP_B' }]), 'utf-8');
+  const duplicateOrderLedger = new OrderManager();
+  assert(duplicateOrderLedger.hasPersistenceLoadFailure(), '[Order schema] Parseable order ledger with duplicate clientOrderId fails closed');
+  if (savedOrderHistory === null) fs.unlinkSync(orderFile); else fs.writeFileSync(orderFile, savedOrderHistory, 'utf-8');
+
+  const savedReservations = fs.existsSync(reservationFile) ? fs.readFileSync(reservationFile, 'utf-8') : null;
+  fs.writeFileSync(reservationFile, JSON.stringify([{ clientOrderId: 123, amountKrw: -1, status: 'BAD' }]), 'utf-8');
+  const corruptedRiskEngine = new ATREngine(undefined, { backtest: true });
+  if (savedReservations === null) fs.unlinkSync(reservationFile); else fs.writeFileSync(reservationFile, savedReservations, 'utf-8');
+  (corruptedRiskEngine as any).startupReady = false;
+  corruptedRiskEngine.botState = 'STARTING';
+  await (corruptedRiskEngine as any).startStartupBarrier();
+  assert((corruptedRiskEngine as any).riskGovernor.getPersistenceFailure() && (corruptedRiskEngine as any).startupReady === false && (corruptedRiskEngine.botState as string) === 'PAUSED', '[Risk persistence] Malformed reservation ledger blocks startup READY');
 
   const savedPositionState = fs.existsSync(posFile) ? fs.readFileSync(posFile, 'utf-8') : null;
   fs.writeFileSync(posFile, '{not-valid-json', 'utf-8');

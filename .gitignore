@@ -14,3 +14,6 @@ data/processed_signals.json
 data/exposure_reservations.json
 data/trade_logs.json
 data/daily_risk_state.json
+data/bot_run_intent.json
+data/research/
+*.zip

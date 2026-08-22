@@ -83,6 +83,12 @@ interface PricePoint {
 export default function App() {
   // Mobile Tab view: 'chart' | 'bot' | 'lab' | 'logs' | 'account'
   const [activeTab, setActiveTab] = useState<'chart' | 'radar' | 'bot' | 'lab' | 'logs' | 'account'>('chart');
+
+  // The laboratory is retired from the live UI. This also redirects a client
+  // that happened to have the old tab open during a server update.
+  useEffect(() => {
+    if (activeTab === 'lab') setActiveTab('chart');
+  }, [activeTab]);
   const [deviceFrameMode, setDeviceFrameMode] = useState<boolean>(true);
 
   // Backend WS Connection State
@@ -164,6 +170,7 @@ export default function App() {
   const [experimentTrendTrailingArmingEnabled, setExperimentTrendTrailingArmingEnabled] = useState(false);
   const [researchStats, setResearchStats] = useState({ enabled: false, ticksRecorded: 0, candlesRecorded: 0, shadowDifferences: 0, totalTicksRecorded: 0, totalCandlesRecorded: 0, totalShadowDifferences: 0, startedAt: 0 });
   const [rebaseStatus, setRebaseStatus] = useState<string | null>(null);
+  const [rebaseRequired, setRebaseRequired] = useState<boolean>(false);
 
   // API Credentials State (Upbit Exclusive)
   // Exchange secrets must never be retained in browser storage.  They exist
@@ -171,6 +178,9 @@ export default function App() {
   // same-origin WebSocket to the server-side secret store.
   const [upbitAccess, setUpbitAccess] = useState<string>('');
   const [upbitSecret, setUpbitSecret] = useState<string>('');
+  const [telegramBotToken, setTelegramBotToken] = useState<string>('');
+  const [telegramChatId, setTelegramChatId] = useState<string>('332341066');
+  const [telegramStatus, setTelegramStatus] = useState<string | null>(null);
   const [apiKeyTestStatus, setApiKeyTestStatus] = useState<string | null>(null);
   const [hasApiKeys, setHasApiKeys] = useState<{ upbit: boolean }>({ upbit: false });
 
@@ -223,6 +233,7 @@ export default function App() {
     volumeMultiplier?: number;
     volumeMa?: number;
   } | null>(null);
+  const [higherTimeframe, setHigherTimeframe] = useState<{ trend: 'BULL' | 'SIDEWAYS' | 'BEAR'; htfSlope: number } | null>(null);
   const [rsiValue, setRsiValue] = useState<number>(50.0);
   const [volumeMultiplier, setVolumeMultiplier] = useState<number>(1.0);
   const [dropSpeed, setDropSpeed] = useState<number>(0);
@@ -233,6 +244,10 @@ export default function App() {
     summary: string;
     status: string;
     metrics: { label: string; value: string }[];
+    order?: number;
+    trigger?: string;
+    execution?: string;
+    checks?: { label: string; value: string; met: boolean }[];
   } | null>(null);
 
   // Price & Indicators State
@@ -347,8 +362,10 @@ export default function App() {
               if (s.params.experimentTrendTrailingArmingEnabled !== undefined) setExperimentTrendTrailingArmingEnabled(s.params.experimentTrendTrailingArmingEnabled);
             }
             if (s.botState !== undefined) setBotLifecycleState(s.botState);
+            if (s.startup?.rebaseRequired !== undefined) setRebaseRequired(s.startup.rebaseRequired);
             if (s.marketState !== undefined) setMarketFeedState(s.marketState);
             if (s.marketRegime !== undefined) setMarketRegime(s.marketRegime);
+            if (s.higherTimeframe) setHigherTimeframe(s.higherTimeframe);
             if (s.initialBalance !== undefined) setInitialBalance(s.initialBalance);
             if (s.balance !== undefined) setBalance(s.balance);
             if (s.position) {
@@ -398,6 +415,10 @@ export default function App() {
             }
           } else if (data.type === 'POSITION_REBASE_RESULT') {
             setRebaseStatus('✅ 거래소 잔고와 최신 지표 기준으로 포지션 보호 조건을 보정했습니다.');
+          } else if (data.type === 'TELEGRAM_CONFIG_RESULT') {
+            setTelegramStatus('✅ 텔레그램 테스트 알림을 전송했습니다. 휴대폰 메시지를 확인하세요.');
+          } else if (data.type === 'COMMAND_ERROR') {
+            setTelegramStatus(`❌ ${data.payload?.message || '요청 처리 중 오류가 발생했습니다.'}`);
           } else if (data.type === 'SERVER_RESTARTING') {
             restartRequestedRef.current = true;
             setServerRestarting(true);
@@ -541,6 +562,21 @@ export default function App() {
     setUpbitAccess('');
     setUpbitSecret('');
     setApiKeyTestStatus('🔑 Upbit API 키가 백엔드에 안전하게 저장되었습니다.');
+  };
+
+  const handleSaveTelegram = () => {
+    if (!telegramBotToken || !telegramChatId) {
+      setTelegramStatus('❌ BotFather 토큰과 Chat ID를 모두 입력해 주세요.');
+      return;
+    }
+    setTelegramStatus('⏳ 텔레그램 테스트 알림을 전송하는 중입니다…');
+    sendWsCommand('SAVE_TELEGRAM_CONFIG', { telegramBotToken, telegramChatId });
+    setTelegramBotToken('');
+  };
+
+  const handleTestTelegram = () => {
+    setTelegramStatus('⏳ 저장된 설정으로 테스트 알림을 전송하는 중입니다…');
+    sendWsCommand('TEST_TELEGRAM_ALERT', {});
   };
 
   const formatPrice = (p: number, symbol = selectedCoin) => {
@@ -1659,37 +1695,168 @@ export default function App() {
                 const isDca2Remainder = authoritativeNextDcaNumber === 2 && nextDcaPage?.type.includes('잔여 매수');
                 const isBreakoutReady = !hasPosition && currentPrice > baselineValue && (marketRegime === 'BULL' || (adaptiveIndicators?.slope || 0) >= 0.1) && rsiValue <= 68 && volumeMultiplier >= 1.15;
                 const isEmergency = hasPosition && currentPrice < lowerBand && dropSpeed <= -Math.abs(trendDropSpeedThreshold);
-                const regimeTargetExposure = marketRegime === 'BULL' ? 65 : marketRegime === 'BEAR' ? 40 : null;
+                const currentExposurePercent = currentEquity > 0 ? (positionAmount * currentPrice / currentEquity) * 100 : 0;
+                const strongBullExtensionReady =
+                  higherTimeframe?.trend === 'BULL' && marketRegime === 'BULL' &&
+                  unrealizedPnlPercent >= 0.70 &&
+                  (adaptiveIndicators?.slope || 0) >= 0.10 &&
+                  volumeMultiplier >= 1.30 && rsiValue >= 52 && rsiValue <= 68;
+                const regimeTargetExposure = marketRegime === 'BULL' ? (strongBullExtensionReady ? 70 : 65) : marketRegime === 'BEAR' ? 40 : null;
+                const bullTargetReady = Boolean(
+                  autoPilotEnabled && pyramidingEnabled &&
+                  higherTimeframe?.trend === 'BULL' && marketRegime === 'BULL' &&
+                  currentExposurePercent < (regimeTargetExposure || 65) - 2 && rsiValue < 75 &&
+                  !isTrailingActive && positionLifecycleState !== 'DEFENSIVE_1' && positionLifecycleState !== 'DEFENSIVE_2'
+                );
+                const isBullPullbackContext = marketRegime === 'SIDEWAYS' && adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK';
+                const bullPullbackPrices = priceHistory.slice(-15).map((point) => point.price);
+                const bullPullbackHigh = Math.max(currentPrice, ...(bullPullbackPrices.length ? bullPullbackPrices : [currentPrice]));
+                const bullPullbackFromHigh = bullPullbackHigh > 0 ? ((bullPullbackHigh - currentPrice) / bullPullbackHigh) * 100 : 0;
+                const bullReboundPrices = priceHistory.slice(-20).map((point) => point.price);
+                const bullReboundLow = Math.min(currentPrice, ...(bullReboundPrices.length ? bullReboundPrices : [currentPrice]));
+                const bullReboundFromLow = bullReboundLow > 0 ? ((currentPrice - bullReboundLow) / bullReboundLow) * 100 : 0;
+                const bullPullbackReady = Boolean(
+                  higherTimeframe?.trend === 'BULL' && isBullPullbackContext &&
+                  bullPullbackFromHigh >= 0.60 && bullPullbackFromHigh <= 1.40 &&
+                  bullReboundFromLow >= 0.20 && unrealizedPnlPercent >= -0.90 &&
+                  (adaptiveIndicators?.slope || 0) >= 0.03 && volumeMultiplier >= 1.00 &&
+                  rsiValue >= 45 && rsiValue <= 62 && !isTrailingActive
+                );
+                const partialCutStage = positionLifecycleState === 'DEFENSIVE_1' ? 2 : 1;
+                const partialCutPercent = partialCutStage === 1 ? 1.5 : 3.2;
+                const partialCutPrice = entry * (1 - partialCutPercent / 100);
+                const partialCutVolume = partialCutStage === 1 ? '보유 수량 30%' : '남은 수량 50%';
+                const pyramidTarget = entry * (1 + (pyramidingCount === 0 ? 0.7 : pyramidingStepPercent * (pyramidingCount + 1)) / 100);
+                const priceDistance = (target: number, direction: 'up' | 'down') => {
+                  const distance = direction === 'up' ? target - currentPrice : currentPrice - target;
+                  const percent = currentPrice > 0 ? Math.abs(distance / currentPrice) * 100 : 0;
+                  return `${distance <= 0 ? '도달' : `${formatPrice(Math.abs(distance))} (${percent.toFixed(2)}%) 남음`}`;
+                };
+                type RadarRow = {
+                  key: string;
+                  order: number;
+                  side: 'BUY' | 'SELL';
+                  label: string;
+                  detail: string;
+                  active: boolean;
+                  enabled: boolean;
+                  icon: string;
+                  trigger: string;
+                  execution: string;
+                  checks: { label: string; value: string; met: boolean }[];
+                  statusOverride?: string;
+                };
                 const status = (active: boolean, enabled = true) => active ? '발동' : enabled ? '대기' : '꺼짐';
                 const tone = (active: boolean, enabled = true) => active ? 'bg-emerald-500 text-white border-emerald-500' : enabled ? 'bg-white text-slate-500 border-slate-200' : 'bg-slate-50 text-slate-400 border-slate-100';
-                const buyRows = hasPosition ? [
-                  ...(regimeTargetExposure ? [{ label: '국면 목표 비중', detail: `${marketRegime} · 코인 ${regimeTargetExposure}%까지 2분 간격·1회 최대 5%p 추가`, active: false, enabled: autoPilotEnabled, icon: '◉' }] : []),
+                const buyRows: RadarRow[] = hasPosition ? [
+                  ...(regimeTargetExposure ? [{
+                    key: 'regime-target', order: 6, side: 'BUY' as const, label: '국면 목표 비중',
+                    detail: `${marketRegime} · 현재 ${currentExposurePercent.toFixed(1)}% → 목표 ${regimeTargetExposure}%까지 2분 간격·1회 최대 5%p${strongBullExtensionReady ? ' (강한 추세 확장)' : ' (기본 보유분)'}`,
+                    active: bullTargetReady,
+                    enabled: autoPilotEnabled, icon: '◉',
+                    trigger: strongBullExtensionReady ? '강한 BULL 추세 유지 + 목표 비중보다 2%p 이상 낮음' : '15분 BULL + RSI 75 미만 + 목표 비중보다 2%p 이상 낮음',
+                    execution: '보호·익절·DCA보다 후순위. 위험관리 승인 후 최대 총자산 5%p만 추가',
+                    checks: [
+                      { label: '15분 추세', value: `${higherTimeframe?.trend || '확인 중'} / 필요 BULL`, met: higherTimeframe?.trend === 'BULL' },
+                      { label: '현재 코인 비중', value: `${currentExposurePercent.toFixed(1)}% / 목표 ${regimeTargetExposure}%`, met: currentExposurePercent < regimeTargetExposure - 2 },
+                      { label: 'RSI 과열 방지', value: `${rsiValue.toFixed(1)} / 필요 <75`, met: rsiValue < 75 },
+                      { label: '강한 추세 70% 확장', value: strongBullExtensionReady ? '충족 · 70% 목표' : `대기 · 수익 +0.70%, 기울기 +0.10%, 거래량 1.30x, RSI 52~68`, met: strongBullExtensionReady },
+                      { label: '자동 운용', value: autoPilotEnabled ? '켜짐' : '꺼짐', met: autoPilotEnabled }
+                    ]
+                  }] : []),
+                  ...(isBullPullbackContext ? [{
+                    key: 'bull-pullback', order: 6, side: 'BUY' as const, label: '상승 조정 반등 추가',
+                    detail: `고점 대비 -${bullPullbackFromHigh.toFixed(2)}% · 저점 반등 +${bullReboundFromLow.toFixed(2)}% · 조건 충족 시 최대 5%p`,
+                    active: bullPullbackReady, enabled: autoPilotEnabled, icon: '↗',
+                    trigger: '고점 대비 -0.60~-1.40% 눌림 뒤 저점에서 +0.20% 반등',
+                    execution: '일반 BULL 목표비중은 현재 BULL일 때만 실행합니다. 상승 조정에서는 이 반등 확인 매수만 허용하며, 방어·DCA보다 후순위입니다.',
+                    checks: [
+                      { label: '15분 추세', value: `${higherTimeframe?.trend || '확인 중'} / 필요 BULL`, met: higherTimeframe?.trend === 'BULL' },
+                      { label: '고점 대비 눌림', value: `-${bullPullbackFromHigh.toFixed(2)}% / 필요 -0.60~-1.40%`, met: bullPullbackFromHigh >= 0.60 && bullPullbackFromHigh <= 1.40 },
+                      { label: '저점 반등', value: `+${bullReboundFromLow.toFixed(2)}% / 필요 +0.20%`, met: bullReboundFromLow >= 0.20 },
+                      { label: '기울기', value: `${(adaptiveIndicators?.slope || 0).toFixed(2)}% / 필요 +0.03%`, met: (adaptiveIndicators?.slope || 0) >= 0.03 },
+                      { label: '거래량', value: `${volumeMultiplier.toFixed(2)}x / 필요 1.00x`, met: volumeMultiplier >= 1.00 },
+                      { label: 'RSI', value: `${rsiValue.toFixed(1)} / 필요 45~62`, met: rsiValue >= 45 && rsiValue <= 62 }
+                    ]
+                  }] : []),
                   authoritativeNextDcaNumber === 2
                     ? {
+                        key: 'dca-2', order: 5, side: 'BUY',
                         label: isDca2Remainder ? 'DCA 2차 잔여 60%' : 'DCA 2차 접근 반등',
                         detail: isDca2Remainder
                           ? `${formatPrice(nextDca)} 이하에서 잔여 60%`
                           : `${formatPrice(dca2ApproachPrice)}~${formatPrice(dca2ApproachFloor)} 터치 후 저점 +0.7% · 기울기 +0.05% 시 40%`,
                         active: dcaEnabled && (isDca2Remainder ? currentPrice <= nextDca : isDca2RecoveryReady),
                         enabled: dcaEnabled,
-                        icon: '↓'
+                        icon: '↓',
+                        trigger: isDca2Remainder ? `${formatPrice(nextDca)} 이하` : `${formatPrice(dca2ApproachPrice)}~${formatPrice(dca2ApproachFloor)} 저점 구간 뒤 +0.7% 반등`,
+                        execution: isDca2Remainder ? '2차 예산의 남은 60%를 매수' : '2차 예산의 40%만 선매수. 본 기준가 도달 시 잔여 60%',
+                        checks: [
+                          { label: '가격/저점 구간', value: isDca2Remainder ? `${formatPrice(currentPrice)} / 기준 ${formatPrice(nextDca)}` : `저점 하락 ${dca2RecoveryLowDrop.toFixed(2)}% (필요 3.50~4.15%)`, met: isDca2Remainder ? currentPrice <= nextDca : isDca2ApproachWindow },
+                          { label: '저점 반등', value: `${dca2RecoveryBounce.toFixed(2)}% / 필요 0.70%`, met: isDca2Remainder || dca2RecoveryBounce >= 0.7 },
+                          { label: '단기 기울기', value: `${(adaptiveIndicators?.slope || 0).toFixed(2)}% / 필요 +0.05%`, met: isDca2Remainder || (adaptiveIndicators?.slope || 0) >= 0.05 }
+                        ]
                       }
-                    : { label: `DCA ${authoritativeNextDcaNumber}차`, detail: authoritativeNextDcaLabel || `${formatPrice(nextDca)} 이하`, active: dcaEnabled && currentPrice <= nextDca, enabled: dcaEnabled, icon: '↓' },
-                  { label: pyramidingCount >= 2 ? '상승 불타기 완료' : `상승 불타기 ${pyramidingCount + 1}차`, detail: marketRegime === 'BULL' ? `평단 +${(pyramidingStepPercent * (pyramidingCount + 1)).toFixed(1)}% · ${pyramidingCount === 0 ? '0.50' : '0.35'} Unit` : '상승 국면에서만', active: false, enabled: pyramidingEnabled && marketRegime === 'BULL' && pyramidingCount < 2, icon: '↑' },
-                  { label: '재진입', detail: awaitingReentry ? '급락 안정 확인 중' : '방어 매도 후 활성화', active: awaitingReentry, enabled: true, icon: '↺' }
+                    : {
+                        key: `dca-${authoritativeNextDcaNumber}`, order: 5, side: 'BUY', label: `DCA ${authoritativeNextDcaNumber}차`, detail: authoritativeNextDcaLabel || `${formatPrice(nextDca)} 이하`, active: dcaEnabled && currentPrice <= nextDca, enabled: dcaEnabled, icon: '↓',
+                        trigger: `${formatPrice(nextDca)} 이하 (${priceDistance(nextDca, 'down')})`, execution: '부분손절·긴급 방어가 먼저 없을 때에만 위험관리 승인 후 매수',
+                        checks: [{ label: '현재가', value: `${formatPrice(currentPrice)} / 기준 ${formatPrice(nextDca)}`, met: currentPrice <= nextDca }, { label: 'DCA 기능', value: dcaEnabled ? '켜짐' : '꺼짐', met: dcaEnabled }]
+                      },
+                  {
+                    key: 'pyramid', order: 6, side: 'BUY', label: pyramidingCount >= 2 ? '상승 불타기 완료' : `상승 불타기 ${pyramidingCount + 1}차`,
+                    detail: marketRegime === 'BULL' ? `${formatPrice(pyramidTarget)} 이상 · ${pyramidingCount === 0 ? '0.35' : '0.35'} Unit` : '상승 국면에서만',
+                    active: pyramidingEnabled && marketRegime === 'BULL' && pyramidingCount < 2 && currentPrice >= pyramidTarget,
+                    enabled: pyramidingEnabled && marketRegime === 'BULL' && pyramidingCount < 2, icon: '↑',
+                    trigger: `BULL + ${formatPrice(pyramidTarget)} 이상 (${priceDistance(pyramidTarget, 'up')})`, execution: 'DCA와 방어 조건보다 후순위. 트레일링 무장 뒤에는 추가 불타기 금지',
+                    checks: [{ label: '시장 국면', value: `${marketRegime} / 필요 BULL`, met: marketRegime === 'BULL' }, { label: '가격', value: `${formatPrice(currentPrice)} / 기준 ${formatPrice(pyramidTarget)}`, met: currentPrice >= pyramidTarget }, { label: '남은 횟수', value: `${Math.max(0, 2 - pyramidingCount)}회`, met: pyramidingCount < 2 }]
+                  },
+                  {
+                    key: 'reentry', order: 4, side: 'BUY', label: '재진입', detail: awaitingReentry ? '급락 안정 확인이 끝나면 재진입 신호 우선' : '방어 매도 후에만 활성화', active: awaitingReentry, enabled: true, icon: '↺',
+                    trigger: '부분·긴급 방어 매도 후, 엔진이 REENTRY_ALLOWED 상태로 전환', execution: '익절·DCA보다 앞선 우선순위 4의 재진입 매수', checks: [{ label: '재진입 상태', value: awaitingReentry ? '확인 중' : '비활성', met: awaitingReentry }]
+                  }
                 ] : [
-                  { label: '저점 매수', detail: `${formatPrice(lowerBand)} 이하`, active: currentPrice <= lowerBand, enabled: true, icon: '↓' },
-                  { label: '돌파 매수', detail: `RSI ${rsiValue.toFixed(0)} · 거래량 ${volumeMultiplier.toFixed(2)}x`, active: isBreakoutReady, enabled: true, icon: '↑' },
-                  { label: '반등 확인', detail: `기준선 ${formatPrice(baselineValue)} 아래`, active: false, enabled: autoPilotEnabled, icon: '↗' }
+                  { key: 'dip-entry', order: 6, side: 'BUY', label: '저점 매수', detail: `${formatPrice(lowerBand)} 이하`, active: currentPrice <= lowerBand, enabled: true, icon: '↓', trigger: `${formatPrice(lowerBand)} 이하 (${priceDistance(lowerBand, 'down')})`, execution: '낙하 방어 필터와 위험관리 승인 후 1차 진입', checks: [{ label: '현재가', value: `${formatPrice(currentPrice)} / 하단 ${formatPrice(lowerBand)}`, met: currentPrice <= lowerBand }] },
+                  { key: 'breakout-entry', order: 6, side: 'BUY', label: '돌파 매수', detail: `기준선 상향 · RSI ${rsiValue.toFixed(0)} · 거래량 ${volumeMultiplier.toFixed(2)}x`, active: isBreakoutReady, enabled: true, icon: '↑', trigger: `기준선 ${formatPrice(baselineValue)} 상향 + 모멘텀`, execution: '세 필터가 모두 충족될 때 1차 진입', checks: [{ label: '기준선 상향', value: `${formatPrice(currentPrice)} / ${formatPrice(baselineValue)}`, met: currentPrice > baselineValue }, { label: 'RSI', value: `${rsiValue.toFixed(1)} / 최대 68`, met: rsiValue <= 68 }, { label: '거래량', value: `${volumeMultiplier.toFixed(2)}x / 최소 1.15x`, met: volumeMultiplier >= 1.15 }] },
+                  { key: 'bounce-entry', order: 6, side: 'BUY', label: '반등 확인', detail: `기준선 ${formatPrice(baselineValue)} 아래의 저점 반등`, active: false, enabled: autoPilotEnabled, icon: '↗', trigger: '저점 형성 뒤 반등 확인', execution: '자동조종이 활성일 때만 보조 진입 판단', checks: [{ label: '자동 운용', value: autoPilotEnabled ? '켜짐' : '꺼짐', met: autoPilotEnabled }] }
                 ];
-                const sellRows = [
-                  { label: '단기 익절', detail: !isNeutralRange ? (adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK' ? '상승 조정형: 전량 익절 보류' : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE' ? '하락 정체형: 박스 익절 비활성' : '상승·하락 국면에서는 비활성') : hasPosition ? `${formatPrice(scalpTarget)} · 전량 매도` : '포지션 진입 후 활성화', active: hasPosition && isNeutralRange && currentPrice >= scalpTarget, enabled: hasPosition && isNeutralRange, icon: '◎' },
-                  { label: '트레일링 익절', detail: isTrailingActive ? `${formatPrice(trailingExit)} 이탈 · 콜백 ${effectiveTrailingCallback.toFixed(1)}%` : scalpPrecedesTrailing ? `단기 익절(${formatPrice(scalpTarget)}) 우선 실행` : `${formatPrice(trailingArm)} 도달 시 무장`, active: isTrailingActive, enabled: trailingStopEnabled && hasPosition && !scalpPrecedesTrailing, statusOverride: scalpPrecedesTrailing ? '후순위' : undefined, icon: '⌁' },
-                  { label: '불타기 수익 보호', detail: profitLockPrice ? `${formatPrice(profitLockPrice)} 이탈 시 전량 청산` : '불타기 1차 체결 후 활성화', active: Boolean(profitLockPrice && currentPrice <= profitLockPrice), enabled: Boolean(profitLockPrice), icon: '⌑' },
-                  { label: '급락 방어', detail: `하단 이탈 + ${trendDropSpeedThreshold.toFixed(1)}% 급락`, active: isEmergency, enabled: trendAwareCutEnabled && hasPosition, icon: '!' },
-                  { label: '절대 손절', detail: hasPosition ? `${formatPrice(calculatedStopLoss)} · 전량` : '포지션 진입 후 활성화', active: hasPosition && currentPrice <= calculatedStopLoss, enabled: hasPosition, icon: '×' }
+                const sellRows: RadarRow[] = [
+                  { key: 'absolute-stop', order: 1, side: 'SELL', label: '절대 손절', detail: hasPosition ? `${formatPrice(calculatedStopLoss)} · 전량` : '포지션 진입 후 활성화', active: hasPosition && currentPrice <= calculatedStopLoss, enabled: hasPosition, icon: '×', trigger: hasPosition ? `${formatPrice(calculatedStopLoss)} 이하 (${priceDistance(calculatedStopLoss, 'down')})` : '포지션 진입 후 계산', execution: '최우선 1순위. 다른 모든 매수·매도 조건보다 먼저 전량 청산', checks: [{ label: '현재가', value: hasPosition ? `${formatPrice(currentPrice)} / 손절 ${formatPrice(calculatedStopLoss)}` : '무포지션', met: hasPosition && currentPrice <= calculatedStopLoss }] },
+                  { key: 'emergency', order: 2, side: 'SELL', label: '급락 방어', detail: `하단 ${formatPrice(lowerBand)} 이탈 + ${trendDropSpeedThreshold.toFixed(1)}% 급락`, active: isEmergency, enabled: trendAwareCutEnabled && hasPosition, icon: '!', trigger: `하단 밴드 이탈 + ${trendDropSpeedThreshold.toFixed(1)}% 이상 급락`, execution: '2순위. 보유 수량 일부를 긴급 방어 매도', checks: [{ label: '하단 밴드', value: `${formatPrice(currentPrice)} / ${formatPrice(lowerBand)}`, met: currentPrice < lowerBand }, { label: '급락 속도', value: `${dropSpeed.toFixed(2)}% / 기준 -${trendDropSpeedThreshold.toFixed(1)}%`, met: dropSpeed <= -Math.abs(trendDropSpeedThreshold) }] },
+                  { key: 'partial-cut', order: 2, side: 'SELL', label: `부분손절 ${partialCutStage}차`, detail: hasPosition ? `${formatPrice(partialCutPrice)} 이하 · ${partialCutVolume}` : '포지션 진입 후 활성화', active: hasPosition && currentPrice <= partialCutPrice, enabled: partialLossCutEnabled && hasPosition, icon: '÷', trigger: `${formatPrice(partialCutPrice)} 이하 (${priceDistance(partialCutPrice, 'down')})`, execution: `2순위. ${partialCutVolume}를 현금화한 뒤 다음 DCA/재진입 자금으로 보존`, checks: [{ label: '현재가', value: `${formatPrice(currentPrice)} / 기준 ${formatPrice(partialCutPrice)}`, met: currentPrice <= partialCutPrice }, { label: '부분손절 기능', value: partialLossCutEnabled ? '켜짐' : '꺼짐', met: partialLossCutEnabled }] },
+                  { key: 'scalp-tp', order: 3, side: 'SELL', label: '단기 익절', detail: !isNeutralRange ? (adaptiveIndicators?.sidewaysContext === 'BULL_PULLBACK' ? '상승 조정형: 전량 익절 보류' : adaptiveIndicators?.sidewaysContext === 'BEAR_PAUSE' ? '하락 정체형: 박스 익절 비활성' : '상승·하락 국면에서는 비활성') : hasPosition ? `${formatPrice(scalpTarget)} 이상 · 전량 매도` : '포지션 진입 후 활성화', active: hasPosition && isNeutralRange && currentPrice >= scalpTarget, enabled: hasPosition && isNeutralRange, icon: '◎', trigger: `${formatPrice(scalpTarget)} 이상 (${priceDistance(scalpTarget, 'up')})`, execution: '3순위. 중립 박스 국면에서만 전량 익절', checks: [{ label: '시장 상태', value: isNeutralRange ? '중립 박스' : marketSituationLabel, met: isNeutralRange }, { label: '현재가', value: `${formatPrice(currentPrice)} / 목표 ${formatPrice(scalpTarget)}`, met: currentPrice >= scalpTarget }] },
+                  { key: 'trailing', order: 3, side: 'SELL', label: '트레일링 익절', detail: isTrailingActive ? `${formatPrice(trailingExit)} 이탈 · 콜백 ${effectiveTrailingCallback.toFixed(1)}%` : scalpPrecedesTrailing ? `단기 익절(${formatPrice(scalpTarget)}) 우선 실행` : `${formatPrice(trailingArm)} 도달 시 무장`, active: isTrailingActive && currentPrice <= trailingExit, enabled: trailingStopEnabled && hasPosition && !scalpPrecedesTrailing, statusOverride: scalpPrecedesTrailing ? '후순위' : undefined, icon: '⌁', trigger: isTrailingActive ? `${formatPrice(trailingExit)} 이탈 (${priceDistance(trailingExit, 'down')})` : `${formatPrice(trailingArm)} 도달 시 무장 (${priceDistance(trailingArm, 'up')})`, execution: isTrailingActive ? '3순위. 무장 뒤 최고가에서 콜백 폭만큼 내려오면 익절' : '무장 전에는 주문 없음', checks: [{ label: '무장 상태', value: isTrailingActive ? '무장됨' : '미무장', met: isTrailingActive }, { label: '현재가', value: `${formatPrice(currentPrice)} / ${formatPrice(isTrailingActive ? trailingExit : trailingArm)}`, met: isTrailingActive ? currentPrice <= trailingExit : currentPrice >= trailingArm }] },
+                  { key: 'profit-lock', order: 1, side: 'SELL', label: '불타기 수익 보호', detail: profitLockPrice ? `${formatPrice(profitLockPrice)} 이탈 시 전량 청산` : '불타기 1차 체결 후 활성화', active: Boolean(profitLockPrice && currentPrice <= profitLockPrice), enabled: Boolean(profitLockPrice), icon: '⌑', trigger: profitLockPrice ? `${formatPrice(profitLockPrice)} 이하` : '불타기 1차 체결 후 계산', execution: '보호선 이탈 시 절대 손절과 동일한 최우선 전량 청산', checks: [{ label: '보호선', value: profitLockPrice ? formatPrice(profitLockPrice) : '미설정', met: Boolean(profitLockPrice) }, { label: '현재가', value: formatPrice(currentPrice), met: Boolean(profitLockPrice && currentPrice <= profitLockPrice) }] }
                 ];
-                const visibleRows = activeRadarTab === 'BUY' ? buyRows : activeRadarTab === 'SELL' ? sellRows : [...buyRows.slice(0, 2), ...sellRows.slice(0, 2)];
+                const percentGap = (target: number) => currentPrice > 0 ? Math.abs((target - currentPrice) / currentPrice) * 100 : 999;
+                const proximityScore = (row: RadarRow) => {
+                  if (row.active) return -1;
+                  if (!row.enabled) return 999;
+                  switch (row.key) {
+                    case 'absolute-stop': return percentGap(calculatedStopLoss);
+                    case 'profit-lock': return profitLockPrice ? percentGap(profitLockPrice) : 999;
+                    case 'partial-cut': return percentGap(partialCutPrice);
+                    case 'emergency': return Math.max(percentGap(lowerBand), Math.max(0, Math.abs(trendDropSpeedThreshold) + dropSpeed));
+                    case 'scalp-tp': return percentGap(scalpTarget);
+                    case 'trailing': return percentGap(isTrailingActive ? trailingExit : trailingArm);
+                    case 'dca-2': return isDca2Remainder ? percentGap(nextDca) : Math.max(0, 3.5 - dca2RecoveryLowDrop);
+                    case 'pyramid': return percentGap(pyramidTarget);
+                    case 'dip-entry': return percentGap(lowerBand);
+                    case 'breakout-entry': return Math.max(percentGap(baselineValue), Math.max(0, 1.15 - volumeMultiplier));
+                    case 'bull-pullback': return Math.max(0, 0.60 - bullPullbackFromHigh) + Math.max(0, 0.20 - bullReboundFromLow);
+                    case 'regime-target': return bullTargetReady ? -1 : 5;
+                    default: return 100;
+                  }
+                };
+                const proximityText = (row: RadarRow) => {
+                  if (row.active) return '지금 발동';
+                  const score = proximityScore(row);
+                  if (score >= 99) return '조건 대기';
+                  return `약 ${score.toFixed(score < 1 ? 2 : 1)}%`;
+                };
+                const candidateRows = activeRadarTab === 'BUY' ? buyRows : activeRadarTab === 'SELL' ? sellRows : [...buyRows, ...sellRows];
+                const visibleRows = candidateRows
+                  .filter((row) => row.enabled)
+                  .sort((a, b) => proximityScore(a) - proximityScore(b) || a.order - b.order || (a.side === 'SELL' ? -1 : 1));
 
                 return (
                   <div className="space-y-3">
@@ -1715,8 +1882,10 @@ export default function App() {
 
                     <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xs">
                       <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
-                        <span className="text-xs font-bold text-slate-900">{activeRadarTab === 'SELL' ? '청산 · 방어 조건' : activeRadarTab === 'BUY' ? '진입 · 추가매수 조건' : '핵심 조건'}</span>
-                        <span className="text-[10px] text-slate-400">현재가 {formatPrice(currentPrice)}</span>
+                        <div>
+                          <span className="text-xs font-bold text-slate-900">{activeRadarTab === 'SELL' ? '청산 · 방어 조건' : activeRadarTab === 'BUY' ? '진입 · 추가매수 조건' : '현재가에 가까운 조건'}</span>
+                          <p className="mt-0.5 text-[10px] text-slate-400">현재가·필터 기준으로 가까운 순서입니다. 실제 전략 우선순위는 상세에서 확인할 수 있습니다.</p>
+                        </div>
                       </div>
                       <div className="divide-y divide-slate-100">
                         {visibleRows.map((row) => (
@@ -1727,6 +1896,10 @@ export default function App() {
                               title: row.label,
                               summary: row.detail,
                               status: ('statusOverride' in row ? row.statusOverride : undefined) || status(row.active, row.enabled),
+                              order: row.order,
+                              trigger: row.trigger,
+                              execution: row.execution,
+                              checks: row.checks,
                               metrics: [
                                 { label: '현재가', value: formatPrice(currentPrice) },
                                 { label: '시장 상황', value: marketSituationLabel },
@@ -1742,8 +1915,12 @@ export default function App() {
                           >
                             <span className={`grid h-7 w-7 place-items-center rounded-full text-xs font-bold ${row.active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{row.icon}</span>
                             <div className="min-w-0 flex-1">
-                              <div className="text-xs font-semibold text-slate-800">{row.label}</div>
-                              <div className="mt-0.5 truncate text-[11px] text-slate-500">{row.detail}</div>
+                              <div className="flex items-center gap-1.5">
+                                <span className={`rounded px-1 py-0.5 text-[9px] font-black ${row.side === 'SELL' ? 'bg-rose-50 text-rose-600' : 'bg-emerald-50 text-emerald-700'}`}>{row.side === 'SELL' ? '매도' : '매수'} · {proximityText(row)}</span>
+                                <div className="text-xs font-semibold text-slate-800">{row.label}</div>
+                              </div>
+                              <div className="mt-0.5 truncate text-[11px] font-medium text-slate-600">{row.trigger}</div>
+                              <div className="mt-0.5 truncate text-[10px] text-slate-400">{row.detail}</div>
                             </div>
                             <span className={`rounded-full border px-2 py-1 text-[10px] font-bold ${tone(row.active, row.enabled)}`}>{('statusOverride' in row ? row.statusOverride : undefined) || status(row.active, row.enabled)}</span>
                           </button>
@@ -1859,7 +2036,7 @@ export default function App() {
                 const distTrailingTrigger = currentPrice - trailingTriggerPrice;
 
                 // Rule 3-a & 3-b: Capital Recycling Partial Cuts
-                const trim1Price = effectiveEntry * 0.990; // -1.0%
+                const trim1Price = effectiveEntry * 0.985; // -1.5%
                 const trim2Price = effectiveEntry * 0.968; // -3.2%
                 const distTrim1 = currentPrice - trim1Price;
                 const distTrim2 = currentPrice - trim2Price;
@@ -2339,7 +2516,7 @@ export default function App() {
                             <div className="grid grid-cols-2 gap-2 text-[9.5px] font-mono">
                               <div className="p-2 rounded-xl bg-amber-50/60 border border-amber-200 text-amber-950">
                                 <div className="font-extrabold flex items-center justify-between">
-                                  <span>1단계 (-1.0%)</span>
+                                  <span>1단계 (-1.5%)</span>
                                   <span className="text-[8.5px] bg-amber-200 px-1 rounded">30% 매도</span>
                                 </div>
                                 <div className="mt-1 font-bold">₩{Math.round(trim1Price).toLocaleString()}</div>
@@ -2573,6 +2750,24 @@ export default function App() {
                 )}
               </div>
 
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                  <h3 className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Smartphone className="w-4 h-4 text-sky-500" />
+                    <span>텔레그램 안전 알림</span>
+                  </h3>
+                  <span className="text-[10px] text-slate-400 font-mono">Encrypted</span>
+                </div>
+                <p className="text-[11px] leading-relaxed text-slate-500">안전 정지, 포지션 보정 필요, 시작 동기화 실패만 휴대폰으로 알립니다. 일반 매수·매도는 보내지 않습니다.</p>
+                {telegramStatus && <div className="p-2.5 rounded-xl bg-slate-100 border border-slate-200 text-xs font-semibold text-slate-800">{telegramStatus}</div>}
+                <input type="password" placeholder="BotFather HTTP API Token" value={telegramBotToken} onChange={(e) => setTelegramBotToken(e.target.value)} className="w-full text-xs font-mono px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 focus:outline-none focus:border-sky-500" />
+                <input inputMode="numeric" placeholder="Telegram Chat ID" value={telegramChatId} onChange={(e) => setTelegramChatId(e.target.value)} className="w-full text-xs font-mono px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 focus:outline-none focus:border-sky-500" />
+                <div className="grid grid-cols-2 gap-2">
+                  <button onClick={handleSaveTelegram} className="py-2.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-xs shadow-2xs">저장 및 테스트</button>
+                  <button onClick={handleTestTelegram} className="py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs shadow-2xs">저장된 설정 테스트</button>
+                </div>
+              </div>
+
               {/* Smart DCA (하락장 평단가 분할 물타기) Card */}
               <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs space-y-3">
                 <div className="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -2729,7 +2924,7 @@ export default function App() {
                 {partialLossCutEnabled && (
                   <div className="space-y-3 pt-1">
                     <p className="text-[10px] text-slate-500 bg-purple-50/60 p-2 rounded-xl border border-purple-100">
-                      💡 고정 방어 규칙입니다. 평단 대비 <strong>-1.0%에서 30%</strong>, 이후 <strong>-3.2%에서 남은 물량의 50%</strong>를 매도합니다. DCA 소진 여부와 무관하며, 부분손절 뒤 60초 쿨다운을 둡니다.
+                      💡 고정 방어 규칙입니다. 평단 대비 <strong>-1.5%에서 30%</strong>, 이후 <strong>-3.2%에서 남은 물량의 50%</strong>를 매도합니다. DCA 소진 여부와 무관하며, 부분손절 뒤 60초 쿨다운을 둡니다.
                     </p>
                   </div>
                 )}
@@ -2790,6 +2985,28 @@ export default function App() {
               </div>
               </fieldset>
 
+              <div className={`rounded-2xl border p-3.5 shadow-2xs ${rebaseRequired ? 'border-rose-300 bg-rose-50' : 'border-amber-200 bg-amber-50/70'}`}>
+                <div className="flex items-start gap-2.5">
+                  <RefreshCw className={`mt-0.5 h-4 w-4 shrink-0 ${rebaseRequired ? 'text-rose-600' : 'text-amber-600'}`} />
+                  <div className="min-w-0 flex-1">
+                    <p className={`text-xs font-extrabold ${rebaseRequired ? 'text-rose-900' : 'text-amber-900'}`}>포지션 안전 보정</p>
+                    <p className={`mt-0.5 text-[10px] leading-relaxed ${rebaseRequired ? 'text-rose-800' : 'text-amber-800'}`}>
+                      {rebaseRequired
+                        ? '거래소 잔고와 로컬 포지션이 다르게 감지되었습니다. 봇을 정지한 뒤 거래소 기준으로 보호가격·평단·수량을 다시 기준화하세요.'
+                        : '재시작·부분체결 뒤 실제 보유 수량·평단과 보호 기준을 다시 맞춰야 할 때 사용합니다.'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  disabled={isBotActive || !wsConnected}
+                  onClick={handlePositionRebase}
+                  className="mt-3 w-full rounded-xl bg-amber-500 py-2.5 text-[11px] font-extrabold text-white transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {isBotActive ? '먼저 봇을 정지하세요' : '거래소 기준으로 포지션 보정'}
+                </button>
+                {rebaseStatus && <p className="mt-2 text-[10px] text-slate-600">{rebaseStatus}</p>}
+              </div>
+
               {/* Big Bot Control Button */}
               <button
                 onClick={handleToggleBot}
@@ -2823,7 +3040,7 @@ export default function App() {
             </div>
           )}
 
-          {activeTab === 'lab' && (
+          {false && activeTab === 'lab' && (
             <div className="space-y-3">
               <div className="bg-gradient-to-br from-violet-700 to-indigo-800 p-4 rounded-2xl text-white shadow-sm">
                 <div className="flex items-start gap-2">
@@ -3238,16 +3455,6 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => setActiveTab('lab')}
-            className={`flex flex-col items-center gap-1 px-2 py-1 rounded-xl transition cursor-pointer ${
-              activeTab === 'lab' ? 'text-violet-600 font-bold' : 'text-slate-400 font-medium'
-            }`}
-          >
-            <Brain className={`w-5 h-5 ${activeTab === 'lab' ? 'text-violet-600' : ''}`} />
-            <span className="text-[9.5px]">전략 실험실</span>
-          </button>
-
-          <button
             onClick={() => setActiveTab('logs')}
             className={`flex flex-col items-center gap-1 px-2 py-1 rounded-xl transition cursor-pointer relative ${
               activeTab === 'logs' ? 'text-blue-600 font-bold' : 'text-slate-400 font-medium'
@@ -3287,6 +3494,37 @@ export default function App() {
                   <p className="text-[10px] font-semibold text-indigo-600">현재 판정 · {selectedRadarCondition.status}</p>
                   <p className="mt-1 text-xs leading-5 text-slate-700">{selectedRadarCondition.summary}</p>
                 </div>
+                {selectedRadarCondition.order !== undefined && (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5">
+                      <p className="text-[10px] font-medium text-slate-400">전략 우선순위</p>
+                      <p className="mt-0.5 text-xs font-black text-slate-800">{selectedRadarCondition.order}순위</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-100 bg-slate-50 p-2.5">
+                      <p className="text-[10px] font-medium text-slate-400">발동 가격·조건</p>
+                      <p className="mt-0.5 text-[11px] font-bold leading-4 text-slate-800">{selectedRadarCondition.trigger}</p>
+                    </div>
+                  </div>
+                )}
+                {selectedRadarCondition.checks && selectedRadarCondition.checks.length > 0 && (
+                  <div>
+                    <p className="mb-2 text-[10px] font-bold text-slate-500">실시간 충족 여부</p>
+                    <div className="space-y-1.5">
+                      {selectedRadarCondition.checks.map((check) => (
+                        <div key={check.label} className="flex items-center justify-between rounded-xl border border-slate-100 bg-white px-3 py-2">
+                          <span className="text-[11px] font-medium text-slate-600">{check.label}</span>
+                          <span className={`text-[10px] font-bold ${check.met ? 'text-emerald-600' : 'text-slate-400'}`}>{check.met ? '✓ 충족 · ' : '○ 대기 · '}{check.value}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {selectedRadarCondition.execution && (
+                  <div className="rounded-xl border border-amber-100 bg-amber-50 p-3">
+                    <p className="text-[10px] font-bold text-amber-700">실행 순서에서의 역할</p>
+                    <p className="mt-1 text-[11px] leading-4 text-amber-900">{selectedRadarCondition.execution}</p>
+                  </div>
+                )}
                 <div className="grid grid-cols-2 gap-2">
                   {selectedRadarCondition.metrics.map((metric) => (
                     <div key={metric.label} className="rounded-xl border border-slate-100 bg-slate-50 p-2.5">

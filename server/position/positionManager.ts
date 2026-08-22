@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { PositionSnapshot, PositionState, BotParams, OrderFill } from '../types/trading';
+import { PositionSnapshot, PositionState, BotParams, OrderFill, SignalType } from '../types/trading';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const TRADE_LOGS_FILE = path.join(DATA_DIR, 'trade_logs.json');
@@ -85,6 +85,7 @@ export class PositionManager {
       profitLockPrice: null,
       lastRegimeRebalanceAt: 0,
       recycleCycleCount: 0,
+      executionStages: {},
       appliedFillEventIds: [],
       durableFillWatermarks: {},
       cooldownUntil: 0
@@ -95,6 +96,7 @@ export class PositionManager {
     return {
       ...this.position,
       dcaSlots: this.position.dcaSlots.map((s) => ({ ...s })),
+      executionStages: Object.fromEntries(Object.entries(this.position.executionStages || {}).map(([id, stage]) => [id, { ...stage }])),
       appliedFillEventIds: [...(this.position.appliedFillEventIds || [])],
       durableFillWatermarks: { ...(this.position.durableFillWatermarks || {}) }
     };
@@ -168,6 +170,61 @@ export class PositionManager {
 
   public getDurableFillWatermark(clientOrderId: string) {
     return this.position.durableFillWatermarks?.[clientOrderId];
+  }
+
+  /** Records order-level progress in the same durable fill commit as position mutation. */
+  public recordExecutionStage(
+    clientOrderId: string,
+    signalType: SignalType,
+    cumulativeFilledVolume: number,
+    orderCompleted: boolean,
+    targetVolume?: number,
+    targetBudgetKrw?: number
+  ) {
+    if (!clientOrderId || cumulativeFilledVolume <= 0) return;
+    const previous = this.position.executionStages?.[clientOrderId];
+    const now = Date.now();
+    this.position.executionStages = {
+      ...(this.position.executionStages || {}),
+      [clientOrderId]: {
+        signalType,
+        targetVolume: targetVolume && targetVolume > 0 ? targetVolume : previous?.targetVolume,
+        targetBudgetKrw: targetBudgetKrw && targetBudgetKrw > 0 ? targetBudgetKrw : previous?.targetBudgetKrw,
+        cumulativeFilledVolume: Number(Math.max(previous?.cumulativeFilledVolume || 0, cumulativeFilledVolume).toFixed(8)),
+        status: orderCompleted ? 'FILLED' : 'PARTIALLY_FILLED',
+        startedAt: previous?.startedAt || now,
+        updatedAt: now
+      }
+    };
+    this.position.lastUpdatedAt = now;
+    this.saveStateToFile();
+  }
+
+  /** Applies the explicit partial-complete policy when an exchange order is cancelled after a fill. */
+  public finalizeCancelledPartialStage(clientOrderId: string, signalType: SignalType, cumulativeFilledVolume: number) {
+    if (!clientOrderId || cumulativeFilledVolume <= 0) return;
+    const existing = this.position.executionStages?.[clientOrderId];
+    const now = Date.now();
+    this.position.executionStages = {
+      ...(this.position.executionStages || {}),
+      [clientOrderId]: {
+        signalType,
+        targetVolume: existing?.targetVolume,
+        targetBudgetKrw: existing?.targetBudgetKrw,
+        cumulativeFilledVolume: Number(Math.max(existing?.cumulativeFilledVolume || 0, cumulativeFilledVolume).toFixed(8)),
+        status: 'CANCELLED_PARTIAL',
+        startedAt: existing?.startedAt || now,
+        updatedAt: now
+      }
+    };
+    if (signalType === 'DCA_BUY') {
+      const partialSlot = [...this.position.dcaSlots].reverse().find((slot) => slot.status === 'PARTIALLY_FILLED');
+      if (partialSlot) partialSlot.status = 'FILLED'; // partial-complete: do not resend the original full DCA budget
+    } else if (signalType === 'TRAILING_STOP_EXIT') {
+      this.position.trailingExitCount = (this.position.trailingExitCount || 0) + 1;
+    }
+    this.position.lastUpdatedAt = now;
+    this.saveStateToFile();
   }
 
   /**
@@ -257,6 +314,7 @@ export class PositionManager {
     this.position.profitLockPrice = null;
     this.position.lastRegimeRebalanceAt = 0;
     this.position.recycleCycleCount = 0;
+    this.position.executionStages = {};
 
     this.saveStateToFile();
     console.log(`[PositionManager] Initial Entry Filled: Price=${fillPrice}, Qty=${fillVolume}, Static Absolute Stop Loss locked at ₩${Math.round(staticStopLossPrice).toLocaleString()}`);
@@ -326,16 +384,25 @@ export class PositionManager {
 
   /** 국면별 목표 비중을 향한 자동 소액 매수. DCA/불타기 슬롯은 소비하지 않는다. */
   public onRegimeRebalanceBuyFilled(fillPrice: number, fillVolume: number, baseline: number, atr: number, atrMultiplier: number, stopLossMultiplier: number) {
-    this.onManualAdditionalBuyFilled(fillPrice, fillVolume, baseline, atr, atrMultiplier, stopLossMultiplier);
+    const currentQty = this.position.amount;
+    const currentEntry = this.position.entryPrice || fillPrice;
+    const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
+    const newWeightedAvgPrice = Number(((currentQty * currentEntry + fillVolume * fillPrice) / newTotalQty).toFixed(2));
+    this.position.amount = newTotalQty;
+    this.position.entryPrice = newWeightedAvgPrice;
+    this.position.totalCostKrw += fillPrice * fillVolume;
+    // Crucially, a small regime add is not a manual rebase: it must not
+    // erase partial-cut count, cooldown, trailing state or fixed stop.
     this.position.lastRegimeRebalanceAt = Date.now();
+    this.position.lastUpdatedAt = Date.now();
     this.saveStateToFile();
-    console.log(`[PositionManager] Regime rebalance filled: Added=${fillVolume}, next regime add delayed.`);
+    console.log(`[PositionManager] Regime rebalance filled: Added=${fillVolume}, defensive protection state preserved.`);
   }
 
   /**
    * Called when a DCA safety order fills.
    */
-  public onDcaFilled(slotNumber: number, fillPrice: number, fillVolume: number) {
+  public onDcaFilled(slotNumber: number, fillPrice: number, fillVolume: number, orderCompleted: boolean = true) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
     const newTotalQty = Number((currentQty + fillVolume).toFixed(8));
@@ -352,7 +419,11 @@ export class PositionManager {
 
     const slot = this.position.dcaSlots.find((s) => s.slotNumber === slotNumber);
     if (slot) {
-      slot.status = 'FILLED';
+      // A DCA stage belongs to the exchange order, not its first fill
+      // fragment. Keep it visibly/internally partial until the order reaches
+      // FILLED; a cancelled partial remains an explicit partial-complete
+      // position rather than silently consuming the next DCA stage.
+      slot.status = orderCompleted ? 'FILLED' : 'PARTIALLY_FILLED';
       slot.filledPrice = fillPrice;
       slot.filledVolume = Number(((slot.filledVolume || 0) + fillVolume).toFixed(8));
       slot.filledAt = Date.now();
@@ -398,7 +469,7 @@ export class PositionManager {
    * Called when additional volume fills for an existing DCA order (via watcher).
    * Does NOT consume a new DCA slot!
    */
-  public addAdditionalDcaFilled(fillPrice: number, additionalVolume: number) {
+  public addAdditionalDcaFilled(fillPrice: number, additionalVolume: number, orderCompleted: boolean = false) {
     const currentQty = this.position.amount;
     const currentEntry = this.position.entryPrice || fillPrice;
     const newTotalQty = Number((currentQty + additionalVolume).toFixed(8));
@@ -412,6 +483,7 @@ export class PositionManager {
     const lastFilledSlot = [...this.position.dcaSlots].reverse().find((s) => s.status === 'FILLED' || s.status === 'PARTIALLY_FILLED');
     if (lastFilledSlot) {
       lastFilledSlot.filledVolume = Number(((lastFilledSlot.filledVolume || 0) + additionalVolume).toFixed(8));
+      if (orderCompleted) lastFilledSlot.status = 'FILLED';
     }
 
     this.saveStateToFile();
@@ -549,11 +621,14 @@ export class PositionManager {
    * the NEXT trailing take-profit requires a genuinely new high (price must
    * cross upperBand again) before it can fire again.
    */
-  public onTrailingPartialFilled(cutVolume: number, cutPrice: number, pnl: number) {
+  public onTrailingPartialFilled(cutVolume: number, cutPrice: number, pnl: number, orderCompleted: boolean = true) {
     this.position.amount = Number(Math.max(0, this.position.amount - cutVolume).toFixed(8));
     this.position.realizedPnl += pnl;
     this.position.lastUpdatedAt = Date.now();
-    this.position.trailingExitCount = (this.position.trailingExitCount || 0) + 1;
+    // A fragmented exchange fill is one trailing exit. Increment only when
+    // its order actually completes; the first fragment still disarms the
+    // trailing trigger immediately for protection.
+    if (orderCompleted) this.position.trailingExitCount = (this.position.trailingExitCount || 0) + 1;
 
     // Disarm trailing: require a fresh higher high before the next partial take-profit can fire.
     this.position.trailingActive = false;
@@ -721,6 +796,49 @@ export class PositionManager {
     this.position.recycleCycleCount = 0;
     this.position.cooldownUntil = 0;
     this.position.cooldownReason = 'RECONCILED_POSITION_REBASE';
+    this.position.lastUpdatedAt = Date.now();
+    this.saveStateToFile();
+  }
+
+  /**
+   * Explicitly adopts an exchange-confirmed position and builds all safety
+   * fields in one state mutation/atomic write. This avoids the former
+   * reconcile-save followed by rebase-save crash window.
+   */
+  public adoptAndRebaseExchangePosition(
+    amount: number,
+    entryPrice: number,
+    baseline: number,
+    atr: number,
+    atrMultiplier: number
+  ) {
+    if (amount <= 1e-8 || entryPrice <= 0 || baseline <= 0 || atr <= 0) {
+      throw new Error('Cannot adopt an incomplete exchange position.');
+    }
+    this.position.id = `POS_${Date.now()}`;
+    this.position.symbol = this.params.symbol;
+    this.position.state = 'ENTRY_FILLED';
+    this.position.amount = Number(amount.toFixed(8));
+    this.position.entryPrice = entryPrice;
+    this.position.positionEntryAtr = atr;
+    this.position.initialBaseline = baseline;
+    this.position.initialBand = baseline - (atr * atrMultiplier);
+    this.position.initialStopPrice = Number((entryPrice * 0.94).toFixed(2));
+    this.position.totalCostKrw = amount * entryPrice;
+    this.position.openedAt = this.position.openedAt || Date.now();
+    this.position.partialCutCount = 0;
+    this.position.trailingActive = false;
+    this.position.trailingPeakPrice = null;
+    this.position.trailingExitCount = 0;
+    this.position.profitLockPrice = null;
+    this.position.pyramidingCount = 0;
+    this.position.boxPyramidCount = 0;
+    this.position.lastRegimeRebalanceAt = 0;
+    this.position.recycleCycleCount = 0;
+    this.position.cooldownUntil = 0;
+    this.position.cooldownReason = 'RECONCILED_POSITION_REBASE';
+    this.position.dcaSlots = Array.from({ length: this.params.maxSafetyOrders }, (_, i) => ({ slotNumber: i + 1, status: 'AVAILABLE' as const }));
+    this.position.executionStages = {};
     this.position.lastUpdatedAt = Date.now();
     this.saveStateToFile();
   }
@@ -907,6 +1025,7 @@ export class PositionManager {
       profitLockPrice: defaults.profitLockPrice,
       lastRegimeRebalanceAt: defaults.lastRegimeRebalanceAt,
       recycleCycleCount: defaults.recycleCycleCount,
+      executionStages: {},
       appliedFillEventIds: [],
       durableFillWatermarks: {},
       cooldownReason: undefined
@@ -975,6 +1094,18 @@ export class PositionManager {
       finite(value.fee, 'durableFillWatermarks.fee', 0);
       if (value.funds !== undefined) finite(value.funds, 'durableFillWatermarks.funds', 0);
       if (typeof value.initialApplied !== 'boolean') throw new Error('Invalid durable fill watermark initialApplied flag.');
+    }
+    if (!candidate.executionStages || typeof candidate.executionStages !== 'object' || Array.isArray(candidate.executionStages)) throw new Error('Invalid execution-stage ledger.');
+    for (const [clientOrderId, stage] of Object.entries(candidate.executionStages as Record<string, unknown>)) {
+      if (!clientOrderId || !stage || typeof stage !== 'object' || Array.isArray(stage)) throw new Error('Invalid execution stage.');
+      const value = stage as Record<string, unknown>;
+      if (typeof value.signalType !== 'string') throw new Error('Invalid execution stage signal type.');
+      finite(value.cumulativeFilledVolume, 'executionStages.cumulativeFilledVolume', 0);
+      if (value.targetVolume !== undefined) finite(value.targetVolume, 'executionStages.targetVolume', 0);
+      if (value.targetBudgetKrw !== undefined) finite(value.targetBudgetKrw, 'executionStages.targetBudgetKrw', 0);
+      if (value.status !== 'PARTIALLY_FILLED' && value.status !== 'FILLED' && value.status !== 'CANCELLED_PARTIAL') throw new Error('Invalid execution stage status.');
+      finite(value.startedAt, 'executionStages.startedAt', 0);
+      finite(value.updatedAt, 'executionStages.updatedAt', 0);
     }
 
     const amount = candidate.amount as number;

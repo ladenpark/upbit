@@ -11,6 +11,7 @@ const PROCESSED_SIGNALS_FILE = path.join(DATA_DIR, 'processed_signals.json');
 
 const FILL_CONFIRM_MAX_RETRIES = 5;
 const FILL_CONFIRM_INTERVAL_MS = 600; // 600ms between polls → max ~3s total
+const ORDER_STATUSES = new Set<OrderStatus>(['SIGNAL_CREATED', 'ORDER_SUBMITTING', 'ORDER_SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCEL_REQUESTED', 'CANCELLED', 'REJECTED', 'UNKNOWN_PENDING_RECONCILIATION', 'UNKNOWN']);
 
 export class OrderManager {
   private upbitClient: UpbitClient;
@@ -18,6 +19,7 @@ export class OrderManager {
   private riskGovernor?: GlobalRiskGovernor;
   /** Watcher consumers receive only the newly filled amount, never cumulative volume. */
   private onOrderUpdated?: (record: OrderRecord, incrementalFilledVolume: number) => void;
+  private onPartialOrderCancelled?: (record: OrderRecord) => void;
   private lastApiKeys?: ApiKeys;
   private orders: Map<string, OrderRecord> = new Map();
   private processedSignalIds: Set<string> = new Set();
@@ -50,6 +52,11 @@ export class OrderManager {
 
   public setOnOrderUpdated(cb: (record: OrderRecord, incrementalFilledVolume: number) => void) {
     this.onOrderUpdated = cb;
+  }
+
+  /** Notifies the engine when a partially executed order becomes terminal. */
+  public setOnPartialOrderCancelled(cb: (record: OrderRecord) => void) {
+    this.onPartialOrderCancelled = cb;
   }
 
   public setApiKeysForWatcher(keys: ApiKeys) {
@@ -631,6 +638,9 @@ export class OrderManager {
         this.riskGovernor.releaseExposure(record.clientOrderId);
       }
       this.watchingOrderIds.delete(record.id);
+      if (status === 'CANCELLED' && executedVolume > 0) {
+        this.onPartialOrderCancelled?.({ ...record });
+      }
       if (executedVolume === 0) {
         onError(`Order ${status}: executed_volume=0`);
       } else {
@@ -879,10 +889,15 @@ export class OrderManager {
     try {
       if (fs.existsSync(ORDERS_FILE)) {
         const raw = fs.readFileSync(ORDERS_FILE, 'utf-8');
-        const list: OrderRecord[] = JSON.parse(raw);
+        const parsed: unknown = JSON.parse(raw);
+        if (!Array.isArray(parsed)) throw new Error('order_history.json must contain an order array.');
+        const list = parsed as OrderRecord[];
+        const ids = new Set<string>();
+        const clientOrderIds = new Set<string>();
         const now = Date.now();
         let migrated = false;
         list.forEach((ord) => {
+          this.validatePersistedOrder(ord, ids, clientOrderIds);
           // Old order files predate the strategy watermark. Their persisted
           // position state has already consumed recorded fills, so treating
           // historical volume as unapplied would duplicate a live position on
@@ -921,6 +936,39 @@ export class OrderManager {
       console.error('[OrderManager] Failed to load order history:', e);
       this.persistenceLoadFailure = e instanceof Error ? e : new Error(String(e));
     }
+  }
+
+  /** Semantic validation prevents parseable-but-corrupt ledgers from becoming a clean empty order map. */
+  private validatePersistedOrder(order: OrderRecord, ids: Set<string>, clientOrderIds: Set<string>) {
+    const finite = (value: unknown, field: string, min = 0) => {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < min) throw new Error(`Invalid order field: ${field}.`);
+    };
+    if (!order || typeof order !== 'object') throw new Error('Invalid order record.');
+    if (!order.id || typeof order.id !== 'string' || ids.has(order.id)) throw new Error('Invalid or duplicate order id.');
+    if (!order.clientOrderId || typeof order.clientOrderId !== 'string' || clientOrderIds.has(order.clientOrderId)) throw new Error('Invalid or duplicate clientOrderId.');
+    if (!order.signalId || typeof order.signalId !== 'string') throw new Error('Order is missing signal identity.');
+    // Old terminal history predates signalType. It is safe to retain only
+    // because it can never be watched/submitted again and its historical
+    // fill is migrated as already applied below. A live/pending order without
+    // an owner remains unrecoverable and must fail closed.
+    const terminalLegacyOrder = order.status === 'FILLED' || order.status === 'CANCELLED' || order.status === 'REJECTED';
+    if ((!order.signalType || typeof order.signalType !== 'string') && !terminalLegacyOrder) {
+      throw new Error('Live order is missing strategy signal ownership.');
+    }
+    if (!order.symbol || typeof order.symbol !== 'string' || (order.side !== 'BUY' && order.side !== 'SELL') || !ORDER_STATUSES.has(order.status)) throw new Error('Invalid order identity/status.');
+    finite(order.requestedBudgetOrVolume, 'requestedBudgetOrVolume');
+    finite(order.filledVolume, 'filledVolume');
+    finite(order.avgFillPrice, 'avgFillPrice');
+    finite(order.fee, 'fee');
+    finite(order.createdAt, 'createdAt');
+    finite(order.updatedAt, 'updatedAt');
+    if (!Array.isArray(order.fills)) throw new Error('Invalid order fills.');
+    if (order.strategyAppliedFilledVolume !== undefined) finite(order.strategyAppliedFilledVolume, 'strategyAppliedFilledVolume');
+    if (order.strategyAppliedFee !== undefined) finite(order.strategyAppliedFee, 'strategyAppliedFee');
+    if (order.strategyAppliedFunds !== undefined) finite(order.strategyAppliedFunds, 'strategyAppliedFunds');
+    if ((order.strategyAppliedFilledVolume || 0) - order.filledVolume > 1e-8) throw new Error('Order strategy watermark exceeds exchange fill volume.');
+    ids.add(order.id);
+    clientOrderIds.add(order.clientOrderId);
   }
 
   private saveOrdersToFile() {

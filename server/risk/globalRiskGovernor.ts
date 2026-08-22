@@ -395,6 +395,19 @@ export class GlobalRiskGovernor {
       signal.type === 'REGIME_REBALANCE_BUY' ||
       signal.type === 'REENTRY_BUY'
     ) {
+      // Regime allocation is a trend-following add, never a recovery tool.
+      // After any defensive cut the position must preserve its cash buffer,
+      // cooldown and cut-stage accounting until an explicit DCA/re-entry rule
+      // is allowed to act.
+      if (signal.type === 'REGIME_REBALANCE_BUY' && (
+        position.state === 'DEFENSIVE' ||
+        position.state === 'DEFENSIVE_1' ||
+        position.state === 'DEFENSIVE_2' ||
+        position.state === 'EMERGENCY_EXIT' ||
+        (signal.reason.includes('[BEAR 목표비중') && (position.partialCutCount || 0) > 0)
+      )) {
+        return { approved: false, rejectionReason: '[Risk Block] Regime rebalance is forbidden while defensive protection is active.' };
+      }
       const limits = this.calculateExposureLimits(actualKrwBalance, position.amount, currentPrice, pendingOrdersAmountKrw);
 
       // Trailing Exit Gate: 한 번이라도 트레일링 익절이 시작된 포지션은 전량 청산(FLAT)까지 불타기 일체 기각
